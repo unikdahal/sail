@@ -427,13 +427,11 @@ impl TryFrom<r#gen::ChannelSizes> for ChannelSizes {
         let invalid =
             |reason: &str| DataFusionError::Internal(format!("invalid channel sizes: {reason}"));
         let codes = |bytes: &[u8]| -> Result<Vec<u16>> {
-            if !bytes.len().is_multiple_of(size_of::<u16>()) {
+            let (codes, rest) = bytes.as_chunks::<{ size_of::<u16>() }>();
+            if !rest.is_empty() {
                 return Err(invalid("odd number of code bytes"));
             }
-            Ok(bytes
-                .chunks_exact(size_of::<u16>())
-                .map(|x| u16::from_le_bytes([x[0], x[1]]))
-                .collect())
+            Ok(codes.iter().map(|x| u16::from_le_bytes(*x)).collect())
         };
         match value.kind {
             Some(Kind::Dense(dense)) => Ok(Self::Dense(codes(&dense.codes)?.into())),
