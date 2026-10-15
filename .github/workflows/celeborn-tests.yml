@@ -1,0 +1,38 @@
+name: Celeborn Integration Tests
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      HATCH_ENV: "test.spark-4.1.3"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Hatch
+        uses: pypa/hatch@install
+
+      - name: Download Python Package
+        uses: actions/download-artifact@v7
+        with:
+          name: python-package
+          path: target/wheels
+
+      - name: Set Up Hatch Environment
+        run: |
+          hatch run install-pysail
+
+      # The test fixtures start the Celeborn master and workers as containers.
+      - name: Run Celeborn Integration Tests
+        run: |
+          hatch run pytest -m integration -v --pyargs \
+            pysail.tests.celeborn \
+            pysail.tests.spark.execution.test_shuffle_celeborn \
+            pysail.tests.spark.execution.test_shuffle_celeborn_adaptive

@@ -1,0 +1,76 @@
+name: Celeborn Adaptive Execution Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: A multiplier for the workload sizes
+        default: "1"
+      parallelism:
+        description: The default shuffle partition count
+        default: "200"
+
+jobs:
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/adjust-swap-space
+
+      - uses: ./.github/actions/mount-target-directory
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: celeborn-benchmark
+          install-testing-tools: false
+
+      - name: Build Python Package
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out target/wheels
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+      - name: Install Python Package
+        run: |
+          python -m pip install "$(ls target/wheels/*.whl)[test]"
+
+      - name: Start Celeborn
+        run: |
+          scripts/celeborn/local-cluster.sh start
+
+      - name: Run Benchmark
+        run: |
+          python scripts/celeborn/benchmark_aqe.py \
+            --master 127.0.0.1:12097 \
+            --scale "${{ inputs.scale }}" \
+            --parallelism "${{ inputs.parallelism }}" \
+            --output benchmark.json | tee benchmark.txt
+          sed -n '/^| workload/,$p' benchmark.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop Celeborn
+        if: ${{ always() }}
+        run: |
+          scripts/celeborn/local-cluster.sh stop || true
+
+      - name: Upload Results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: celeborn-benchmark
+          path: |
+            benchmark.json
+            benchmark.txt
+          if-no-files-found: ignore
