@@ -11,18 +11,20 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
+use crate::driver::job_scheduler::core::tests_support::build_input_locator;
 use crate::driver::job_scheduler::state::{
     ShuffleCommit, StageState, TaskAttemptDescriptor, TaskState,
 };
 use crate::driver::job_scheduler::test_utils::{
-    MIB, aggregate_graph, celeborn, commit, job, producer_statistics, reporter, schema, succeed,
+    MIB, NoAssignments, aggregate_graph, celeborn, commit, job, producer_statistics, reporter,
+    schema, succeed,
 };
 use crate::driver::job_scheduler::{AdaptiveOptions, JobAction, JobScheduler, JobSchedulerOptions};
 use crate::id::{JobId, TaskKey};
 use crate::job_graph::{JobGraph, JobGraphOptions};
 use crate::shuffle::ShuffleBackendKind;
 use crate::statistics::ChannelCounts;
-use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter};
+use crate::task::definition::TaskInputLocator;
 
 #[test]
 fn output_is_retained_until_consumer_regions_succeed() {
@@ -137,6 +139,29 @@ fn pipelined_output_is_released_when_its_region_reruns_the_producer() {
 }
 
 #[test]
+fn committed_map_attempts_are_passed_to_readers() {
+    let mut job = job(aggregate_graph());
+    succeed(&mut job, 0, producer_statistics);
+    commit(&mut job, 0);
+    let input = job.graph.stages()[1].inputs[0].clone();
+    let key = TaskKey {
+        job_id: JobId::from(1),
+        stage: 1,
+        partition: 0,
+        attempt: 0,
+    };
+    let locator = build_input_locator(&job, &key, &input, &NoAssignments);
+    // Readers skip the output of any other attempt, e.g. partial data of a failed one.
+    assert!(matches!(
+        locator.as_ref(),
+        TaskInputLocator::ShuffleService {
+            map_attempts: Some(attempts),
+            ..
+        } if attempts.as_ref() == [0, 0, 0, 0]
+    ));
+}
+
+#[test]
 fn failed_celeborn_commit_fails_the_consumer_definition() {
     let mut job = job(aggregate_graph());
     succeed(&mut job, 0, producer_statistics);
@@ -144,12 +169,6 @@ fn failed_celeborn_commit_fails_the_consumer_definition() {
         attempts: vec![0; 4],
         succeeded: false,
     });
-    struct NoAssignments;
-    impl TaskAssignmentGetter for NoAssignments {
-        fn get(&self, _: &TaskKey) -> Option<&TaskAssignment> {
-            None
-        }
-    }
     let input = job.graph.stages()[1].inputs[0].clone();
     let key = TaskKey {
         job_id: JobId::from(1),
@@ -158,12 +177,7 @@ fn failed_celeborn_commit_fails_the_consumer_definition() {
         attempt: 0,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::driver::job_scheduler::core::tests_support::build_input_locator(
-            &job,
-            &key,
-            &input,
-            &NoAssignments,
-        )
+        build_input_locator(&job, &key, &input, &NoAssignments)
     }));
     assert!(result.is_err(), "reading an uncommitted shuffle must fail");
 }

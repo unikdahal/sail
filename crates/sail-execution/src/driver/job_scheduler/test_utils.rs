@@ -21,9 +21,11 @@ use sail_telemetry::events::SystemEventReporter;
 use crate::driver::job_scheduler::state::{
     JobDescriptor, JobState, ShuffleCommit, TaskAttemptDescriptor, TaskState,
 };
+use crate::id::TaskKey;
 use crate::job_graph::{JobGraph, JobGraphOptions};
 use crate::shuffle::ShuffleBackendKind;
 use crate::statistics::{ChannelCounts, TaskOutputStatistics};
+use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter};
 
 pub(crate) const MIB: u64 = 1024 * 1024;
 
@@ -126,4 +128,13 @@ pub(crate) fn commit(job: &mut JobDescriptor, stage: usize) {
         attempts: vec![0; partitions],
         succeeded: true,
     });
+}
+
+/// A task assignment getter for tasks that have not been assigned.
+pub(crate) struct NoAssignments;
+
+impl TaskAssignmentGetter for NoAssignments {
+    fn get(&self, _: &TaskKey) -> Option<&TaskAssignment> {
+        None
+    }
 }
