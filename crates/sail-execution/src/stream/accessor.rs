@@ -402,7 +402,12 @@ impl TaskStreamWriter for MultiChannelTaskStreamWriter {
                 .await?
             }
         };
-        Ok(Box::new(MultiChannelTaskStreamSink::new(sinks)))
+        Ok(Box::new(match &self.output.locator {
+            TaskOutputLocator::Pipelined { .. } => {
+                MultiChannelTaskStreamSink::new_without_statistics(sinks)
+            }
+            TaskOutputLocator::Blocking => MultiChannelTaskStreamSink::new(sinks),
+        }))
     }
 }
 

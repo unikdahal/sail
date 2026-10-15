@@ -11,7 +11,7 @@ use sail_cache::remote_checkpoint::RemoteCheckpointRegistry;
 use sail_catalog::provider::CatalogCacheManager;
 use sail_catalog_system::service::SystemTableService;
 use sail_common::actor::ActorHandle;
-use sail_common::config::{AppConfig, ExecutionMode};
+use sail_common::config::{AppConfig, ExecutionMode, ShuffleBackend};
 use sail_common::runtime::RuntimeHandle;
 use sail_common_datafusion::session::activity::ActivityTracker;
 use sail_common_datafusion::session::job::{JobRunner, JobService};
@@ -152,7 +152,12 @@ impl ServerSessionFactory {
                 preserve_explicit_hash_repartition: matches!(
                     self.config.mode,
                     ExecutionMode::LocalCluster | ExecutionMode::KubernetesCluster
-                ) && self.config.cluster.adaptive.enabled,
+                ) && self.config.cluster.adaptive.enabled
+                    // Adaptive re-planning applies only to the Celeborn shuffle backend.
+                    && matches!(
+                        self.config.cluster.shuffle_backend,
+                        ShuffleBackend::Celeborn(_)
+                    ),
                 ..Default::default()
             }))
             .with_query_planner(new_query_planner());

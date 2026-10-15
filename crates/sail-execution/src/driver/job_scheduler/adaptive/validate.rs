@@ -266,7 +266,11 @@ fn validate_schedulable(ctx: &ValidationContext) -> Result<(), String> {
     let Some(cap) = ctx.slot_cap else {
         return Ok(());
     };
+    // Only regions holding a changed stage are affected by the rewrite.
     for (r, region) in ctx.topology.regions.iter().enumerate() {
+        if !region.tasks.iter().any(|t| ctx.changed.contains(&t.stage)) {
+            continue;
+        }
         let slots = region_slots(ctx.new, &region.tasks);
         if slots > cap {
             return Err(format!(

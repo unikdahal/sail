@@ -177,9 +177,12 @@ fn rewrite_partitioned_hash_join(
         swapped = Some(join.swap_inputs(PartitionMode::Partitioned)?);
     }
     // After a swap, the join may sit below a projection that restores the column order.
-    let join_node = match &swapped {
-        Some(plan) => find_hash_join(plan)?,
-        None => None,
+    let (parent, join_node) = match &swapped {
+        Some(plan) => match find_hash_join(plan)? {
+            Some(join) => (Some(Arc::clone(plan)), Some(join)),
+            None => (None, Some(Arc::clone(plan))),
+        },
+        None => (None, None),
     };
     let join = match &join_node {
         Some(node) => node
@@ -194,17 +197,21 @@ fn rewrite_partitioned_hash_join(
         && largest > cap
         && supports_sort_merge(join)
     {
-        let smj = to_sort_merge_join(join)?;
-        notes.push(format!(
-            "sort-merge join: largest build partition {largest} bytes exceeds {cap} bytes"
-        ));
-        rules.push(RULE_SORT_MERGE_JOIN);
-        return Ok(Some(match swapped {
-            Some(parent) if join_node.is_some() => {
-                replace_children_if_necessary(parent, vec![smj])?
+        // A join that cannot be expressed as a sort-merge join keeps its hash join,
+        // without giving up the other rules for the stage.
+        match to_sort_merge_join(join) {
+            Ok(smj) => {
+                notes.push(format!(
+                    "sort-merge join: largest build partition {largest} bytes exceeds {cap} bytes"
+                ));
+                rules.push(RULE_SORT_MERGE_JOIN);
+                return Ok(Some(match parent {
+                    Some(parent) => replace_children_if_necessary(parent, vec![smj])?,
+                    None => smj,
+                }));
             }
-            _ => smj,
-        }));
+            Err(error) => notes.push(format!("sort-merge join not applicable: {error}")),
+        }
     }
     Ok(swapped)
 }

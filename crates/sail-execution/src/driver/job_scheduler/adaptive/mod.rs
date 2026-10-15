@@ -341,6 +341,10 @@ impl JobScheduler {
             .collect();
         job.graph = graph;
         job.topology = topology;
+        // Region states are derived from task attempts, so they are recomputed for the
+        // new topology right away. Later stages in the same pass see succeeded
+        // dependencies as succeeded.
+        Self::update_task_regions(job, options);
         Ok(AppliedRewrite {
             old_partitions,
             new_partitions,

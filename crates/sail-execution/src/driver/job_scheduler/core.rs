@@ -411,17 +411,24 @@ impl JobScheduler {
             // the output, so only the consumer tasks must have succeeded. Otherwise the
             // output is released only once the consumer region has succeeded, since
             // succeeded regions never run again.
-            let producer_regions = (0..job.stages[s].tasks.len())
-                .filter_map(|p| {
-                    job.topology
-                        .task_regions
-                        .get(&TaskTopology {
-                            stage: s,
-                            partition: p,
+            // The producer regions are computed only once every consumer task has
+            // succeeded, since this runs on every task status update.
+            let producer_regions = std::cell::OnceCell::new();
+            let producer_regions = || {
+                producer_regions.get_or_init(|| {
+                    (0..job.stages[s].tasks.len())
+                        .filter_map(|p| {
+                            job.topology
+                                .task_regions
+                                .get(&TaskTopology {
+                                    stage: s,
+                                    partition: p,
+                                })
+                                .copied()
                         })
-                        .copied()
+                        .collect::<IndexSet<_>>()
                 })
-                .collect::<IndexSet<_>>();
+            };
             let all_consumer_regions_succeeded = stage.consumers.iter().all(|&c| {
                 let partitions = job.graph.stages()[c]
                     .plan
@@ -438,8 +445,8 @@ impl JobScheduler {
                     });
                     task_succeeded
                         && region.is_some_and(|r| {
-                            producer_regions.contains(r)
-                                || matches!(job.regions[*r].state, TaskRegionState::Succeeded)
+                            matches!(job.regions[*r].state, TaskRegionState::Succeeded)
+                                || producer_regions().contains(r)
                         })
                 })
             });

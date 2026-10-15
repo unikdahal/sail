@@ -146,12 +146,13 @@ pub(crate) struct ChannelCounter {
 }
 
 impl ChannelCounter {
-    pub fn add(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// Counting never fails a write, since statistics are advisory. If a layout
+    /// cannot be sized, Arrow's buffer size is used as an upper bound.
+    pub fn add(&mut self, batch: &RecordBatch) {
         self.rows = self.rows.saturating_add(batch.num_rows() as u64);
-        self.logical_bytes = self
-            .logical_bytes
-            .saturating_add(logical_batch_size(batch)?);
-        Ok(())
+        let size =
+            logical_batch_size(batch).unwrap_or_else(|_| batch.get_array_memory_size() as u64);
+        self.logical_bytes = self.logical_bytes.saturating_add(size);
     }
 }
 
@@ -170,6 +171,10 @@ pub fn logical_batch_size(batch: &RecordBatch) -> Result<u64> {
 
 fn logical_array_size(array: &ArrayRef) -> Result<u64> {
     let len = array.len();
+    if len == 0 {
+        // An empty offset-based array may have an empty offsets buffer.
+        return Ok(0);
+    }
     let nulls = if array.nulls().is_some() {
         len.div_ceil(8) as u64
     } else {
@@ -461,6 +466,23 @@ mod tests {
                 "split at {split}"
             );
         }
+    }
+
+    #[test]
+    fn logical_size_of_empty_arrays_is_zero() {
+        use datafusion::arrow::array::ArrayData;
+        use datafusion::arrow::buffer::Buffer;
+
+        // An empty string array may come with an empty offsets buffer, e.g. after IPC decoding.
+        let data = ArrayData::builder(DataType::Utf8)
+            .len(0)
+            .add_buffer(Buffer::from_vec(Vec::<i32>::new()))
+            .add_buffer(Buffer::from_vec(Vec::<u8>::new()))
+            .build()
+            .unwrap();
+        let array = datafusion::arrow::array::make_array(data);
+        let batch = RecordBatch::try_from_iter(vec![("s", array)]).unwrap();
+        assert_eq!(logical_batch_size(&batch).unwrap(), 0);
     }
 
     #[test]

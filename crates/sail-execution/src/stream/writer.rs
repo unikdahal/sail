@@ -47,15 +47,26 @@ pub trait TaskStreamChannelSink: Send {
 
 pub(crate) struct MultiChannelTaskStreamSink {
     sinks: Vec<Option<Box<dyn TaskStreamChannelSink>>>,
-    counters: Vec<ChannelCounter>,
+    /// Per-channel counters, present only when the output's statistics are used.
+    counters: Option<Vec<ChannelCounter>>,
 }
 
 impl MultiChannelTaskStreamSink {
+    /// Creates a sink that counts what each channel accepts.
     pub(crate) fn new(sinks: Vec<Box<dyn TaskStreamChannelSink>>) -> Self {
-        let counters = vec![ChannelCounter::default(); sinks.len()];
+        let counters = Some(vec![ChannelCounter::default(); sinks.len()]);
         Self {
             sinks: sinks.into_iter().map(Some).collect(),
             counters,
+        }
+    }
+
+    /// Creates a sink without counting, for outputs whose statistics are not used
+    /// (pipelined outputs, which have no committed form).
+    pub(crate) fn new_without_statistics(sinks: Vec<Box<dyn TaskStreamChannelSink>>) -> Self {
+        Self {
+            sinks: sinks.into_iter().map(Some).collect(),
+            counters: None,
         }
     }
 }
@@ -73,23 +84,27 @@ impl TaskStreamSink for MultiChannelTaskStreamSink {
         // Borrow each channel independently so slow I/O on one partition does
         // not prevent writes to other partitions from making progress. Retain
         // the sinks so the caller can abort them if any write fails.
-        try_join_all(
-            self.sinks
-                .iter_mut()
-                .zip(self.counters.iter_mut())
-                .zip(batches)
-                .map(|((sink, counter), batch)| async move {
-                    if let (Some(writer), Some(batch)) = (sink.as_mut(), batch) {
-                        // Count before the batch is moved into the backend. The counts are
-                        // published only if the whole output is committed.
-                        counter.add(&batch)?;
-                        if writer.write(batch).await? == TaskStreamWriteState::Closed {
-                            *sink = None;
-                        }
+        let channels = self.sinks.len();
+        let counters = self
+            .counters
+            .as_mut()
+            .map(|x| x.iter_mut().map(Some).collect::<Vec<_>>())
+            .unwrap_or_else(|| (0..channels).map(|_| None).collect());
+        try_join_all(self.sinks.iter_mut().zip(counters).zip(batches).map(
+            |((sink, counter), batch)| async move {
+                if let (Some(writer), Some(batch)) = (sink.as_mut(), batch) {
+                    // Count before the batch is moved into the backend. The counts are
+                    // published only if the whole output is committed.
+                    if let Some(counter) = counter {
+                        counter.add(&batch);
                     }
-                    Ok::<_, DataFusionError>(())
-                }),
-        )
+                    if writer.write(batch).await? == TaskStreamWriteState::Closed {
+                        *sink = None;
+                    }
+                }
+                Ok::<_, DataFusionError>(())
+            },
+        ))
         .await?;
         Ok(if self.sinks.iter().any(Option::is_some) {
             TaskStreamWriteState::Active
@@ -112,6 +127,7 @@ impl TaskStreamSink for MultiChannelTaskStreamSink {
             }
         }))
         .await?;
+        let counters = counters.unwrap_or_else(|| vec![ChannelCounter::default(); commits.len()]);
         Ok(TaskOutputStatistics {
             rows: counters.iter().map(|x| x.rows).collect(),
             physical_bytes: commits.into_iter().collect::<Option<Vec<_>>>(),
