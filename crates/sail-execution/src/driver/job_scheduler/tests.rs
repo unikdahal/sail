@@ -15,7 +15,7 @@ use crate::driver::job_scheduler::state::{
     ShuffleCommit, StageState, TaskAttemptDescriptor, TaskState,
 };
 use crate::driver::job_scheduler::test_utils::{
-    MIB, aggregate_graph, celeborn, job, producer_statistics, reporter, schema, succeed,
+    MIB, aggregate_graph, celeborn, commit, job, producer_statistics, reporter, schema, succeed,
 };
 use crate::driver::job_scheduler::{AdaptiveOptions, JobAction, JobScheduler, JobSchedulerOptions};
 use crate::id::{JobId, TaskKey};
@@ -77,10 +77,7 @@ fn statistics_are_folded_from_committed_attempts() {
     let mut job = job(aggregate_graph());
     succeed(&mut job, 0, producer_statistics);
     assert!(JobScheduler::committed_statistics(&mut job, 0).is_none());
-    job.stages[0].commit = Some(ShuffleCommit {
-        attempts: vec![0; 4],
-        succeeded: true,
-    });
+    commit(&mut job, 0);
     let statistics = JobScheduler::committed_statistics(&mut job, 0).unwrap();
     assert_eq!(statistics.total_rows, 3200);
     assert_eq!(statistics.total_physical_bytes, Some(8 * MIB));
