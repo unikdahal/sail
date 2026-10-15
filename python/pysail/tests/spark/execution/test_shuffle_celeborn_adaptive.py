@@ -121,10 +121,24 @@ def test_committed_statistics_are_recorded(spark):
     rows = _poll(
         spark,
         "SELECT CAST(rows AS BIGINT) AS rows, CAST(logical_bytes AS BIGINT) AS logical_bytes "
-        "FROM system.execution.stages WHERE rows IS NOT NULL",
+        f"FROM system.execution.stages WHERE rows IS NOT NULL AND session_id = '{spark.session_id}'",
     )
     assert rows
     assert all(row.logical_bytes >= 0 for row in rows)
+
+
+def test_statistics_are_not_collected_without_adaptive_execution(static_remote):
+    with spark_session_factory(static_remote) as sessions:
+        spark = sessions.create()
+        spark.range(1000).repartition(8, "id").groupBy((F.col("id") % 3).alias("m")).count().collect()
+        # System events are recorded asynchronously, so allow time for any to arrive.
+        time.sleep(2)
+        # Both servers of this module share the system store, so look at this session only.
+        rows = spark.sql(
+            "SELECT CAST(stage AS BIGINT) AS stage FROM system.execution.stages "
+            f"WHERE rows IS NOT NULL AND session_id = '{spark.session_id}'"
+        ).collect()
+        assert not rows, "statistics were collected without adaptive execution"
 
 
 def test_user_chosen_partition_count_is_kept(spark):
@@ -148,7 +162,7 @@ def test_skewed_join_is_split_with_map_range_reads(remote, static_remote):
         adaptive = adaptive_sessions.create()
         static = static_sessions.create()
         expected = _skewed_join(static).collect()
-        assert sum(row.c for row in expected) == 300_000  # noqa: PLR2004
+        assert sum(row.c for row in expected) == 300_000
         assert _skewed_join(adaptive).collect() == expected
 
         rules = _poll(
@@ -164,10 +178,10 @@ def _fail_once(marker: str):
 
     @F.udf("long")
     def fail_once(value):
-        import os  # noqa: PLC0415
+        import os
 
-        if value == 150_000 and not os.path.exists(marker):  # noqa: PLR2004
-            with open(marker, "w") as f:  # noqa: PTH123
+        if value == 150_000 and not os.path.exists(marker):
+            with open(marker, "w") as f:
                 f.write("failed")
             msg = "injected failure"
             raise RuntimeError(msg)
@@ -191,10 +205,10 @@ def test_retried_producer_output_is_read_once(remote, static_remote, tmp_path, a
             .agg(F.count("*").alias("c"), F.sum("id").alias("s"))
             .collect()
         )
-    import os  # noqa: PLC0415
+    import os
 
     assert os.path.exists(marker), "the failure was not injected"
     # A failed attempt pushed partial output before failing. Reading it in addition to
     # the retried attempt would duplicate rows.
-    assert sum(row.c for row in rows) == 200_000  # noqa: PLR2004
+    assert sum(row.c for row in rows) == 200_000
     assert sum(row.s for row in rows) == sum(range(200_000))
