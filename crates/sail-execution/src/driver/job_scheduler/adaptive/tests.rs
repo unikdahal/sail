@@ -7,12 +7,15 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::expressions::Column;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, lit};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -31,7 +34,7 @@ use crate::driver::job_scheduler::{JobAction, JobSchedulerOptions};
 use crate::id::TaskKey;
 use crate::job_graph::{JobGraph, JobGraphOptions};
 use crate::proto::RemoteExecutionCodec;
-use crate::statistics::{CompactOutputStatistics, ShuffleStatistics, TaskOutputStatistics};
+use crate::statistics::{ChannelCounts, ShuffleStatistics, TaskOutputStatistics};
 use crate::task::definition::{ShuffleServiceRead, TaskInputLocator};
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter};
 
@@ -128,7 +131,6 @@ fn statistics(physical: &[u64]) -> Arc<ShuffleStatistics> {
         total_rows: physical.iter().sum::<u64>() / 8,
         total_logical_bytes: physical.iter().sum::<u64>() * 2,
         total_physical_bytes: Some(physical.iter().sum()),
-        rows: physical.iter().map(|x| x / 8).collect(),
         physical_bytes: Some(physical.to_vec()),
         logical_bytes: physical.iter().map(|x| x * 2).collect(),
     })
@@ -140,7 +142,7 @@ fn shuffle_input(statistics: Arc<ShuffleStatistics>) -> InputView {
         origin: ShuffleOrigin::Engine,
         layout: BucketLayout::Direct,
         hash_partitioned: true,
-        buckets: statistics.rows.len(),
+        buckets: statistics.logical_bytes.len(),
         statistics: Some(statistics),
         producers: 1,
         committed: None,
@@ -358,6 +360,170 @@ fn build_guard_bounds_coalesced_build_partitions() {
     );
 }
 
+fn filter(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let predicate = Arc::new(BinaryExpr::new(key(), Operator::Gt, lit(0i64)));
+    Arc::new(FilterExec::try_new(predicate, input).unwrap())
+}
+
+/// A projection that computes a value, so its output may be wider than its input.
+fn computed_projection(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let value = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("v", 1)),
+        Operator::Plus,
+        lit(1i64),
+    ));
+    Arc::new(
+        ProjectionExec::try_new(
+            vec![(key(), "k".to_string()), (value, "v".to_string())],
+            input,
+        )
+        .unwrap(),
+    )
+}
+
+/// Returns the stage input that the first hash join of the plan builds from.
+fn build_input(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    let mut result = None;
+    plan.apply(|node| {
+        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            result = bounds::input_bound(join.left()).map(|x| x.input);
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    result
+}
+
+#[test]
+fn build_side_without_a_bound_is_not_coalesced() {
+    // The outer join builds from the output of the inner join, which can be far
+    // larger than its inputs. A projection that computes values has no bound either.
+    let nested = hash_join(
+        hash_join(
+            placeholder(0, 4),
+            placeholder(1, 4),
+            PartitionMode::Partitioned,
+            JoinType::Inner,
+        ),
+        placeholder(2, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let computed = hash_join(
+        computed_projection(placeholder(0, 4)),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    for (plan, inputs) in [(nested, 3), (computed, 2)] {
+        let mut view = view(plan, vec![shuffle_input(statistics(&[MIB; 4])); inputs]);
+        view.options.join_enabled = false;
+        let rewrite = adapt(&view).unwrap();
+        assert!(rewrite.is_none(), "{:?}", rewrite.map(|x| x.notes));
+    }
+}
+
+#[test]
+fn bounded_build_side_through_a_filter_is_coalesced_within_the_cap() {
+    let plan = hash_join(
+        filter(placeholder(0, 4)),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let mut view = view(
+        plan,
+        vec![
+            shuffle_input(statistics(&[10 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    view.options.join_max_build_partition_size = 50 * MIB;
+    view.options.join_enabled = false;
+    let rewrite = adapt(&view).unwrap().expect("a rewrite");
+    assert_eq!(
+        spec_ranges(rewrite.inputs[0].as_ref().unwrap()),
+        vec![0..2, 2..4]
+    );
+}
+
+#[test]
+fn logical_size_cap_bounds_coalesced_partitions() {
+    // Logical bytes are twice the physical bytes: 2 MiB per bucket.
+    let plan = final_aggregate(placeholder(0, 8));
+    let mut view = view(plan, vec![shuffle_input(statistics(&[MIB; 8]))]);
+    view.options.coalesce_max_logical_size = 5 * MIB;
+    let rewrite = adapt(&view).unwrap().expect("a rewrite");
+    assert_eq!(
+        spec_ranges(rewrite.inputs[0].as_ref().unwrap()),
+        vec![0..2, 2..4, 4..6, 6..8]
+    );
+}
+
+#[test]
+fn filtered_build_side_is_not_swapped() {
+    // The filter may remove most of the build side, so its input size does not show
+    // that the build side is larger than the probe side.
+    let plan = hash_join(
+        filter(placeholder(0, 4)),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let mut view = view(
+        plan,
+        vec![
+            shuffle_input(statistics(&[8 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    view.options.coalesce_enabled = false;
+    assert!(adapt(&view).unwrap().is_none());
+}
+
+#[test]
+fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
+    // The probe side is at most its input, so the exact build side is larger.
+    let plan = hash_join(
+        placeholder(0, 4),
+        filter(placeholder(1, 4)),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let mut view = view(
+        plan,
+        vec![
+            shuffle_input(statistics(&[8 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    view.options.coalesce_enabled = false;
+    let rewrite = adapt(&view).unwrap().expect("a rewrite");
+    assert_eq!(rewrite.rules, vec![joins::RULE_SWAP_JOIN_INPUTS]);
+    assert_eq!(build_input(&rewrite.plan), Some(1));
+    validate::validate_plan(&rewrite.plan).unwrap();
+}
+
+#[test]
+fn upper_bounded_build_side_keeps_its_hash_join() {
+    let plan = hash_join(
+        filter(placeholder(0, 4)),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Left,
+    );
+    let mut view = view(
+        plan,
+        vec![
+            shuffle_input(statistics(&[MIB, MIB, 40 * MIB, MIB])),
+            shuffle_input(statistics(&[100 * MIB; 4])),
+        ],
+    );
+    view.options.coalesce_enabled = false;
+    assert!(adapt(&view).unwrap().is_none());
+}
+
 #[test]
 fn joins_with_an_empty_input_are_pruned() {
     let plan = global_aggregate(hash_join(
@@ -559,24 +725,20 @@ fn aggregate_graph() -> JobGraph {
     .unwrap()
 }
 
-fn succeed(
-    job: &mut JobDescriptor,
-    stage: usize,
-    statistics: impl Fn(usize) -> TaskOutputStatistics,
-) {
+fn succeed(job: &mut JobDescriptor, stage: usize, statistics: impl Fn(usize) -> ChannelCounts) {
     for (p, task) in job.stages[stage].tasks.iter_mut().enumerate() {
         task.attempts.push(TaskAttemptDescriptor {
             state: TaskState::Succeeded,
             messages: vec![],
             cause: None,
             job_output_fetched: false,
-            statistics: Some(Arc::new(CompactOutputStatistics::new(&statistics(p)))),
+            statistics: Some(Arc::new(TaskOutputStatistics::new(&statistics(p)).unwrap())),
         });
     }
 }
 
-fn producer_statistics(_: usize) -> TaskOutputStatistics {
-    TaskOutputStatistics {
+fn producer_statistics(_: usize) -> ChannelCounts {
+    ChannelCounts {
         rows: vec![100; 8],
         physical_bytes: Some(vec![MIB / 4; 8]),
         logical_bytes: vec![MIB; 8],
@@ -758,7 +920,7 @@ fn output_is_retained_until_consumer_regions_succeed() {
     succeed(&mut job, 0, producer_statistics);
     // Stage 1 succeeds, but stage 2 in the same region is still running, so a failure
     // of stage 2 would rerun stage 1, which reads stage 0 again.
-    succeed(&mut job, 1, |_| TaskOutputStatistics::default());
+    succeed(&mut job, 1, |_| ChannelCounts::default());
     job.stages[2].tasks[0].attempts.push(TaskAttemptDescriptor {
         state: TaskState::Running,
         messages: vec![],
@@ -784,18 +946,30 @@ fn output_is_retained_until_consumer_regions_succeed() {
 }
 
 #[test]
+fn statistics_are_collected_only_for_adaptive_execution_on_celeborn() {
+    let job = job(aggregate_graph());
+    assert!(JobScheduler::collects_statistics(&adaptive_options(), &job));
+    let disabled = JobSchedulerOptions::new_for_test(celeborn(), AdaptiveOptions::default(), None);
+    assert!(!JobScheduler::collects_statistics(&disabled, &job));
+}
+
+#[test]
 fn statistics_are_folded_from_committed_attempts() {
     let mut job = job(aggregate_graph());
     succeed(&mut job, 0, producer_statistics);
-    assert!(JobScheduler::committed_statistics(&job, 0).is_none());
+    assert!(JobScheduler::committed_statistics(&mut job, 0).is_none());
     job.stages[0].commit = Some(ShuffleCommit {
         attempts: vec![0; 4],
         succeeded: true,
     });
-    let statistics = JobScheduler::committed_statistics(&job, 0).unwrap();
+    let statistics = JobScheduler::committed_statistics(&mut job, 0).unwrap();
     assert_eq!(statistics.total_rows, 3200);
     assert_eq!(statistics.total_physical_bytes, Some(8 * MIB));
     assert_eq!(statistics.total_logical_bytes, 32 * MIB);
+    // The fold is computed once and shared by every consumer.
+    let again = JobScheduler::committed_statistics(&mut job, 0).unwrap();
+    assert!(Arc::ptr_eq(&statistics, &again));
+    assert!(job.stages[0].retained_statistics_bytes >= statistics.retained_bytes() as u64);
 }
 
 #[test]
@@ -827,8 +1001,8 @@ fn pipelined_output_is_released_when_its_region_reruns_the_producer() {
     let mut job = job(graph);
     assert_eq!(job.topology.regions.len(), 1);
     let options = JobSchedulerOptions::new_for_test(flight, AdaptiveOptions::default(), None);
-    succeed(&mut job, 0, |_| TaskOutputStatistics::default());
-    succeed(&mut job, 1, |_| TaskOutputStatistics::default());
+    succeed(&mut job, 0, |_| ChannelCounts::default());
+    succeed(&mut job, 1, |_| ChannelCounts::default());
     job.stages[2].tasks[0].attempts.push(TaskAttemptDescriptor {
         state: TaskState::Running,
         messages: vec![],
@@ -855,11 +1029,14 @@ fn producer_input(matrix: &[Vec<u64>]) -> InputView {
     let committed = matrix
         .iter()
         .map(|physical| {
-            Arc::new(CompactOutputStatistics::new(&TaskOutputStatistics {
-                rows: physical.iter().map(|x| x / 8).collect(),
-                physical_bytes: Some(physical.clone()),
-                logical_bytes: physical.iter().map(|x| x * 2).collect(),
-            }))
+            Arc::new(
+                TaskOutputStatistics::new(&ChannelCounts {
+                    rows: physical.iter().map(|x| x / 8).collect(),
+                    physical_bytes: Some(physical.clone()),
+                    logical_bytes: physical.iter().map(|x| x * 2).collect(),
+                })
+                .unwrap(),
+            )
         })
         .collect::<Vec<_>>();
     let buckets = matrix[0].len();
@@ -1144,12 +1321,12 @@ fn celeborn_join_stage_is_split_and_reads_mapper_ranges() {
     let mut job = job(join_graph(JoinType::Inner));
     assert_eq!(job.graph.stages().len(), 3);
     // Every producer writes 50 MiB to bucket 1 of the left side and 1 MiB elsewhere.
-    succeed(&mut job, 0, |_| TaskOutputStatistics {
+    succeed(&mut job, 0, |_| ChannelCounts {
         rows: vec![100; 4],
         physical_bytes: Some(vec![MIB, 50 * MIB, MIB, MIB]),
         logical_bytes: vec![2 * MIB; 4],
     });
-    succeed(&mut job, 1, |_| TaskOutputStatistics {
+    succeed(&mut job, 1, |_| ChannelCounts {
         rows: vec![100; 4],
         physical_bytes: Some(vec![MIB; 4]),
         logical_bytes: vec![2 * MIB; 4],
@@ -1263,7 +1440,7 @@ fn rule_failure_keeps_the_static_plan_and_freezes_the_decision() {
     let options = adaptive_options();
     let consumer = job.graph.stages().len() - 1;
     for s in 0..consumer {
-        succeed(&mut job, s, |_| TaskOutputStatistics {
+        succeed(&mut job, s, |_| ChannelCounts {
             rows: vec![1; 2],
             physical_bytes: Some(vec![10; 2]),
             logical_bytes: vec![10; 2],

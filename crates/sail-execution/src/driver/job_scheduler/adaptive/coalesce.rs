@@ -5,8 +5,12 @@
 //! `ShufflePartitionsUtil.coalescePartitions`, with two differences:
 //!   - every bucket is read exactly once, including empty buckets, so the coverage of
 //!     a spec can be validated without statistics;
-//!   - an optional build cap bounds the build-side bytes of each coalesced range,
-//!     so coalescing never undoes a hash join decision.
+//!   - hard caps bound other per-range sizes, such as the uncompressed bytes of the
+//!     range or the build side of a hash join. A range of more than one bucket never
+//!     exceeds a cap; a single bucket above a cap is left alone, since coalescing
+//!     cannot make it smaller.
+//!
+//! Both passes are linear in the number of buckets.
 
 use std::ops::Range;
 
@@ -15,8 +19,13 @@ pub(crate) struct CoalesceParams {
     pub target_size: u64,
     pub min_partition_size: u64,
     pub min_partitions: usize,
-    /// The largest build-side size of a coalesced range of more than one bucket.
-    pub build_cap: Option<u64>,
+}
+
+/// A hard limit on a per-bucket size, summed over each coalesced range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Cap {
+    pub sizes: Vec<u64>,
+    pub limit: u64,
 }
 
 /// Returns the target size for the given total, as Spark does:
@@ -30,93 +39,124 @@ pub(crate) fn target_size(total: u64, params: &CoalesceParams) -> u64 {
         .max(1)
 }
 
+/// A range under construction, with its size and its size under each cap.
+#[derive(Debug, Clone)]
+struct Run {
+    range: Range<usize>,
+    size: u64,
+    capped: Vec<u64>,
+}
+
+impl Run {
+    fn new(i: usize, sizes: &[u64], caps: &[Cap]) -> Self {
+        Self {
+            range: i..i + 1,
+            size: sizes[i],
+            capped: caps.iter().map(|cap| cap.sizes[i]).collect(),
+        }
+    }
+
+    /// Whether the run and the next one may form one range.
+    fn fits(&self, next: &Run, caps: &[Cap]) -> bool {
+        self.capped
+            .iter()
+            .zip(&next.capped)
+            .zip(caps)
+            .all(|((a, b), cap)| a.saturating_add(*b) <= cap.limit)
+    }
+
+    fn absorb(&mut self, next: Run) {
+        self.range.end = next.range.end;
+        self.size = self.size.saturating_add(next.size);
+        for (a, b) in self.capped.iter_mut().zip(next.capped) {
+            *a = a.saturating_add(b);
+        }
+    }
+}
+
 /// Packs buckets into contiguous ranges.
 ///
-/// `sizes` are the bucket sizes summed across the group's inputs, and `build_sizes`
-/// are the bucket sizes of the inputs that feed the build side of a partitioned hash
-/// join. The returned ranges cover `0..sizes.len()` in order without gaps.
-pub(crate) fn coalesce(
-    sizes: &[u64],
-    build_sizes: Option<&[u64]>,
-    params: &CoalesceParams,
-) -> Vec<Range<usize>> {
+/// `sizes` are the bucket sizes summed across the group's inputs, and every cap
+/// has one size per bucket. The returned ranges cover `0..sizes.len()` in order
+/// without gaps.
+pub(crate) fn coalesce(sizes: &[u64], caps: &[Cap], params: &CoalesceParams) -> Vec<Range<usize>> {
     let n = sizes.len();
-    if n == 0 {
-        return vec![];
+    if n == 0 || caps.iter().any(|cap| cap.sizes.len() != n) {
+        return (0..n).map(|i| i..i + 1).collect();
     }
-    let build = |i: usize| build_sizes.map_or(0, |x| x[i]);
-    let exceeds_cap = |b: u64| params.build_cap.is_some_and(|cap| b > cap);
     let total = sizes.iter().fold(0u64, |a, b| a.saturating_add(*b));
     let target = target_size(total, params);
 
-    let mut ranges: Vec<(Range<usize>, u64, u64)> = vec![];
-    let mut start = 0;
-    let mut size = 0u64;
-    let mut build_size = 0u64;
-    for (i, &bucket_size) in sizes.iter().enumerate() {
-        let next_size = size.saturating_add(bucket_size);
-        let next_build = build_size.saturating_add(build(i));
-        if i > start && (next_size > target || exceeds_cap(next_build)) {
-            ranges.push((start..i, size, build_size));
-            start = i;
-            size = bucket_size;
-            build_size = build(i);
-        } else {
-            size = next_size;
-            build_size = next_build;
+    // Greedy pass: extend the current range while it stays within the target and
+    // the caps.
+    let mut runs: Vec<Run> = vec![];
+    for i in 0..n {
+        let bucket = Run::new(i, sizes, caps);
+        match runs.last_mut() {
+            Some(run)
+                if run.size.saturating_add(bucket.size) <= target && run.fits(&bucket, caps) =>
+            {
+                run.absorb(bucket)
+            }
+            _ => runs.push(bucket),
         }
     }
-    ranges.push((start..n, size, build_size));
 
-    // Merge ranges below the minimum size into their smaller neighbour,
-    // unless the merged range would exceed the build cap.
-    loop {
-        let candidate = ranges
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, size, _))| *size < params.min_partition_size)
-            .filter_map(|(i, (_, size, build_size))| {
-                let neighbours = [i.checked_sub(1), (i + 1 < ranges.len()).then_some(i + 1)];
-                neighbours
-                    .into_iter()
-                    .flatten()
-                    .filter(|&j| !exceeds_cap(build_size.saturating_add(ranges[j].2)))
-                    .min_by_key(|&j| ranges[j].1)
-                    .map(|j| (i, j, *size))
-            })
-            .min_by_key(|(_, _, size)| *size);
-        let Some((i, j, _)) = candidate else {
-            break;
+    // Merge pass: a range below the minimum size joins its smaller neighbour that
+    // keeps the caps. A range that joins its right neighbour is examined again,
+    // merged, with its own right neighbour.
+    let mut merged: Vec<Run> = Vec::with_capacity(runs.len());
+    let mut runs = runs.into_iter().peekable();
+    let mut pending: Option<Run> = None;
+    while let Some(mut run) = pending.take().or_else(|| runs.next()) {
+        if run.size >= params.min_partition_size {
+            merged.push(run);
+            continue;
+        }
+        let left = merged
+            .last()
+            .filter(|left| left.fits(&run, caps))
+            .map(|left| left.size);
+        let right = runs
+            .peek()
+            .filter(|right| run.fits(right, caps))
+            .map(|right| right.size);
+        let to_right = match (left, right) {
+            (Some(l), Some(r)) => r < l,
+            (None, Some(_)) => true,
+            _ => false,
         };
-        let (a, b) = (i.min(j), i.max(j));
-        let merged = (
-            ranges[a].0.start..ranges[b].0.end,
-            ranges[a].1.saturating_add(ranges[b].1),
-            ranges[a].2.saturating_add(ranges[b].2),
-        );
-        ranges[a] = merged;
-        ranges.remove(b);
+        if to_right {
+            if let Some(next) = runs.next() {
+                run.absorb(next);
+            }
+            pending = Some(run);
+        } else if let (Some(_), Some(left)) = (left, merged.last_mut()) {
+            left.absorb(run);
+        } else {
+            merged.push(run);
+        }
     }
-    ranges.into_iter().map(|(range, _, _)| range).collect()
+    merged.into_iter().map(|run| run.range).collect()
 }
 
-/// Returns whether every range of more than one bucket stays within the build cap.
-pub(crate) fn within_build_cap(
-    ranges: &[Range<usize>],
-    build_sizes: &[u64],
-    build_cap: u64,
-) -> bool {
-    ranges.iter().all(|range| {
-        range.len() <= 1
-            || build_sizes[range.clone()]
-                .iter()
-                .fold(0u64, |a, b| a.saturating_add(*b))
-                <= build_cap
+/// Returns whether every range of more than one bucket stays within every cap.
+pub(crate) fn within_caps(ranges: &[Range<usize>], caps: &[Cap]) -> bool {
+    caps.iter().all(|cap| {
+        ranges.iter().all(|range| {
+            range.len() <= 1
+                || cap
+                    .sizes
+                    .get(range.clone())
+                    .is_some_and(|x| x.iter().fold(0u64, |a, b| a.saturating_add(*b)) <= cap.limit)
+        })
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn params(target: u64, min: u64) -> CoalesceParams {
@@ -124,7 +164,6 @@ mod tests {
             target_size: target,
             min_partition_size: min,
             min_partitions: 1,
-            build_cap: None,
         }
     }
 
@@ -142,25 +181,35 @@ mod tests {
     #[test]
     fn keeps_two_partitions_where_the_skew_helper_would_merge() {
         // Spark's coalescing keeps [60, 50] as two partitions for target 100.
-        assert_eq!(coalesce(&[60, 50], None, &params(100, 1)), vec![0..1, 1..2]);
+        assert_eq!(coalesce(&[60, 50], &[], &params(100, 1)), vec![0..1, 1..2]);
     }
 
     #[test]
     fn packs_contiguous_buckets_up_to_the_target() {
-        let ranges = coalesce(&[10, 20, 30, 40, 50, 10, 10], None, &params(60, 1));
+        let ranges = coalesce(&[10, 20, 30, 40, 50, 10, 10], &[], &params(60, 1));
         assert_eq!(ranges, vec![0..3, 3..4, 4..6, 6..7]);
     }
 
     #[test]
     fn merges_small_ranges_into_the_smaller_neighbour() {
         // The greedy pass yields [0..1] (100), [1..2] (5), [2..3] (100), [3..4] (30).
-        let ranges = coalesce(&[100, 5, 100, 30], None, &params(100, 20));
+        let ranges = coalesce(&[100, 5, 100, 30], &[], &params(100, 20));
         assert_eq!(ranges, vec![0..2, 2..3, 3..4]);
+        // A small range prefers its smaller right neighbour.
+        let ranges = coalesce(&[100, 5, 50], &[], &params(100, 20));
+        assert_eq!(ranges, vec![0..1, 1..3]);
+    }
+
+    #[test]
+    fn small_ranges_carried_forward_keep_merging() {
+        // Every greedy range is small, so they merge left to right.
+        let ranges = coalesce(&[9, 9, 9, 9], &[], &params(10, 30));
+        assert_eq!(ranges, vec![0..4]);
     }
 
     #[test]
     fn empty_buckets_are_still_covered() {
-        let ranges = coalesce(&[0, 0, 0, 0], None, &params(100, 1));
+        let ranges = coalesce(&[0, 0, 0, 0], &[], &params(100, 1));
         assert_eq!(ranges, vec![0..4]);
     }
 
@@ -171,51 +220,68 @@ mod tests {
             ..params(1000, 1)
         };
         assert_eq!(target_size(400, &p), 100);
-        assert_eq!(coalesce(&[50; 8], None, &p).len(), 4);
+        assert_eq!(coalesce(&[50; 8], &[], &p).len(), 4);
     }
 
     #[test]
-    fn build_cap_bounds_coalesced_ranges() {
-        let p = CoalesceParams {
-            build_cap: Some(25),
-            ..params(1000, 1)
+    fn caps_bound_coalesced_ranges() {
+        let cap = Cap {
+            sizes: vec![10, 10, 10, 30, 1],
+            limit: 25,
         };
-        let build = [10, 10, 10, 30, 1];
-        let ranges = coalesce(&[1; 5], Some(&build), &p);
+        let ranges = coalesce(&[1; 5], std::slice::from_ref(&cap), &params(1000, 1));
         assert_eq!(ranges, vec![0..2, 2..3, 3..4, 4..5]);
-        assert!(within_build_cap(&ranges, &build, 25));
+        assert!(within_caps(&ranges, std::slice::from_ref(&cap)));
         // A single bucket above the cap is allowed.
-        let single = std::iter::once(0..1).collect::<Vec<_>>();
-        assert!(within_build_cap(&single, &[100], 25));
-        let pair = std::iter::once(0..2).collect::<Vec<_>>();
-        assert!(!within_build_cap(&pair, &[10, 20], 25));
+        let single = Cap {
+            sizes: vec![100],
+            limit: 25,
+        };
+        assert!(within_caps(std::slice::from_ref(&(0..1)), &[single]));
+        let pair = Cap {
+            sizes: vec![10, 20],
+            limit: 25,
+        };
+        assert!(!within_caps(std::slice::from_ref(&(0..2)), &[pair]));
     }
 
     #[test]
-    fn ranges_always_cover_all_buckets() {
-        // A deterministic pseudo-random sweep over size matrices.
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
+    fn small_ranges_do_not_merge_across_a_cap() {
+        let cap = Cap {
+            sizes: vec![20, 20, 20],
+            limit: 30,
         };
-        for _ in 0..500 {
-            let n = (next() % 64) as usize + 1;
-            let sizes = (0..n).map(|_| next() % 200).collect::<Vec<_>>();
-            let build = (0..n).map(|_| next() % 50).collect::<Vec<_>>();
-            let p = CoalesceParams {
-                target_size: next() % 300 + 1,
-                min_partition_size: next() % 50,
-                min_partitions: (next() % 4) as usize + 1,
-                build_cap: (next() % 2 == 0).then(|| next() % 100 + 1),
-            };
-            let ranges = coalesce(&sizes, Some(&build), &p);
-            assert!(covers(&ranges, n), "{sizes:?} {ranges:?}");
-            if let Some(cap) = p.build_cap {
-                assert!(within_build_cap(&ranges, &build, cap));
-            }
+        let ranges = coalesce(&[1, 1, 1], &[cap], &params(1000, 100));
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn many_buckets_coalesce_in_linear_time() {
+        let sizes = vec![1u64; 1_000_000];
+        let ranges = coalesce(&sizes, &[], &params(10, 1_000));
+        assert!(covers(&ranges, sizes.len()));
+        assert_eq!(ranges.len(), 1000);
+    }
+
+    proptest! {
+        #[test]
+        fn ranges_cover_all_buckets_and_respect_caps(
+            sizes in prop::collection::vec(0u64..200, 1..64),
+            cap_sizes in prop::collection::vec(0u64..50, 64),
+            target in 1u64..300,
+            min in 0u64..50,
+            min_partitions in 1usize..5,
+            limit in prop::option::of(1u64..100),
+        ) {
+            let n = sizes.len();
+            let caps = limit
+                .map(|limit| Cap { sizes: cap_sizes[..n].to_vec(), limit })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let p = CoalesceParams { target_size: target, min_partition_size: min, min_partitions };
+            let ranges = coalesce(&sizes, &caps, &p);
+            prop_assert!(covers(&ranges, n), "{:?} {:?}", sizes, ranges);
+            prop_assert!(within_caps(&ranges, &caps));
         }
     }
 }

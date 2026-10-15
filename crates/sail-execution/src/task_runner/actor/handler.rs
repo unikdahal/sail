@@ -14,6 +14,7 @@ use crate::driver::{DriverMessage, TaskStatus};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::statistics::TaskOutputStatistics;
+use crate::stream::celeborn::CelebornOutput;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
@@ -227,8 +228,7 @@ impl TaskRunnerActor {
         &mut self,
         ctx: &mut ActorContext<Self>,
         key: TaskKey,
-        mappers: usize,
-        channels: usize,
+        output: CelebornOutput,
         schema: Arc<Schema>,
         result: oneshot::Sender<ExecutionResult<Box<dyn TaskStreamSink>>>,
     ) -> ActorAction {
@@ -241,7 +241,7 @@ impl TaskRunnerActor {
         if let Some(streams) = self.extensions.celeborn_streams.clone() {
             ctx.spawn(async move {
                 let output = streams
-                    .create_stream(key, mappers, channels, schema)
+                    .create_stream(key, output, schema)
                     .await
                     .map_err(ExecutionError::from);
                 let _ = result.send(output);

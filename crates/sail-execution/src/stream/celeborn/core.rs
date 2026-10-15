@@ -11,7 +11,7 @@ use futures::{StreamExt, TryStreamExt};
 use sail_celeborn::shuffle::{PartitionReadOptions, ShuffleClient};
 
 use crate::id::{JobId, TaskKey};
-use crate::statistics::TaskOutputStatistics;
+use crate::statistics::ChannelCounts;
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{
@@ -19,6 +19,20 @@ use crate::stream::writer::{
     TaskStreamWriteState,
 };
 use crate::task::definition::ShuffleServiceRead;
+
+/// The largest number of Celeborn partitions that one task reads at a time.
+const MAX_CONCURRENT_PARTITION_READS: usize = 8;
+
+/// The shape of one map task's output to a Celeborn shuffle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CelebornOutput {
+    /// The number of map tasks of the producer stage.
+    pub mappers: usize,
+    /// The number of reduce channels.
+    pub channels: usize,
+    /// Whether the sinks count the output for committed statistics.
+    pub collect_statistics: bool,
+}
 
 #[derive(Clone)]
 pub(crate) struct CelebornStreamManager {
@@ -65,10 +79,14 @@ impl CelebornStreamManager {
     pub(crate) async fn create_stream(
         &self,
         key: TaskKey,
-        mappers: usize,
-        channels: usize,
+        output: CelebornOutput,
         schema: SchemaRef,
     ) -> Result<Box<dyn TaskStreamSink>> {
+        let CelebornOutput {
+            mappers,
+            channels,
+            collect_statistics,
+        } = output;
         // A Celeborn shuffle spans every map task and reduce channel in one producer stage.
         let shuffle_id = self
             .client
@@ -108,7 +126,7 @@ impl CelebornStreamManager {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Box::new(CelebornTaskStreamSink {
-            channels: MultiChannelTaskStreamSink::new(sinks),
+            channels: MultiChannelTaskStreamSink::new(sinks, collect_statistics),
             client: self.client.clone(),
             shuffle_id,
             map_id,
@@ -165,35 +183,34 @@ impl CelebornStreamManager {
             .register_shuffle(shuffle_id, partition_ids.clone(), false, 0)
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let streams = futures::future::join_all(partition_ids.into_iter().map(|partition_id| {
-            self.client.read_partition_stream_with_options(
-                shuffle_id,
-                partition_id,
-                options.clone(),
-            )
-        }))
-        .await;
-        let streams = streams
-            .into_iter()
-            .map(|stream| {
-                let schema = schema.clone();
-                Box::pin(
-                    stream
-                        .map(move |result| {
-                            result
-                                .map_err(|error| TaskStreamError::External(Arc::new(error)))
-                                .and_then(|data| {
-                                    decode_batches(data, &schema).map_err(|error| {
-                                        TaskStreamError::Unknown(error.to_string())
-                                    })
-                                })
-                        })
-                        .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
-                        .try_flatten(),
-                ) as TaskStreamSource
+        // Partition streams are opened lazily and at most a few at a time, so a task
+        // that reads many channels (a coalesced range or a broadcast input) does not
+        // open all of them on the shuffle service at once.
+        let client = self.client.clone();
+        let streams = futures::stream::iter(partition_ids).map(move |partition_id| {
+            let client = client.clone();
+            let options = options.clone();
+            let schema = schema.clone();
+            Box::pin(futures::stream::once(async move {
+                client
+                    .read_partition_stream_with_options(shuffle_id, partition_id, options)
+                    .await
+            }))
+            .flatten()
+            .map(move |result| {
+                result
+                    .map_err(|error| TaskStreamError::External(Arc::new(error)))
+                    .and_then(|data| {
+                        decode_batches(data, &schema)
+                            .map_err(|error| TaskStreamError::Unknown(error.to_string()))
+                    })
             })
-            .collect::<Vec<TaskStreamSource>>();
-        Ok(Box::pin(futures::stream::select_all(streams)))
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
+        });
+        Ok(Box::pin(
+            streams.flatten_unordered(MAX_CONCURRENT_PARTITION_READS),
+        ))
     }
 }
 
@@ -273,9 +290,9 @@ impl TaskStreamSink for CelebornTaskStreamSink {
         self.channels.write(batches).await
     }
 
-    async fn commit(self: Box<Self>) -> Result<TaskOutputStatistics> {
-        let statistics = Box::new(self.channels).commit().await?;
-        // The statistics become visible only once `mapper_end` succeeds. Whether this
+    async fn commit(self: Box<Self>) -> Result<Option<ChannelCounts>> {
+        let counts = Box::new(self.channels).commit().await?;
+        // The counts become visible only once `mapper_end` succeeds. Whether this
         // attempt's output is the one Celeborn serves is decided by the lifecycle manager,
         // which reports the selected attempt of every mapper to the driver.
         self.client
@@ -287,7 +304,7 @@ impl TaskStreamSink for CelebornTaskStreamSink {
             )
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        Ok(statistics)
+        Ok(counts)
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {

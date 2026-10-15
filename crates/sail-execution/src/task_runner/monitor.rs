@@ -14,7 +14,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::driver::TaskStatus;
 use crate::id::{TaskKey, TaskKeyDisplay};
-use crate::statistics::TaskOutputStatistics;
+use crate::statistics::{ChannelCounts, TaskOutputStatistics};
 use crate::task_runner::{TaskRunnerActor, TaskRunnerMessage};
 
 pub struct TaskMonitor {
@@ -174,7 +174,9 @@ impl TaskMonitor {
             };
             // Statistics are advisory, so a malformed completion batch drops them
             // instead of failing a task whose output has been committed.
-            match TaskOutputStatistics::try_from_record_batch(&batch) {
+            match ChannelCounts::try_from_record_batch(&batch)
+                .and_then(|x| x.as_ref().map(TaskOutputStatistics::new).transpose())
+            {
                 Ok(Some(x)) => statistics = Some(x),
                 Ok(None) => {}
                 Err(error) => {
@@ -255,16 +257,17 @@ mod tests {
         use datafusion::arrow::array::RecordBatch;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
-        let statistics = TaskOutputStatistics {
+        let counts = ChannelCounts {
             rows: vec![3, 4],
             physical_bytes: None,
             logical_bytes: vec![30, 40],
         };
-        let batch = statistics.to_record_batch().map_err(|e| e.to_string())?;
-        let empty = RecordBatch::new_empty(TaskOutputStatistics::schema());
+        let statistics = TaskOutputStatistics::new(&counts).map_err(|e| e.to_string())?;
+        let batch = counts.to_record_batch().map_err(|e| e.to_string())?;
+        let empty = RecordBatch::new_empty(ChannelCounts::schema());
         for (batches, expected) in [(vec![batch], Some(statistics.clone())), (vec![empty], None)] {
             let stream = Box::pin(RecordBatchStreamAdapter::new(
-                TaskOutputStatistics::schema(),
+                ChannelCounts::schema(),
                 futures::stream::iter(batches.into_iter().map(Ok)),
             ));
             let TaskRunnerMessage::ReportTaskStatus {

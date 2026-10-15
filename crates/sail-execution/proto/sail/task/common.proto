@@ -128,4 +128,7 @@ message TaskOutputPipelinedLocator {
 }
 
 message TaskOutputBlockingLocator {
+  // Whether the sinks count the output and the task reports its committed
+  // statistics, which the driver requests only for adaptive execution.
+  bool collect_statistics = 1;
 }

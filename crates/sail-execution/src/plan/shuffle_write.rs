@@ -19,7 +19,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use sail_physical_plan::repartition::RowRoundRobinPartitioner;
 
-use crate::statistics::TaskOutputStatistics;
+use crate::statistics::ChannelCounts;
 use crate::stream::writer::{TaskStreamWriteState, TaskStreamWriter};
 
 enum ShufflePartitioner {
@@ -120,14 +120,14 @@ impl ShuffleWriteExec {
     ) -> Self {
         let partitioning = partitioning.normalize();
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(TaskOutputStatistics::schema()),
+            EquivalenceProperties::new(ChannelCounts::schema()),
             // The shuffle write plan has the same number of partitions as the input plan.
             // For each partition that are executed, the data is further partitioned according to
             // the shuffle partitioning, resulting in multiple output streams.
             // These output streams are written to locations managed by the worker,
             // while the return value of `.execute()` is a single completion batch.
-            // The completion batch carries the committed output statistics with one row
-            // per channel, or no rows if the output was not committed.
+            // The completion batch carries the committed output counts with one row
+            // per channel, or no rows if the output was not committed or not counted.
             Partitioning::UnknownPartitioning(plan.output_partitioning().partition_count()),
             EmissionType::Final,
             Boundedness::Unbounded {
@@ -255,7 +255,7 @@ impl ExecutionPlan for ShuffleWriteExec {
         let channels = self.partitioning.partition_count();
         let output = futures::stream::once(async move {
             match shuffle_write(writer, stream, partition, channels, partitioner).await? {
-                Some(statistics) => statistics.to_record_batch(),
+                Some(counts) => counts.to_record_batch(),
                 None => Ok(empty),
             }
         });
@@ -272,7 +272,7 @@ async fn shuffle_write(
     partition: usize,
     channels: usize,
     mut partitioner: ShufflePartitioner,
-) -> Result<Option<TaskOutputStatistics>> {
+) -> Result<Option<ChannelCounts>> {
     let mut sink = writer.open(partition).await?;
     let result = async {
         while let Some(batch) = stream.next().await {
@@ -294,14 +294,16 @@ async fn shuffle_write(
     .await;
     match result {
         Ok(true) => {
-            let statistics = sink.commit().await?;
-            if statistics.channels() != channels {
+            let counts = sink.commit().await?;
+            if let Some(counts) = &counts
+                && counts.channels() != channels
+            {
                 return internal_err!(
-                    "expected statistics for {channels} shuffle output channels, got {}",
-                    statistics.channels()
+                    "expected counts for {channels} shuffle output channels, got {}",
+                    counts.channels()
                 );
             }
-            Ok(Some(statistics))
+            Ok(counts)
         }
         Ok(false) => {
             // TODO: model successful early-stop separately from error-triggered aborts

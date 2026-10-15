@@ -4,7 +4,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use futures::future::try_join_all;
 
-use crate::statistics::{ChannelCounter, TaskOutputStatistics};
+use crate::statistics::{ChannelCounter, ChannelCounts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStreamWriteState {
@@ -23,9 +23,9 @@ pub trait TaskStreamSink: Send {
     /// Write at most one batch per output channel concurrently. Calls are ordered
     /// so that each channel preserves its input batch order.
     async fn write(&mut self, batches: Vec<Option<RecordBatch>>) -> Result<TaskStreamWriteState>;
-    /// Commits the output and returns the statistics of the committed output.
-    /// Statistics must describe only what the backend has committed.
-    async fn commit(self: Box<Self>) -> Result<TaskOutputStatistics>;
+    /// Commits the output and returns the counts of the committed output, if the
+    /// sink counts. Counts must describe only what the backend has committed.
+    async fn commit(self: Box<Self>) -> Result<Option<ChannelCounts>>;
     async fn abort(self: Box<Self>) -> Result<()>;
 }
 
@@ -52,21 +52,12 @@ pub(crate) struct MultiChannelTaskStreamSink {
 }
 
 impl MultiChannelTaskStreamSink {
-    /// Creates a sink that counts what each channel accepts.
-    pub(crate) fn new(sinks: Vec<Box<dyn TaskStreamChannelSink>>) -> Self {
-        let counters = Some(vec![ChannelCounter::default(); sinks.len()]);
+    /// Creates a sink that counts what each channel accepts if `count` is set.
+    pub(crate) fn new(sinks: Vec<Box<dyn TaskStreamChannelSink>>, count: bool) -> Self {
+        let counters = count.then(|| vec![ChannelCounter::default(); sinks.len()]);
         Self {
             sinks: sinks.into_iter().map(Some).collect(),
             counters,
-        }
-    }
-
-    /// Creates a sink without counting, for outputs whose statistics are not used
-    /// (pipelined outputs, which have no committed form).
-    pub(crate) fn new_without_statistics(sinks: Vec<Box<dyn TaskStreamChannelSink>>) -> Self {
-        Self {
-            sinks: sinks.into_iter().map(Some).collect(),
-            counters: None,
         }
     }
 }
@@ -113,7 +104,7 @@ impl TaskStreamSink for MultiChannelTaskStreamSink {
         })
     }
 
-    async fn commit(self: Box<Self>) -> Result<TaskOutputStatistics> {
+    async fn commit(self: Box<Self>) -> Result<Option<ChannelCounts>> {
         let Self { sinks, counters } = *self;
         // A consumer may finish without reading one channel (for example, an
         // empty hash-join build partition). Do not let that channel's buffered
@@ -127,12 +118,11 @@ impl TaskStreamSink for MultiChannelTaskStreamSink {
             }
         }))
         .await?;
-        let counters = counters.unwrap_or_else(|| vec![ChannelCounter::default(); commits.len()]);
-        Ok(TaskOutputStatistics {
+        Ok(counters.map(|counters| ChannelCounts {
             rows: counters.iter().map(|x| x.rows).collect(),
             physical_bytes: commits.into_iter().collect::<Option<Vec<_>>>(),
             logical_bytes: counters.iter().map(|x| x.logical_bytes).collect(),
-        })
+        }))
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {
@@ -203,6 +193,7 @@ mod tests {
                     }) as Box<dyn TaskStreamChannelSink>
                 })
                 .collect(),
+            true,
         );
         // A sequential writer cannot get past the first channel's barrier.
         for _ in 0..2 {
@@ -212,7 +203,7 @@ mod tests {
                     .map_err(|error| DataFusionError::External(Box::new(error)))??;
             assert_eq!(state, TaskStreamWriteState::Active);
         }
-        let statistics = Box::new(sink).commit().await?;
+        let statistics = Box::new(sink).commit().await?.unwrap_or_default();
         assert_eq!(statistics.rows, vec![0, 0]);
         assert_eq!(statistics.physical_bytes, Some(vec![7, 7]));
         Ok(())
@@ -231,6 +222,7 @@ mod tests {
                     }) as Box<dyn TaskStreamChannelSink>
                 })
                 .collect(),
+            true,
         );
         assert_eq!(
             sink.write(vec![batch(), None]).await?,
@@ -263,6 +255,7 @@ mod tests {
                     }) as Box<dyn TaskStreamChannelSink>
                 })
                 .collect(),
+            true,
         );
         let rows = |n: i32| -> Result<Option<RecordBatch>> {
             Ok(Some(RecordBatch::try_from_iter(vec![(
@@ -272,11 +265,27 @@ mod tests {
         };
         sink.write(vec![rows(3)?, None, rows(1)?]).await?;
         sink.write(vec![rows(2)?, None, rows(5)?]).await?;
-        let statistics = Box::new(sink).commit().await?;
+        let statistics = Box::new(sink).commit().await?.unwrap_or_default();
         assert_eq!(statistics.rows, vec![5, 0, 1]);
         assert_eq!(statistics.logical_bytes, vec![20, 0, 4]);
         // A closed channel has no committed size, so the physical size is unknown.
         assert_eq!(statistics.physical_bytes, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_without_counting_returns_no_counts() -> Result<()> {
+        let mut sink = MultiChannelTaskStreamSink::new(
+            vec![Box::new(TestSink {
+                barrier: None,
+                state: TaskStreamWriteState::Active,
+                fail: false,
+                aborted: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn TaskStreamChannelSink>],
+            false,
+        );
+        sink.write(vec![batch()]).await?;
+        assert_eq!(Box::new(sink).commit().await?, None);
         Ok(())
     }
 
@@ -295,6 +304,7 @@ mod tests {
                     }) as Box<dyn TaskStreamChannelSink>
                 })
                 .collect(),
+            true,
         );
         let result =
             tokio::time::timeout(Duration::from_secs(5), sink.write(vec![batch(), batch()]))

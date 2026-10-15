@@ -5,6 +5,9 @@
 //! bucket boundaries, so they form one alignment group. The grouping follows Spark's
 //! `CoalesceShufflePartitions`: children of broadcast joins and plain unions are
 //! grouped independently.
+//!
+//! Each group also records the build side of every partitioned hash join in it,
+//! since coalescing the group enlarges the hash table that each task builds.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -16,6 +19,7 @@ use datafusion::physical_plan::joins::{
 };
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 
+use crate::driver::job_scheduler::adaptive::bounds::input_bound;
 use crate::plan::StageInputExec;
 
 /// An alignment group of stage inputs.
@@ -23,8 +27,10 @@ use crate::plan::StageInputExec;
 pub(crate) struct AlignmentGroup {
     /// The stage inputs in the group, by placeholder index.
     pub inputs: BTreeSet<usize>,
-    /// The inputs that feed the build side of a partitioned hash join.
-    pub build_inputs: BTreeSet<usize>,
+    /// The build side of each partitioned hash join over the group: the stage
+    /// input whose committed logical bytes bound the build side in each partition,
+    /// or `None` if no input bounds it (e.g. the build side is itself a join).
+    pub builds: Vec<Option<usize>>,
     /// Whether the group contains a leaf that is not a stage input (e.g. a scan),
     /// whose partitioning cannot be rewritten.
     pub fixed: bool,
@@ -36,7 +42,7 @@ pub(crate) fn alignment_groups(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<AlignmentGroup>, String> {
     let mut groups = vec![AlignmentGroup::default()];
-    walk(plan, Some(0), false, false, &mut groups)?;
+    walk(plan, Some(0), false, &mut groups)?;
     Ok(groups
         .into_iter()
         .filter(|group| !group.inputs.is_empty() || group.fixed)
@@ -48,21 +54,15 @@ pub(crate) fn alignment_groups(
 ///     whose partitions are read in full by every task.
 ///   - `aligned` is whether the current domain is paired with another domain by an
 ///     ancestor, in which case the domain's partition count must not change on its own.
-///   - `build` is whether the current domain feeds the build side of a partitioned
-///     hash join.
 fn walk(
     node: &Arc<dyn ExecutionPlan>,
     group: Option<usize>,
     aligned: bool,
-    build: bool,
     groups: &mut Vec<AlignmentGroup>,
 ) -> Result<(), String> {
     if let Some(placeholder) = node.downcast_ref::<StageInputExec<usize>>() {
         if let Some(g) = group {
             groups[g].inputs.insert(*placeholder.input());
-            if build {
-                groups[g].build_inputs.insert(*placeholder.input());
-            }
         }
         return Ok(());
     }
@@ -73,24 +73,29 @@ fn walk(
     if let Some(join) = node.downcast_ref::<HashJoinExec>() {
         return match join.mode {
             PartitionMode::Partitioned => {
-                walk(join.left(), group, true, true, groups)?;
-                walk(join.right(), group, true, build, groups)
+                if let Some(g) = group {
+                    groups[g]
+                        .builds
+                        .push(input_bound(join.left()).map(|x| x.input));
+                }
+                walk(join.left(), group, true, groups)?;
+                walk(join.right(), group, true, groups)
             }
             PartitionMode::CollectLeft => {
-                walk(join.left(), None, false, false, groups)?;
-                walk(join.right(), group, aligned, build, groups)
+                walk(join.left(), None, false, groups)?;
+                walk(join.right(), group, aligned, groups)
             }
             PartitionMode::Auto => Err("the stage has a hash join in auto mode".to_string()),
         };
     }
     if let Some(join) = node.downcast_ref::<SortMergeJoinExec>() {
-        walk(join.left(), group, true, build, groups)?;
-        return walk(join.right(), group, true, build, groups);
+        walk(join.left(), group, true, groups)?;
+        return walk(join.right(), group, true, groups);
     }
     if node.is::<SymmetricHashJoinExec>() {
         let children = node.children();
         for child in children {
-            walk(child, group, true, build, groups)?;
+            walk(child, group, true, groups)?;
         }
         return Ok(());
     }
@@ -102,8 +107,8 @@ fn walk(
         let [left, right] = children.as_slice() else {
             return Err(format!("unexpected children of {}", node.name()));
         };
-        walk(left, None, false, false, groups)?;
-        return walk(right, group, aligned, build, groups);
+        walk(left, None, false, groups)?;
+        return walk(right, group, aligned, groups);
     }
     if node.is::<UnionExec>() {
         if aligned {
@@ -117,7 +122,7 @@ fn walk(
                 }
                 None => None,
             };
-            walk(child, child_group, false, false, groups)?;
+            walk(child, child_group, false, groups)?;
         }
         return Ok(());
     }
@@ -128,7 +133,7 @@ fn walk(
             }
             Ok(())
         }
-        [child] => walk(child, group, aligned, build, groups),
+        [child] => walk(child, group, aligned, groups),
         _ => Err(format!(
             "the stage contains {} with multiple inputs",
             node.name()

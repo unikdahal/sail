@@ -14,6 +14,7 @@
 //! Any failure leaves the stage as statically planned. Adaptive execution never
 //! fails a job by itself.
 
+mod bounds;
 mod coalesce;
 mod domain;
 mod joins;
@@ -38,7 +39,7 @@ use sail_system_store::SystemEvent;
 use sail_telemetry::events::SystemEventReporter;
 
 use crate::driver::job_scheduler::adaptive::coalesce::{
-    CoalesceParams, coalesce, within_build_cap,
+    Cap, CoalesceParams, coalesce, within_caps,
 };
 use crate::driver::job_scheduler::adaptive::domain::{AlignmentGroup, alignment_groups};
 use crate::driver::job_scheduler::adaptive::joins::{
@@ -205,11 +206,22 @@ impl JobScheduler {
 
     /// Builds the snapshot of a stage, or returns why the stage is not eligible.
     fn stage_view(
-        job: &JobDescriptor,
+        job: &mut JobDescriptor,
         s: usize,
         options: &AdaptiveOptions,
         slot_cap: Option<usize>,
     ) -> Result<StageView, String> {
+        // Fold the statistics of every producer first. The fold is cached per producer,
+        // so all consumers of a shuffle share it.
+        let statistics = job.graph.stages()[s]
+            .inputs
+            .iter()
+            .map(|input| input.stage)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|producer| Self::committed_statistics(job, producer))
+            .collect::<Vec<_>>();
+        let job = &*job;
         let stage = &job.graph.stages()[s];
         if stage.placement != TaskPlacement::Worker || stage.kind != StageKind::Compute {
             return Err("the stage is not a worker compute stage".to_string());
@@ -242,7 +254,7 @@ impl JobScheduler {
                     input.mode
                 ));
             }
-            let statistics = Self::committed_statistics(job, input.stage).map(Arc::new);
+            let statistics = statistics[i].clone();
             if statistics.is_none() && matches!(input.mode, InputMode::Shuffle) {
                 return Err(format!(
                     "input {i} has no committed statistics from stage {}",
@@ -266,25 +278,6 @@ impl JobScheduler {
             options: options.clone(),
             slot_cap,
         })
-    }
-
-    /// Returns the statistics of the committed attempt of each partition of a stage,
-    /// or `None` if any of them is unknown.
-    fn committed_attempt_statistics(
-        job: &JobDescriptor,
-        stage: usize,
-    ) -> Option<Vec<Arc<crate::statistics::CompactOutputStatistics>>> {
-        Self::committed_attempts(job, stage)?
-            .iter()
-            .enumerate()
-            .map(|(p, &a)| {
-                job.stages[stage].tasks[p]
-                    .attempts
-                    .get(a)?
-                    .statistics
-                    .clone()
-            })
-            .collect()
     }
 
     /// Validates the rewrite and commits it atomically.
@@ -432,7 +425,7 @@ pub(crate) fn adapt(view: &StageView) -> Result<Option<StageRewrite>, String> {
             }
         };
         let identity = (0..sizes.buckets).map(|b| b..b + 1).collect::<Vec<_>>();
-        let ranges = if view.options.coalesce_enabled {
+        let ranges = if view.options.coalesce_enabled && sizes.buckets > 1 {
             coalesce_ranges(view, &sizes).unwrap_or_else(|reason| {
                 notes.push(format!("inputs {:?} not coalesced: {reason}", group.inputs));
                 identity.clone()
@@ -541,7 +534,7 @@ fn partition_logical_sizes(
                         .get(producers.clone())?
                         .iter()
                         .fold(0u64, |a, s| {
-                            a.saturating_add(s.logical_bytes(slice.buckets.start))
+                            a.saturating_add(s.logical_bytes_of(slice.buckets.start))
                         }),
                 };
                 Some(total.saturating_add(size))
@@ -555,9 +548,10 @@ struct GroupSizes {
     buckets: usize,
     /// Physical bytes per bucket, summed across the group's inputs.
     sizes: Vec<u64>,
-    /// Logical bytes per bucket of the inputs that feed the build side of a
-    /// partitioned hash join.
-    build_sizes: Option<Vec<u64>>,
+    /// Hard limits on every coalesced range of more than one bucket.
+    caps: Vec<Cap>,
+    /// Why the group must not be coalesced, if it must not.
+    coalesce_blocker: Option<String>,
 }
 
 /// Returns the sizes of an alignment group, nothing for a group without inputs, or
@@ -566,9 +560,10 @@ fn group_sizes(view: &StageView, group: &AlignmentGroup) -> Result<Option<GroupS
     if group.fixed {
         return Err("the group reads a source that is not a stage input".to_string());
     }
+    let options = &view.options;
     let mut buckets = None;
     let mut sizes: Vec<u64> = vec![];
-    let mut build_sizes: Option<Vec<u64>> = None;
+    let mut logical: Vec<u64> = vec![];
     for &i in &group.inputs {
         let input = view
             .inputs
@@ -595,26 +590,50 @@ fn group_sizes(view: &StageView, group: &AlignmentGroup) -> Result<Option<GroupS
             .physical_bytes
             .as_ref()
             .ok_or_else(|| format!("input {i} has unknown physical sizes"))?;
-        if physical.len() != input.buckets {
+        if physical.len() != input.buckets || statistics.logical_bytes.len() != input.buckets {
             return Err(format!("input {i} statistics do not match its buckets"));
         }
         if sizes.is_empty() {
             sizes = vec![0; input.buckets];
+            logical = vec![0; input.buckets];
         }
         for (total, value) in sizes.iter_mut().zip(physical) {
             *total = total.saturating_add(*value);
         }
-        if group.build_inputs.contains(&i) {
-            let build = build_sizes.get_or_insert_with(|| vec![0; input.buckets]);
-            for (total, value) in build.iter_mut().zip(&statistics.logical_bytes) {
-                *total = total.saturating_add(*value);
+        for (total, value) in logical.iter_mut().zip(&statistics.logical_bytes) {
+            *total = total.saturating_add(*value);
+        }
+    }
+    let Some(buckets) = buckets else {
+        return Ok(None);
+    };
+    // Physical sizes reflect compression, so the uncompressed data a coalesced task
+    // reads is bounded separately.
+    let mut caps = vec![Cap {
+        sizes: logical,
+        limit: options.coalesce_max_logical_size,
+    }];
+    let mut coalesce_blocker = None;
+    for build in &group.builds {
+        match build.and_then(|i| view.statistics(i)) {
+            // The build side of each task is at most the input's bytes in its range.
+            Some(statistics) => caps.push(Cap {
+                sizes: statistics.logical_bytes.clone(),
+                limit: options.join_max_build_partition_size,
+            }),
+            None => {
+                coalesce_blocker = Some(
+                    "the build side of a partitioned hash join is not bounded by committed statistics"
+                        .to_string(),
+                );
             }
         }
     }
-    Ok(buckets.map(|buckets| GroupSizes {
+    Ok(Some(GroupSizes {
         buckets,
         sizes,
-        build_sizes,
+        caps,
+        coalesce_blocker,
     }))
 }
 
@@ -623,21 +642,18 @@ fn coalesce_ranges(
     view: &StageView,
     sizes: &GroupSizes,
 ) -> Result<Vec<std::ops::Range<usize>>, String> {
+    if let Some(blocker) = &sizes.coalesce_blocker {
+        return Err(blocker.clone());
+    }
     let options = &view.options;
     let params = CoalesceParams {
         target_size: options.coalesce_target_size,
         min_partition_size: options.coalesce_min_partition_size,
         min_partitions: options.coalesce_min_partitions,
-        build_cap: sizes
-            .build_sizes
-            .as_ref()
-            .map(|_| options.join_max_build_partition_size),
     };
-    let ranges = coalesce(&sizes.sizes, sizes.build_sizes.as_deref(), &params);
-    if let Some(build) = &sizes.build_sizes
-        && !within_build_cap(&ranges, build, options.join_max_build_partition_size)
-    {
-        return Err("a coalesced build partition would exceed the build cap".to_string());
+    let ranges = coalesce(&sizes.sizes, &sizes.caps, &params);
+    if !within_caps(&ranges, &sizes.caps) {
+        return Err("a coalesced partition would exceed a size cap".to_string());
     }
     Ok(ranges)
 }

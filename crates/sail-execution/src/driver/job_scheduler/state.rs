@@ -9,7 +9,7 @@ use crate::driver::job_scheduler::topology::JobTopology;
 use crate::driver::output::{JobOutputManager, JobOutputOutcome};
 use crate::error::ExecutionResult;
 use crate::job_graph::JobGraph;
-use crate::statistics::CompactOutputStatistics;
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 
 /// Tracks graph/topology and runtime state for a single job.
 pub struct JobDescriptor {
@@ -29,7 +29,7 @@ pub struct AdaptiveMetrics {
     pub replanning_time: Duration,
     /// The number of stages whose plans were rewritten.
     pub replanned_stages: usize,
-    /// Bytes of statistics received with task reports.
+    /// Bytes of compact statistics received with task reports.
     pub statistics_payload_bytes: u64,
     /// The number of bytes currently retained for statistics.
     pub retained_statistics_bytes: u64,
@@ -85,6 +85,7 @@ impl JobDescriptor {
                 adaptive: AdaptiveDecision::Pending,
                 statistics_reported: false,
                 retained_statistics_bytes: 0,
+                shuffle_statistics: None,
             };
             for _ in 0..stage.plan.output_partitioning().partition_count() {
                 descriptor.tasks.push(TaskDescriptor { attempts: vec![] });
@@ -124,6 +125,10 @@ pub struct StageDescriptor {
     pub statistics_reported: bool,
     /// The number of bytes retained for the statistics of the stage's attempts.
     pub retained_statistics_bytes: u64,
+    /// The statistics of the committed attempts folded per bucket, cached so that
+    /// every consumer shares one fold. Cleared when the commit changes or the
+    /// statistics are released.
+    pub shuffle_statistics: Option<Arc<ShuffleStatistics>>,
 }
 
 /// The output that a shuffle backend committed for a stage.
@@ -204,7 +209,7 @@ pub struct TaskAttemptDescriptor {
     /// The committed output statistics reported with the succeeded status.
     /// They are released once every consumer of the stage has made its
     /// adaptive decision.
-    pub statistics: Option<Arc<CompactOutputStatistics>>,
+    pub statistics: Option<Arc<TaskOutputStatistics>>,
 }
 
 #[derive(Debug, Clone, Copy)]

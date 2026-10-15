@@ -11,6 +11,7 @@ use crate::driver::TaskStatus;
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::statistics::TaskOutputStatistics;
+use crate::stream::celeborn::CelebornOutput;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
@@ -54,8 +55,7 @@ pub enum TaskRunnerMessage {
     },
     CreateCelebornStream {
         key: TaskKey,
-        mappers: usize,
-        channels: usize,
+        output: CelebornOutput,
         schema: SchemaRef,
         result: oneshot::Sender<ExecutionResult<Box<dyn TaskStreamSink>>>,
     },

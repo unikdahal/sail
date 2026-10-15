@@ -1,13 +1,16 @@
 //! Committed shuffle output statistics.
 //!
-//! Shuffle sinks count what they accept and publish the counts only after the
-//! backend has committed the output. The counts travel from the worker to the
-//! driver with the task's `Succeeded` status, and the driver keeps them in a
-//! compact form until every consumer of the shuffle has made its adaptive
-//! decision.
+//! Statistics are collected only for blocking outputs that the driver will re-plan
+//! from, as requested in the task definition. Shuffle sinks count what they accept
+//! and publish the counts only after the backend has committed the output.
+//!
+//! The exact per-channel counts ([`ChannelCounts`]) never leave the worker. A task
+//! reports [`TaskOutputStatistics`]: exact totals and per-channel sizes in a compact
+//! encoding ([`ChannelSizes`]) of at most two bytes per channel, which the driver
+//! retains as is until every consumer of the shuffle has made its adaptive decision.
 //!
 //! Every metric has a fixed unit:
-//!   - `rows`: rows accepted by the sink.
+//!   - `rows`: rows accepted by the sink, reported as a total only.
 //!   - `physical_bytes`: bytes the backend stores for the channel after its own
 //!     compression. This is unknown (never zero) when the backend cannot tell.
 //!   - `logical_bytes`: uncompressed Arrow data the accepted batches reference,
@@ -19,16 +22,19 @@ use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, UInt64Arra
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 
-/// The committed output statistics of one task attempt, one entry per output channel.
+use crate::driver::r#gen;
+
+/// The exact counts of one task attempt, one entry per output channel.
+/// They describe the committed output of the attempt on the worker.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TaskOutputStatistics {
+pub struct ChannelCounts {
     pub rows: Vec<u64>,
     /// `None` when the backend cannot tell the stored size of the channels.
     pub physical_bytes: Option<Vec<u64>>,
     pub logical_bytes: Vec<u64>,
 }
 
-impl TaskOutputStatistics {
+impl ChannelCounts {
     pub fn channels(&self) -> usize {
         self.rows.len()
     }
@@ -42,7 +48,7 @@ impl TaskOutputStatistics {
                 .is_some_and(|x| x.len() != channels)
         {
             return Err(DataFusionError::Internal(format!(
-                "inconsistent task output statistics: {} rows, {:?} physical bytes, {} logical bytes",
+                "inconsistent channel counts: {} rows, {:?} physical bytes, {} logical bytes",
                 channels,
                 self.physical_bytes.as_ref().map(|x| x.len()),
                 self.logical_bytes.len()
@@ -60,7 +66,8 @@ impl TaskOutputStatistics {
         ]))
     }
 
-    /// Encodes the statistics as a completion batch with one row per channel.
+    /// Encodes the counts as a completion batch with one row per channel.
+    /// The batch only travels from the shuffle writer to the task monitor.
     pub fn to_record_batch(&self) -> Result<RecordBatch> {
         self.validate()?;
         let physical = match &self.physical_bytes {
@@ -77,23 +84,22 @@ impl TaskOutputStatistics {
         )?)
     }
 
-    /// Decodes a completion batch. Returns `None` for a batch without rows,
-    /// which a writer emits when it has no committed output to describe.
+    /// Decodes a completion batch. Returns `None` for a batch without rows, which a
+    /// writer emits when it has no committed output to describe or does not count.
     pub fn try_from_record_batch(batch: &RecordBatch) -> Result<Option<Self>> {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
         if batch.schema().fields() != Self::schema().fields() {
             return Err(DataFusionError::Internal(format!(
-                "unexpected task output statistics schema: {:?}",
+                "unexpected channel counts schema: {:?}",
                 batch.schema()
             )));
         }
         let column = |i: usize| -> Result<&UInt64Array> {
-            batch
-                .column(i)
-                .as_primitive_opt()
-                .ok_or_else(|| DataFusionError::Internal("invalid statistics column".to_string()))
+            batch.column(i).as_primitive_opt().ok_or_else(|| {
+                DataFusionError::Internal("invalid channel counts column".to_string())
+            })
         };
         let rows = column(0)?;
         let physical = column(1)?;
@@ -105,36 +111,6 @@ impl TaskOutputStatistics {
             physical_bytes,
             logical_bytes: logical.values().to_vec(),
         }))
-    }
-}
-
-impl From<TaskOutputStatistics> for crate::driver::r#gen::TaskOutputStatistics {
-    fn from(value: TaskOutputStatistics) -> Self {
-        Self {
-            rows: value.rows,
-            physical_bytes: value.physical_bytes.unwrap_or_default(),
-            logical_bytes: value.logical_bytes,
-        }
-    }
-}
-
-impl TryFrom<crate::driver::r#gen::TaskOutputStatistics> for TaskOutputStatistics {
-    type Error = DataFusionError;
-
-    fn try_from(value: crate::driver::r#gen::TaskOutputStatistics) -> Result<Self> {
-        // An empty list means unknown, except for a task without output channels.
-        let physical_bytes = if value.physical_bytes.is_empty() && !value.rows.is_empty() {
-            None
-        } else {
-            Some(value.physical_bytes)
-        };
-        let statistics = Self {
-            rows: value.rows,
-            physical_bytes,
-            logical_bytes: value.logical_bytes,
-        };
-        statistics.validate()?;
-        Ok(statistics)
     }
 }
 
@@ -250,85 +226,348 @@ fn logical_array_size(array: &ArrayRef) -> Result<u64> {
     Ok(size.saturating_add(nulls))
 }
 
-/// Encodes a size in one byte with 10% precision, as Spark does for map output sizes.
-/// Zero stays exact.
-pub(crate) fn compress_size(size: u64) -> u8 {
-    const LOG_BASE: f64 = 1.1;
+/// The base of the logarithmic size code. A decoded size is within 1% of the
+/// encoded size, and every `u64` has a code, so large sizes never saturate.
+const SIZE_CODE_BASE: f64 = 1.01;
+
+/// Encodes a size in two bytes: `0` for zero, otherwise `1 + ceil(log_1.01(size))`.
+/// The largest code, for `u64::MAX`, is about 4,460.
+pub(crate) fn encode_size(size: u64) -> u16 {
     if size == 0 {
+        return 0;
+    }
+    let exponent = ((size as f64).ln() / SIZE_CODE_BASE.ln()).ceil();
+    (1.0 + exponent).min(u16::MAX as f64) as u16
+}
+
+pub(crate) fn decode_size(code: u16) -> u64 {
+    if code == 0 {
         0
-    } else if size <= 1 {
-        1
     } else {
-        ((size as f64).ln() / LOG_BASE.ln()).ceil().min(255.0) as u8
+        // The float-to-integer conversion saturates.
+        SIZE_CODE_BASE.powi(code as i32 - 1).round() as u64
     }
 }
 
-pub(crate) fn decompress_size(size: u8) -> u64 {
-    const LOG_BASE: f64 = 1.1;
-    if size == 0 {
-        0
-    } else {
-        LOG_BASE.powi(size as i32) as u64
-    }
-}
+/// Above this many channels, a task reports sizes in the sparse form when it is
+/// smaller than the dense form, as Spark's `HighlyCompressedMapStatus` does.
+const DENSE_CHANNEL_LIMIT: usize = 2000;
 
-/// Statistics of one committed attempt as retained by the driver.
-/// Totals are exact, while per-channel values use the one-byte log encoding.
+/// A nonempty channel of a sparse encoding is recorded on its own when it is larger
+/// than this factor times the average nonempty channel. Fewer than half of the
+/// nonempty channels can exceed twice the average.
+const HUGE_CHANNEL_FACTOR: u64 = 2;
+
+/// Per-channel sizes of one task attempt.
+///
+///   - The dense form keeps a two-byte code per channel, within 1% of each size.
+///   - The sparse form keeps which channels are empty, the sizes of channels much
+///     larger than the average within 1%, and one average for the remaining channels.
+///
+/// An empty channel is exactly zero in both forms, and a nonempty channel is never
+/// zero. The driver keeps this form as is, so its memory is at most two bytes per
+/// channel and task, and often one bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompactOutputStatistics {
-    pub total_rows: u64,
-    pub total_physical_bytes: Option<u64>,
-    pub total_logical_bytes: u64,
-    rows: Box<[u8]>,
-    physical_bytes: Option<Box<[u8]>>,
-    logical_bytes: Box<[u8]>,
+pub enum ChannelSizes {
+    Dense(Box<[u16]>),
+    Sparse(SparseChannelSizes),
 }
 
-impl CompactOutputStatistics {
-    pub fn new(statistics: &TaskOutputStatistics) -> Self {
-        let compress = |x: &[u64]| x.iter().map(|v| compress_size(*v)).collect::<Box<[u8]>>();
-        Self {
-            total_rows: statistics.rows.iter().fold(0, |a, b| a.saturating_add(*b)),
-            total_physical_bytes: statistics
-                .physical_bytes
-                .as_ref()
-                .map(|x| x.iter().fold(0u64, |a, b| a.saturating_add(*b))),
-            total_logical_bytes: statistics
-                .logical_bytes
-                .iter()
-                .fold(0, |a, b| a.saturating_add(*b)),
-            rows: compress(&statistics.rows),
-            physical_bytes: statistics.physical_bytes.as_deref().map(compress),
-            logical_bytes: compress(&statistics.logical_bytes),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseChannelSizes {
+    channels: usize,
+    /// A bitmap of the nonempty channels, least significant bit first.
+    nonempty: Box<[u8]>,
+    /// The size of every nonempty channel without its own entry.
+    average: u64,
+    /// The channels recorded on their own, in ascending order, with their size codes.
+    huge: Box<[(u32, u16)]>,
+}
+
+impl ChannelSizes {
+    pub fn encode(sizes: &[u64]) -> Self {
+        let dense = || Self::Dense(sizes.iter().map(|&x| encode_size(x)).collect());
+        if sizes.len() <= DENSE_CHANNEL_LIMIT || u32::try_from(sizes.len()).is_err() {
+            return dense();
+        }
+        let (total, count) = sizes
+            .iter()
+            .filter(|&&x| x > 0)
+            .fold((0u64, 0u64), |(t, c), &x| (t.saturating_add(x), c + 1));
+        let threshold = (total / count.max(1)).saturating_mul(HUGE_CHANNEL_FACTOR);
+        let mut nonempty = vec![0u8; sizes.len().div_ceil(8)];
+        let mut huge = vec![];
+        let (mut rest_total, mut rest_count) = (0u64, 0u64);
+        for (channel, &size) in sizes.iter().enumerate() {
+            if size == 0 {
+                continue;
+            }
+            nonempty[channel / 8] |= 1 << (channel % 8);
+            if size > threshold {
+                // The channel count fits in `u32`, as checked above.
+                huge.push((channel as u32, encode_size(size)));
+            } else {
+                rest_total = rest_total.saturating_add(size);
+                rest_count += 1;
+            }
+        }
+        let sparse = SparseChannelSizes {
+            channels: sizes.len(),
+            nonempty: nonempty.into(),
+            average: rest_total.div_ceil(rest_count.max(1)).max(1),
+            huge: huge.into(),
+        };
+        if sparse.encoded_bytes() < sizes.len() * size_of::<u16>() {
+            Self::Sparse(sparse)
+        } else {
+            dense()
         }
     }
 
     pub fn channels(&self) -> usize {
-        self.rows.len()
+        match self {
+            Self::Dense(codes) => codes.len(),
+            Self::Sparse(sparse) => sparse.channels,
+        }
+    }
+
+    /// Returns the approximate size of a channel, or zero for a channel out of range.
+    pub fn get(&self, channel: usize) -> u64 {
+        match self {
+            Self::Dense(codes) => codes.get(channel).map_or(0, |&x| decode_size(x)),
+            Self::Sparse(sparse) => {
+                if !sparse.is_nonempty(channel) {
+                    return 0;
+                }
+                match sparse
+                    .huge
+                    .binary_search_by_key(&channel, |&(c, _)| c as usize)
+                {
+                    Ok(i) => decode_size(sparse.huge[i].1),
+                    Err(_) => sparse.average,
+                }
+            }
+        }
+    }
+
+    /// Adds the approximate size of every channel to `totals`, which has one entry
+    /// per channel.
+    pub fn add_to(&self, totals: &mut [u64]) {
+        match self {
+            Self::Dense(codes) => {
+                for (total, &code) in totals.iter_mut().zip(codes.iter()) {
+                    *total = total.saturating_add(decode_size(code));
+                }
+            }
+            Self::Sparse(sparse) => {
+                let mut huge = sparse.huge.iter().peekable();
+                for (channel, total) in totals.iter_mut().enumerate().take(sparse.channels) {
+                    if !sparse.is_nonempty(channel) {
+                        continue;
+                    }
+                    let size = match huge.next_if(|(c, _)| *c as usize == channel) {
+                        Some(&(_, code)) => decode_size(code),
+                        None => sparse.average,
+                    };
+                    *total = total.saturating_add(size);
+                }
+            }
+        }
+    }
+
+    /// The approximate number of bytes the encoding occupies.
+    pub fn encoded_bytes(&self) -> usize {
+        match self {
+            Self::Dense(codes) => codes.len() * size_of::<u16>(),
+            Self::Sparse(sparse) => sparse.encoded_bytes(),
+        }
+    }
+}
+
+impl SparseChannelSizes {
+    fn is_nonempty(&self, channel: usize) -> bool {
+        self.nonempty
+            .get(channel / 8)
+            .is_some_and(|x| x & (1 << (channel % 8)) != 0)
+    }
+
+    fn encoded_bytes(&self) -> usize {
+        self.nonempty.len() + size_of::<u64>() + self.huge.len() * size_of::<(u32, u16)>()
+    }
+}
+
+impl From<ChannelSizes> for r#gen::ChannelSizes {
+    fn from(value: ChannelSizes) -> Self {
+        use r#gen::channel_sizes::Kind;
+        let kind = match value {
+            ChannelSizes::Dense(codes) => Kind::Dense(r#gen::DenseChannelSizes {
+                codes: codes.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            }),
+            ChannelSizes::Sparse(sparse) => Kind::Sparse(r#gen::SparseChannelSizes {
+                channels: sparse.channels as u64,
+                nonempty: sparse.nonempty.into_vec(),
+                average: sparse.average,
+                huge_channels: sparse.huge.iter().map(|&(c, _)| c).collect(),
+                huge_codes: sparse
+                    .huge
+                    .iter()
+                    .flat_map(|&(_, code)| code.to_le_bytes())
+                    .collect(),
+            }),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl TryFrom<r#gen::ChannelSizes> for ChannelSizes {
+    type Error = DataFusionError;
+
+    fn try_from(value: r#gen::ChannelSizes) -> Result<Self> {
+        use r#gen::channel_sizes::Kind;
+        let invalid =
+            |reason: &str| DataFusionError::Internal(format!("invalid channel sizes: {reason}"));
+        let codes = |bytes: &[u8]| -> Result<Vec<u16>> {
+            if !bytes.len().is_multiple_of(size_of::<u16>()) {
+                return Err(invalid("odd number of code bytes"));
+            }
+            Ok(bytes
+                .chunks_exact(size_of::<u16>())
+                .map(|x| u16::from_le_bytes([x[0], x[1]]))
+                .collect())
+        };
+        match value.kind {
+            Some(Kind::Dense(dense)) => Ok(Self::Dense(codes(&dense.codes)?.into())),
+            Some(Kind::Sparse(sparse)) => {
+                let channels =
+                    usize::try_from(sparse.channels).map_err(|_| invalid("too many channels"))?;
+                if sparse.nonempty.len() != channels.div_ceil(8) {
+                    return Err(invalid("bitmap does not match the channels"));
+                }
+                let huge_codes = codes(&sparse.huge_codes)?;
+                if huge_codes.len() != sparse.huge_channels.len() {
+                    return Err(invalid("huge channels and codes differ in length"));
+                }
+                let huge = sparse
+                    .huge_channels
+                    .into_iter()
+                    .zip(huge_codes)
+                    .collect::<Box<[_]>>();
+                let result = SparseChannelSizes {
+                    channels,
+                    nonempty: sparse.nonempty.into(),
+                    average: sparse.average,
+                    huge,
+                };
+                let ordered = result.huge.windows(2).all(|x| x[0].0 < x[1].0);
+                let consistent = result
+                    .huge
+                    .iter()
+                    .all(|&(c, code)| code > 0 && result.is_nonempty(c as usize));
+                if !ordered || !consistent || result.average == 0 {
+                    return Err(invalid("inconsistent sparse sizes"));
+                }
+                Ok(Self::Sparse(result))
+            }
+            None => Err(invalid("missing kind")),
+        }
+    }
+}
+
+/// The committed output statistics of one task attempt, as reported to the driver
+/// and retained there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOutputStatistics {
+    pub rows: u64,
+    pub logical_bytes: u64,
+    /// `None` when the backend cannot tell the stored size of the channels.
+    pub physical_bytes: Option<u64>,
+    pub channel_logical_bytes: ChannelSizes,
+    pub channel_physical_bytes: Option<ChannelSizes>,
+}
+
+impl TaskOutputStatistics {
+    pub fn new(counts: &ChannelCounts) -> Result<Self> {
+        counts.validate()?;
+        let sum = |x: &[u64]| x.iter().fold(0u64, |a, b| a.saturating_add(*b));
+        Ok(Self {
+            rows: sum(&counts.rows),
+            logical_bytes: sum(&counts.logical_bytes),
+            physical_bytes: counts.physical_bytes.as_deref().map(sum),
+            channel_logical_bytes: ChannelSizes::encode(&counts.logical_bytes),
+            channel_physical_bytes: counts.physical_bytes.as_deref().map(ChannelSizes::encode),
+        })
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channel_logical_bytes.channels()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self
+            .channel_physical_bytes
+            .as_ref()
+            .is_some_and(|x| x.channels() != self.channels())
+            || self.channel_physical_bytes.is_some() != self.physical_bytes.is_some()
+        {
+            return Err(DataFusionError::Internal(
+                "inconsistent task output statistics".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// The approximate number of bytes the driver retains for these statistics.
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>()
-            + self.rows.len()
-            + self.logical_bytes.len()
-            + self.physical_bytes.as_ref().map(|x| x.len()).unwrap_or(0)
+            + self.channel_logical_bytes.encoded_bytes()
+            + self
+                .channel_physical_bytes
+                .as_ref()
+                .map_or(0, |x| x.encoded_bytes())
     }
 
-    pub fn rows(&self, channel: usize) -> u64 {
-        // A channel with a nonzero total but rounding to zero cannot happen, since
-        // only zero is encoded as zero.
-        decompress_size(self.rows[channel])
+    pub fn physical_bytes_of(&self, channel: usize) -> Option<u64> {
+        self.channel_physical_bytes.as_ref().map(|x| x.get(channel))
     }
 
-    pub fn physical_bytes(&self, channel: usize) -> Option<u64> {
-        self.physical_bytes
-            .as_ref()
-            .map(|x| decompress_size(x[channel]))
+    pub fn logical_bytes_of(&self, channel: usize) -> u64 {
+        self.channel_logical_bytes.get(channel)
     }
+}
 
-    pub fn logical_bytes(&self, channel: usize) -> u64 {
-        decompress_size(self.logical_bytes[channel])
+impl From<TaskOutputStatistics> for r#gen::TaskOutputStatistics {
+    fn from(value: TaskOutputStatistics) -> Self {
+        Self {
+            rows: value.rows,
+            logical_bytes: value.logical_bytes,
+            physical_bytes: value.physical_bytes,
+            channel_logical_bytes: Some(value.channel_logical_bytes.into()),
+            channel_physical_bytes: value.channel_physical_bytes.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<r#gen::TaskOutputStatistics> for TaskOutputStatistics {
+    type Error = DataFusionError;
+
+    fn try_from(value: r#gen::TaskOutputStatistics) -> Result<Self> {
+        let statistics = Self {
+            rows: value.rows,
+            logical_bytes: value.logical_bytes,
+            physical_bytes: value.physical_bytes,
+            channel_logical_bytes: value
+                .channel_logical_bytes
+                .ok_or_else(|| {
+                    DataFusionError::Internal("missing channel logical bytes".to_string())
+                })?
+                .try_into()?,
+            channel_physical_bytes: value
+                .channel_physical_bytes
+                .map(TryInto::try_into)
+                .transpose()?,
+        };
+        statistics.validate()?;
+        Ok(statistics)
     }
 }
 
@@ -336,29 +575,27 @@ impl CompactOutputStatistics {
 /// producer partition. Bucket `b` is channel `b` of every producer partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShuffleStatistics {
-    /// Exact total rows across all buckets.
+    /// Exact totals across all buckets.
     pub total_rows: u64,
     pub total_logical_bytes: u64,
     pub total_physical_bytes: Option<u64>,
-    /// Approximate rows per bucket. A bucket is zero only if it is exactly empty.
-    pub rows: Vec<u64>,
-    pub physical_bytes: Option<Vec<u64>>,
+    /// Approximate sizes per bucket. A bucket is zero only if it is exactly empty.
     pub logical_bytes: Vec<u64>,
+    pub physical_bytes: Option<Vec<u64>>,
 }
 
 impl ShuffleStatistics {
     /// Folds the statistics of the committed attempts of all producer partitions.
     pub fn fold<'a>(
         channels: usize,
-        attempts: impl IntoIterator<Item = &'a CompactOutputStatistics>,
+        attempts: impl IntoIterator<Item = &'a TaskOutputStatistics>,
     ) -> Result<Self> {
         let mut result = Self {
             total_rows: 0,
             total_logical_bytes: 0,
             total_physical_bytes: Some(0),
-            rows: vec![0; channels],
-            physical_bytes: Some(vec![0; channels]),
             logical_bytes: vec![0; channels],
+            physical_bytes: Some(vec![0; channels]),
         };
         for attempt in attempts {
             if attempt.channels() != channels {
@@ -367,29 +604,30 @@ impl ShuffleStatistics {
                     attempt.channels()
                 )));
             }
-            result.total_rows = result.total_rows.saturating_add(attempt.total_rows);
+            result.total_rows = result.total_rows.saturating_add(attempt.rows);
             result.total_logical_bytes = result
                 .total_logical_bytes
-                .saturating_add(attempt.total_logical_bytes);
+                .saturating_add(attempt.logical_bytes);
             result.total_physical_bytes = result
                 .total_physical_bytes
-                .zip(attempt.total_physical_bytes)
+                .zip(attempt.physical_bytes)
                 .map(|(a, b)| a.saturating_add(b));
-            for c in 0..channels {
-                result.rows[c] = result.rows[c].saturating_add(attempt.rows(c));
-                result.logical_bytes[c] =
-                    result.logical_bytes[c].saturating_add(attempt.logical_bytes(c));
-            }
-            match (&mut result.physical_bytes, attempt.physical_bytes.is_some()) {
-                (Some(physical), true) => {
-                    for (c, value) in physical.iter_mut().enumerate() {
-                        *value = value.saturating_add(attempt.physical_bytes(c).unwrap_or(0));
-                    }
-                }
+            attempt
+                .channel_logical_bytes
+                .add_to(&mut result.logical_bytes);
+            match (&mut result.physical_bytes, &attempt.channel_physical_bytes) {
+                (Some(physical), Some(sizes)) => sizes.add_to(physical),
                 (physical, _) => *physical = None,
             }
         }
         Ok(result)
+    }
+
+    /// The approximate number of bytes the driver retains for these statistics.
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + (self.logical_bytes.len() + self.physical_bytes.as_ref().map_or(0, |x| x.len()))
+                * size_of::<u64>()
     }
 
     /// The per-bucket size used for sizing decisions: physical bytes when known.
@@ -416,6 +654,7 @@ mod tests {
         BinaryViewArray, Int32Array, ListArray, StringArray, StringViewArray, StructArray,
     };
     use datafusion::arrow::datatypes::Int32Type;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -494,77 +733,165 @@ mod tests {
     }
 
     #[test]
-    fn statistics_round_trip_through_completion_batch() {
+    fn counts_round_trip_through_completion_batch() {
         for physical_bytes in [Some(vec![3, 0, 5]), None] {
-            let statistics = TaskOutputStatistics {
+            let counts = ChannelCounts {
                 rows: vec![1, 0, 2],
                 physical_bytes,
                 logical_bytes: vec![10, 0, 20],
             };
-            let batch = statistics.to_record_batch().unwrap();
+            let batch = counts.to_record_batch().unwrap();
             assert_eq!(
-                TaskOutputStatistics::try_from_record_batch(&batch).unwrap(),
-                Some(statistics)
+                ChannelCounts::try_from_record_batch(&batch).unwrap(),
+                Some(counts)
             );
         }
-        let empty = RecordBatch::new_empty(TaskOutputStatistics::schema());
-        assert_eq!(
-            TaskOutputStatistics::try_from_record_batch(&empty).unwrap(),
-            None
-        );
+        let empty = RecordBatch::new_empty(ChannelCounts::schema());
+        assert_eq!(ChannelCounts::try_from_record_batch(&empty).unwrap(), None);
     }
 
     #[test]
-    fn inconsistent_statistics_are_rejected() {
-        let statistics = TaskOutputStatistics {
+    fn inconsistent_counts_are_rejected() {
+        let counts = ChannelCounts {
             rows: vec![1, 2],
             physical_bytes: Some(vec![1]),
             logical_bytes: vec![1, 2],
         };
-        assert!(statistics.to_record_batch().is_err());
+        assert!(counts.to_record_batch().is_err());
+        assert!(TaskOutputStatistics::new(&counts).is_err());
+    }
+
+    fn within_one_percent(approx: u64, size: u64) -> bool {
+        approx.abs_diff(size) <= size / 100 + 1
     }
 
     #[test]
-    fn compressed_sizes_keep_zero_exact_and_stay_within_ten_percent() {
-        assert_eq!(decompress_size(compress_size(0)), 0);
-        assert_eq!(decompress_size(compress_size(1)), 1);
-        for size in [2u64, 10, 1000, 123_456, 1 << 30, 7 << 32] {
-            let approx = decompress_size(compress_size(size)) as f64;
-            let error = (approx - size as f64).abs() / size as f64;
-            assert!(error <= 0.1, "size {size} approx {approx}");
+    fn size_codes_keep_zero_exact_and_never_saturate() {
+        assert_eq!(decode_size(encode_size(0)), 0);
+        assert_eq!(decode_size(encode_size(1)), 1);
+        for size in [2u64, 10, 1000, 123_456, 1 << 30, 7 << 32, 1 << 50] {
+            let approx = decode_size(encode_size(size));
+            assert!(within_one_percent(approx, size), "{size} -> {approx}");
         }
-        assert_eq!(compress_size(u64::MAX), 255);
+        assert!(encode_size(u64::MAX) < 4500);
+        assert!(decode_size(encode_size(u64::MAX)) > u64::MAX / 2);
+    }
+
+    proptest! {
+        #[test]
+        fn size_codes_are_within_one_percent(size in 1u64..u64::MAX / 2) {
+            let approx = decode_size(encode_size(size));
+            prop_assert!(approx > 0);
+            prop_assert!(within_one_percent(approx, size), "{} -> {}", size, approx);
+        }
+
+        #[test]
+        fn channel_sizes_preserve_emptiness_and_totals(
+            sizes in prop::collection::vec(
+                prop_oneof![Just(0u64), 1u64..1000, 1u64..(1 << 40)],
+                0..5000,
+            ),
+        ) {
+            let encoded = ChannelSizes::encode(&sizes);
+            prop_assert_eq!(encoded.channels(), sizes.len());
+            let proto: r#gen::ChannelSizes = encoded.clone().into();
+            prop_assert_eq!(&ChannelSizes::try_from(proto).unwrap(), &encoded);
+            prop_assert!(encoded.encoded_bytes() <= sizes.len() * 2 + 64);
+
+            let mut totals = vec![0; sizes.len()];
+            encoded.add_to(&mut totals);
+            for (c, &size) in sizes.iter().enumerate() {
+                prop_assert_eq!(totals[c], encoded.get(c));
+                prop_assert_eq!(totals[c] == 0, size == 0);
+                if matches!(encoded, ChannelSizes::Dense(_)) {
+                    prop_assert!(within_one_percent(totals[c], size));
+                }
+            }
+            // The sparse form keeps the total within the code precision plus the
+            // rounding of the average.
+            let total = sizes.iter().sum::<u64>();
+            let approx = totals.iter().sum::<u64>();
+            prop_assert!(approx.abs_diff(total) <= total / 100 + sizes.len() as u64);
+        }
+    }
+
+    #[test]
+    fn many_channels_use_the_sparse_form_with_accurate_large_channels() {
+        let mut sizes = vec![0u64; 10_000];
+        for (c, size) in sizes.iter_mut().enumerate().step_by(3) {
+            *size = 100 + c as u64 % 7;
+        }
+        sizes[42] = 1 << 33;
+        let encoded = ChannelSizes::encode(&sizes);
+        assert!(matches!(encoded, ChannelSizes::Sparse(_)));
+        assert!(encoded.encoded_bytes() < 10_000 / 8 + 64);
+        assert!(within_one_percent(encoded.get(42), 1 << 33));
+        assert_eq!(encoded.get(1), 0);
+        assert!((100..=107).contains(&encoded.get(3)));
+    }
+
+    #[test]
+    fn invalid_sparse_sizes_are_rejected() {
+        let proto = r#gen::ChannelSizes {
+            kind: Some(r#gen::channel_sizes::Kind::Sparse(
+                r#gen::SparseChannelSizes {
+                    channels: 16,
+                    nonempty: vec![1, 0],
+                    average: 10,
+                    huge_channels: vec![3],
+                    huge_codes: 100u16.to_le_bytes().to_vec(),
+                },
+            )),
+        };
+        // Channel 3 is recorded as huge but marked empty.
+        assert!(ChannelSizes::try_from(proto).is_err());
     }
 
     #[test]
     fn fold_sums_buckets_and_propagates_unknown_physical_sizes() {
-        let a = CompactOutputStatistics::new(&TaskOutputStatistics {
+        let a = TaskOutputStatistics::new(&ChannelCounts {
             rows: vec![0, 100],
             physical_bytes: Some(vec![0, 1000]),
             logical_bytes: vec![0, 4000],
-        });
-        let b = CompactOutputStatistics::new(&TaskOutputStatistics {
+        })
+        .unwrap();
+        let b = TaskOutputStatistics::new(&ChannelCounts {
             rows: vec![5, 0],
             physical_bytes: Some(vec![50, 0]),
             logical_bytes: vec![200, 0],
-        });
+        })
+        .unwrap();
         let folded = ShuffleStatistics::fold(2, [&a, &b]).unwrap();
         assert_eq!(folded.total_rows, 105);
         assert_eq!(folded.total_physical_bytes, Some(1050));
-        assert!(folded.rows[0] > 0);
         let physical = folded.physical_bytes.clone().unwrap();
-        assert!((45..=55).contains(&physical[0]));
-        assert!((900..=1100).contains(&physical[1]));
+        assert!(within_one_percent(physical[0], 50));
+        assert!(within_one_percent(physical[1], 1000));
 
-        let c = CompactOutputStatistics::new(&TaskOutputStatistics {
+        let c = TaskOutputStatistics::new(&ChannelCounts {
             rows: vec![1, 1],
             physical_bytes: None,
             logical_bytes: vec![1, 1],
-        });
+        })
+        .unwrap();
         let folded = ShuffleStatistics::fold(2, [&a, &c]).unwrap();
         assert_eq!(folded.physical_bytes, None);
         assert_eq!(folded.total_physical_bytes, None);
         assert_eq!(folded.sizing_bytes(), folded.logical_bytes.as_slice());
         assert!(ShuffleStatistics::fold(3, [&a]).is_err());
+    }
+
+    #[test]
+    fn statistics_round_trip_through_proto() {
+        for physical_bytes in [Some(vec![3, 0, 5]), None] {
+            let statistics = TaskOutputStatistics::new(&ChannelCounts {
+                rows: vec![1, 0, 2],
+                physical_bytes,
+                logical_bytes: vec![10, 0, 20],
+            })
+            .unwrap();
+            let proto: r#gen::TaskOutputStatistics = statistics.clone().into();
+            assert_eq!(TaskOutputStatistics::try_from(proto).unwrap(), statistics);
+        }
     }
 }

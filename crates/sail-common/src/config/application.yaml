@@ -294,6 +294,16 @@
     The minimum number of coalesced partitions. Raise this value to keep parallelism.
   experimental: true
 
+- key: cluster.adaptive.coalesce.max_logical_size
+  type: number
+  default: "268435456"
+  description: |
+    The largest logical (uncompressed Arrow) size in bytes of a coalesced partition.
+    The coalesce target size measures compressed shuffle bytes, so this bounds the data
+    a coalesced task reads when the shuffle data compresses well. A single partition
+    larger than this value is kept as it is.
+  experimental: true
+
 - key: cluster.adaptive.join.enabled
   type: boolean
   default: "true"

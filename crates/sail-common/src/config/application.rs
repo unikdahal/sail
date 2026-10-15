@@ -255,6 +255,7 @@ pub struct ClusterAdaptiveCoalesceConfig {
     pub target_size: u64,
     pub min_partition_size: u64,
     pub min_partitions: usize,
+    pub max_logical_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1112,6 +1113,7 @@ mod tests {
         assert_eq!(adaptive.coalesce.target_size, 64 * 1024 * 1024);
         assert_eq!(adaptive.coalesce.min_partition_size, 1024 * 1024);
         assert_eq!(adaptive.coalesce.min_partitions, 1);
+        assert_eq!(adaptive.coalesce.max_logical_size, 256 * 1024 * 1024);
         assert!(adaptive.join.enabled);
         assert_eq!(adaptive.join.max_build_partition_size, 64 * 1024 * 1024);
         assert!(adaptive.skew.enabled);

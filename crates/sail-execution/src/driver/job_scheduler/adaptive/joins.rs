@@ -2,11 +2,15 @@
 //!
 //!   - Empty-input pruning: a join or grouped aggregate whose result must be empty
 //!     because of an input with exactly zero committed rows becomes `EmptyExec`.
-//!   - Build-side swap: a partitioned hash join whose build side is measured larger
+//!   - Build-side swap: a partitioned hash join whose build side is certainly larger
 //!     than its probe side swaps its inputs, keeping the partitioned mode.
 //!   - Hash join to sort-merge join: a partitioned hash join whose largest build
-//!     bucket exceeds the build cap becomes a sort-merge join with explicit sorts,
-//!     since no physical optimizer runs after the job graph is built.
+//!     partition certainly exceeds the build cap becomes a sort-merge join with
+//!     explicit sorts, since no physical optimizer runs after the job graph is built.
+//!
+//! "Certainly" means that the sizes come from [`input_bound`]: the build side must
+//! have an exact size, and the probe side at least an upper bound. Otherwise the
+//! join keeps its static strategy.
 
 use std::sync::Arc;
 
@@ -27,6 +31,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
+use crate::driver::job_scheduler::adaptive::bounds::{Bound, input_bound};
 use crate::driver::job_scheduler::adaptive::view::StageView;
 use crate::plan::StageInputExec;
 use crate::statistics::ShuffleStatistics;
@@ -115,7 +120,9 @@ fn output_is_empty(node: &Arc<dyn ExecutionPlan>, view: &StageView) -> bool {
     }
 }
 
-/// Follows operators that emit a subset of their input rows, partition by partition.
+/// Follows operators that emit at most one row per input row, partition by
+/// partition, so that an empty input means an empty output. This is about rows
+/// only: a projection may still widen each row.
 fn row_subset_base(node: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     let mut node = node;
     loop {
@@ -144,15 +151,18 @@ fn is_empty(node: &Arc<dyn ExecutionPlan>, view: &StageView) -> bool {
         .is_some_and(|statistics| statistics.total_rows == 0)
 }
 
-/// Returns the committed statistics of the stage input that a join child reads
-/// through row-subset operators. Sizes measured at the input are upper bounds of
-/// what the child produces.
-fn input_statistics<'a>(
+/// Returns the committed statistics of the stage input that bounds what a join
+/// child produces, if the bound is at least as strong as `required`.
+fn bounding_statistics<'a>(
     node: &Arc<dyn ExecutionPlan>,
     view: &'a StageView,
-) -> Option<&'a ShuffleStatistics> {
-    let placeholder = row_subset_base(node).downcast_ref::<StageInputExec<usize>>()?;
-    view.statistics(*placeholder.input())
+    required: Bound,
+) -> Option<(usize, &'a ShuffleStatistics)> {
+    let bound = input_bound(node)?;
+    if required == Bound::Exact && bound.bound != Bound::Exact {
+        return None;
+    }
+    Some((bound.input, view.statistics(bound.input)?))
 }
 
 fn rewrite_partitioned_hash_join(
@@ -161,13 +171,13 @@ fn rewrite_partitioned_hash_join(
     rules: &mut Vec<&'static str>,
     notes: &mut Vec<String>,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if let (Some(build), Some(probe)) = (
-        input_statistics(join.left(), view),
-        input_statistics(join.right(), view),
+    if let (Some((_, build)), Some((_, probe))) = (
+        bounding_statistics(join.left(), view, Bound::Exact),
+        bounding_statistics(join.right(), view, Bound::Upper),
     ) && should_swap(join, build, probe)
     {
         notes.push(format!(
-            "swap join inputs: build {} bytes, probe {} bytes",
+            "swap join inputs: build {} bytes, probe at most {} bytes",
             build.total_logical_bytes, probe.total_logical_bytes
         ));
         rules.push(RULE_SWAP_JOIN_INPUTS);
@@ -179,7 +189,8 @@ fn rewrite_partitioned_hash_join(
 /// Converts partitioned hash joins whose largest build partition exceeds the build
 /// cap into sort-merge joins. This runs after the partition specs are decided, so
 /// `build_sizes` returns the logical size of each partition of a stage input's own
-/// domain, after coalescing and skew splits.
+/// domain, after coalescing and skew splits. Only a build side whose size is exact
+/// is converted; an upper bound above the cap does not show that the cap is exceeded.
 pub(crate) fn apply_sort_merge_joins(
     plan: Arc<dyn ExecutionPlan>,
     view: &StageView,
@@ -196,10 +207,7 @@ pub(crate) fn apply_sort_merge_joins(
             if join.mode != PartitionMode::Partitioned || !supports_sort_merge(join) {
                 return Ok(Transformed::no(node));
             }
-            let Some(input) = row_subset_base(join.left())
-                .downcast_ref::<StageInputExec<usize>>()
-                .map(|x| *x.input())
-            else {
+            let Some((input, _)) = bounding_statistics(join.left(), view, Bound::Exact) else {
                 return Ok(Transformed::no(node));
             };
             let Some(largest) = build_sizes(input).and_then(|x| x.into_iter().max()) else {
@@ -229,8 +237,9 @@ pub(crate) fn apply_sort_merge_joins(
     Ok(JoinRuleOutcome { plan, rules, notes })
 }
 
-/// Swaps only when the build side is clearly larger, to absorb small measurement
-/// differences, and only for joins whose semantics allow swapping.
+/// Swaps only when the exact build size exceeds the probe's upper bound by a margin
+/// that absorbs measurement differences, and only for joins whose semantics allow
+/// swapping.
 fn should_swap(join: &HashJoinExec, build: &ShuffleStatistics, probe: &ShuffleStatistics) -> bool {
     !join.null_aware
         && join.fetch().is_none()

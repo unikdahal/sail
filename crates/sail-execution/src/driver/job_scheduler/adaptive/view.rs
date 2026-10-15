@@ -4,7 +4,7 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use crate::driver::job_scheduler::AdaptiveOptions;
 use crate::job_graph::{AdaptiveInput, BucketLayout, InputMode, ShuffleOrigin};
-use crate::statistics::{CompactOutputStatistics, ShuffleStatistics};
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 
 /// An immutable snapshot of everything the adaptive rules may read about one stage.
 /// Rules are pure functions of this view, so they never touch scheduler state and
@@ -40,7 +40,7 @@ pub(crate) struct InputView {
     pub producers: usize,
     /// The statistics of the committed attempt of each producer partition, which
     /// give the per-producer sizes of each bucket for skew splits.
-    pub committed: Option<Arc<Vec<Arc<CompactOutputStatistics>>>>,
+    pub committed: Option<Arc<Vec<Arc<TaskOutputStatistics>>>>,
 }
 
 /// A rewrite proposal for one stage.

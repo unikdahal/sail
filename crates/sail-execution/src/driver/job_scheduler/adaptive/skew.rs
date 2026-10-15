@@ -34,6 +34,7 @@ use crate::driver::job_scheduler::adaptive::spec::{ranges_from_starts, split_by_
 use crate::driver::job_scheduler::adaptive::view::StageView;
 use crate::job_graph::{AdaptiveInput, AdaptiveProperty, BucketSlice};
 use crate::plan::StageInputExec;
+use crate::statistics::TaskOutputStatistics;
 
 pub(crate) const RULE_SKEW_SPLIT: &str = "skew_split";
 
@@ -282,7 +283,7 @@ struct Side {
     splittable: bool,
     skewed: Vec<bool>,
     target: u64,
-    committed: Arc<Vec<Arc<crate::statistics::CompactOutputStatistics>>>,
+    committed: Arc<Vec<Arc<TaskOutputStatistics>>>,
     producers: usize,
 }
 
@@ -295,8 +296,8 @@ impl Side {
         let sizes = self
             .committed
             .iter()
-            .map(|statistics| statistics.physical_bytes(bucket).unwrap_or(0))
-            .collect::<Vec<_>>();
+            .map(|statistics| statistics.physical_bytes_of(bucket))
+            .collect::<Option<Vec<_>>>()?;
         if sizes.len() != self.producers || sizes.len() < 2 {
             return None;
         }

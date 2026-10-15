@@ -70,11 +70,10 @@ impl Actor for TaskRunnerActor {
             } => self.handle_create_storage_stream(key, schema, context, result),
             TaskRunnerMessage::CreateCelebornStream {
                 key,
-                mappers,
-                channels,
+                output,
                 schema,
                 result,
-            } => self.handle_create_celeborn_stream(ctx, key, mappers, channels, schema, result),
+            } => self.handle_create_celeborn_stream(ctx, key, output, schema, result),
             TaskRunnerMessage::FetchDriverStream {
                 key,
                 schema,

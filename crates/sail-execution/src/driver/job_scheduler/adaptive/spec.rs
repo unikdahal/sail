@@ -409,9 +409,8 @@ mod tests {
             target_size: target,
             min_partition_size: 1,
             min_partitions: 1,
-            build_cap: None,
         };
-        let ranges = coalesce(sizes, None, &params);
+        let ranges = coalesce(sizes, &[], &params);
         let mut specs = [vec![], vec![]];
         for range in ranges {
             let split = splits
@@ -495,9 +494,8 @@ mod tests {
                 target_size: target,
                 min_partition_size: target / 4,
                 min_partitions: 1,
-                build_cap: None,
-            };
-            let ranges = coalesce(&sizes, None, &params);
+                };
+            let ranges = coalesce(&sizes, &[], &params);
             let spec = coalesced(&ranges, sizes.len());
             prop_assert!(check_group(&[input(&spec, sizes.len(), 3), input(&spec, sizes.len(), 5)]).is_ok());
         }

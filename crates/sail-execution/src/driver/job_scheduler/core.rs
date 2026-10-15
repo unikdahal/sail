@@ -31,7 +31,7 @@ use crate::proto::{
     encode_remote_partitioning, encode_remote_physical_expr, encode_remote_physical_plan,
 };
 use crate::shuffle::ShuffleBackendKind;
-use crate::statistics::{CompactOutputStatistics, ShuffleStatistics, TaskOutputStatistics};
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 use crate::task::definition::{
     ShuffleServiceRead, TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput,
     TaskOutputDistribution, TaskOutputLocator,
@@ -151,12 +151,10 @@ impl JobScheduler {
             if channels.is_none() {
                 // Statistics of pipelined outputs are not used.
             } else if Some(statistics.channels()) == channels {
-                job.adaptive.statistics_payload_bytes = job
-                    .adaptive
-                    .statistics_payload_bytes
-                    .saturating_add(statistics_payload_bytes(&statistics));
-                let statistics = CompactOutputStatistics::new(&statistics);
+                // Statistics are retained in the form they are reported in.
                 let bytes = statistics.retained_bytes() as u64;
+                job.adaptive.statistics_payload_bytes =
+                    job.adaptive.statistics_payload_bytes.saturating_add(bytes);
                 *stage = stage.saturating_add(bytes);
                 job.adaptive.retained_statistics_bytes =
                     job.adaptive.retained_statistics_bytes.saturating_add(bytes);
@@ -769,7 +767,10 @@ impl JobScheduler {
             .iter()
             .map(|input| TaskInputBuilder::try_new(job, key, input, assignments)?.build())
             .collect::<ExecutionResult<Vec<_>>>()?;
-        let output = TaskOutputBuilder::new(job, key, stage, self.codec.as_ref()).build()?;
+        let collect_statistics = Self::collects_statistics(&self.options, job);
+        let output =
+            TaskOutputBuilder::new(job, key, stage, self.codec.as_ref(), collect_statistics)
+                .build()?;
         let definition = TaskDefinition {
             plan: Arc::from(plan),
             inputs,
@@ -831,6 +832,17 @@ impl JobScheduler {
         }
     }
 
+    /// Whether the blocking outputs of a job count their committed statistics.
+    /// Only adaptive execution reads them, and only for Celeborn, so execution
+    /// without it does not pay for counting.
+    pub(super) fn collects_statistics(options: &JobSchedulerOptions, job: &JobDescriptor) -> bool {
+        options.adaptive.enabled
+            && matches!(
+                job.graph.shuffle_backend(),
+                ShuffleBackendKind::Celeborn { .. }
+            )
+    }
+
     /// Records the output that the Celeborn lifecycle manager committed for a stage.
     pub fn record_shuffle_commit(
         &mut self,
@@ -877,51 +889,78 @@ impl JobScheduler {
         };
         debug!("job {job_id} stage {stage} shuffle commit: {commit:?}");
         descriptor.commit = Some(commit);
+        descriptor.shuffle_statistics = None;
     }
 
     /// Returns the attempt whose output the shuffle backend committed, for each
     /// partition of a blocking stage, or `None` if the committed output is not known.
-    pub(super) fn committed_attempts(job: &JobDescriptor, stage: usize) -> Option<Vec<usize>> {
-        if !matches!(job.graph.stages().get(stage)?.mode, OutputMode::Blocking) {
+    /// Statistics are collected only for Celeborn, whose lifecycle manager reports
+    /// the committed attempts: the first attempt of each mapper that reached
+    /// `mapper_end`, which need not be the scheduler's latest successful attempt.
+    pub(super) fn committed_attempts(job: &JobDescriptor, stage: usize) -> Option<&[usize]> {
+        if !matches!(job.graph.stages().get(stage)?.mode, OutputMode::Blocking)
+            || !matches!(
+                job.graph.shuffle_backend(),
+                ShuffleBackendKind::Celeborn { .. }
+            )
+        {
             return None;
         }
-        match job.graph.shuffle_backend() {
-            // Celeborn serves the first attempt of each mapper that reached `mapper_end`,
-            // which need not be the scheduler's latest successful attempt.
-            ShuffleBackendKind::Celeborn { .. } => job.stages[stage]
-                .commit
-                .as_ref()
-                .filter(|commit| commit.succeeded)
-                .map(|commit| commit.attempts.clone()),
-            // A storage merge task's committed output is its latest successful attempt.
-            ShuffleBackendKind::Storage { .. } => job.stages[stage]
-                .tasks
-                .iter()
-                .map(|task| {
-                    let (attempt, head) = task.attempts.split_last()?;
-                    matches!(attempt.state, TaskState::Succeeded).then_some(head.len())
-                })
-                .collect(),
-            ShuffleBackendKind::Flight { .. } => None,
-        }
+        job.stages[stage]
+            .commit
+            .as_ref()
+            .filter(|commit| commit.succeeded)
+            .map(|commit| commit.attempts.as_slice())
     }
 
-    /// Folds the statistics of the committed attempts of a stage, or returns `None`
-    /// if the committed output is not known or any committed attempt lacks statistics.
-    pub(super) fn committed_statistics(
+    /// Returns the statistics of the committed attempt of each partition of a stage,
+    /// or `None` if the committed output is not known or any attempt lacks statistics.
+    pub(super) fn committed_attempt_statistics(
         job: &JobDescriptor,
         stage: usize,
-    ) -> Option<ShuffleStatistics> {
-        let attempts = Self::committed_attempts(job, stage)?;
-        let channels = job.graph.stages()[stage].distribution.channels();
-        let statistics = attempts
+    ) -> Option<Vec<Arc<TaskOutputStatistics>>> {
+        Self::committed_attempts(job, stage)?
             .iter()
             .enumerate()
-            .map(|(p, &a)| job.stages[stage].tasks[p].attempts[a].statistics.as_deref())
-            .collect::<Option<Vec<_>>>()?;
-        ShuffleStatistics::fold(channels, statistics)
+            .map(|(p, &a)| {
+                job.stages[stage]
+                    .tasks
+                    .get(p)?
+                    .attempts
+                    .get(a)?
+                    .statistics
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Returns the statistics of the committed attempts of a stage folded per bucket,
+    /// or `None` if they are not all known. The fold is cached for the stage.
+    pub(super) fn committed_statistics(
+        job: &mut JobDescriptor,
+        stage: usize,
+    ) -> Option<Arc<ShuffleStatistics>> {
+        if let Some(statistics) = &job.stages.get(stage)?.shuffle_statistics {
+            return Some(statistics.clone());
+        }
+        let attempts = Self::committed_attempt_statistics(job, stage)?;
+        let channels = job.graph.stages()[stage].distribution.channels();
+        let statistics = ShuffleStatistics::fold(channels, attempts.iter().map(|x| x.as_ref()))
             .inspect_err(|e| warn!("failed to fold statistics of stage {stage}: {e}"))
             .ok()
+            .map(Arc::new)?;
+        let bytes = statistics.retained_bytes() as u64;
+        job.stages[stage].retained_statistics_bytes = job.stages[stage]
+            .retained_statistics_bytes
+            .saturating_add(bytes);
+        job.adaptive.retained_statistics_bytes =
+            job.adaptive.retained_statistics_bytes.saturating_add(bytes);
+        job.adaptive.peak_retained_statistics_bytes = job
+            .adaptive
+            .peak_retained_statistics_bytes
+            .max(job.adaptive.retained_statistics_bytes);
+        job.stages[stage].shuffle_statistics = Some(statistics.clone());
+        Some(statistics)
     }
 
     fn report_stage_statistics(
@@ -993,6 +1032,7 @@ impl JobScheduler {
                         attempt.statistics = None;
                     }
                 }
+                job.stages[s].shuffle_statistics = None;
                 job.adaptive.retained_statistics_bytes = job
                     .adaptive
                     .retained_statistics_bytes
@@ -1025,14 +1065,6 @@ impl JobScheduler {
             .and_then(|stage| stage.tasks.get(partition))
             .and_then(|task| task.attempts.split_last().map(|(_, head)| head.len()))
     }
-}
-
-/// The size of the statistics carried by one task report, for overhead accounting.
-fn statistics_payload_bytes(statistics: &TaskOutputStatistics) -> u64 {
-    let values = statistics.rows.len()
-        + statistics.logical_bytes.len()
-        + statistics.physical_bytes.as_ref().map_or(0, |x| x.len());
-    (values * size_of::<u64>()) as u64
 }
 
 struct TaskInputBuilder<'a> {
@@ -1353,6 +1385,7 @@ struct TaskOutputBuilder<'a> {
     key: &'a TaskKey,
     stage: &'a Stage,
     codec: &'a dyn PhysicalExtensionCodec,
+    collect_statistics: bool,
 }
 
 impl<'a> TaskOutputBuilder<'a> {
@@ -1361,12 +1394,14 @@ impl<'a> TaskOutputBuilder<'a> {
         key: &'a TaskKey,
         stage: &'a Stage,
         codec: &'a dyn PhysicalExtensionCodec,
+        collect_statistics: bool,
     ) -> Self {
         Self {
             job,
             key,
             stage,
             codec,
+            collect_statistics,
         }
     }
 
@@ -1411,7 +1446,9 @@ impl<'a> TaskOutputBuilder<'a> {
             OutputMode::Pipelined => TaskOutputLocator::Pipelined {
                 replicas: self.job.graph.replicas(self.key.stage),
             },
-            OutputMode::Blocking => TaskOutputLocator::Blocking,
+            OutputMode::Blocking => TaskOutputLocator::Blocking {
+                collect_statistics: self.collect_statistics,
+            },
         };
         Ok(TaskOutput {
             distribution,
