@@ -52,10 +52,13 @@ export SAIL_CLUSTER__ADAPTIVE__ENABLED=true
 
 When adaptive query execution is enabled, Sail applies the following rules to each stage whose inputs come from completed Celeborn shuffles.
 
-- Small hash shuffle partitions are coalesced into fewer partitions of about `cluster.adaptive.coalesce.target_size` bytes, so fewer tasks and task slots are needed. Partition counts that you chose explicitly, for example with `repartition(n, ...)`, are kept.
+- Small hash shuffle partitions are coalesced into fewer partitions of about `cluster.adaptive.coalesce.target_size` compressed bytes, so fewer tasks and task slots are needed. A coalesced partition never exceeds `cluster.adaptive.coalesce.max_logical_size` uncompressed bytes. Partition counts that you chose explicitly, for example with `repartition(n, ...)`, are kept.
 - A join or grouped aggregation whose result must be empty because an input has no rows is replaced with an empty result.
-- A partitioned hash join swaps its inputs when its build side is measured larger than its probe side, and becomes a sort-merge join when a build partition exceeds `cluster.adaptive.join.max_build_partition_size` bytes.
+- A partitioned hash join swaps its inputs when its build side is certainly larger than its probe side, and becomes a sort-merge join when a build partition certainly exceeds `cluster.adaptive.join.max_build_partition_size` bytes. Coalescing keeps every build partition of a hash join within the same limit.
+- A skewed partition of a join input is split into several partitions, each reading the output of a subset of the map tasks with a Celeborn map-range read, and each paired with the matching partition of the other input. Only the join sides whose results do not depend on seeing the whole other side are split, so full outer joins are never split.
 
-Each decision is made once and is kept when tasks are retried. If a rule cannot be applied safely, the stage runs as originally planned. `EXPLAIN` shows the initial job graph, and the `system.execution.stages` table shows the committed statistics of each stage and the stages that were re-planned.
+Sizes are known only for the shuffle data itself. A rule that depends on the size of an operator's output, such as a join input behind a filter or a nested join, is applied only when the shuffle sizes bound that output. Otherwise the stage keeps its static plan for that rule.
+
+Each decision is made once and is kept when tasks are retried. If a rule cannot be applied safely, the stage runs as originally planned. `EXPLAIN` shows the initial job graph, and the `system.execution.stages` table shows the committed statistics of each stage and the stages that were re-planned. Statistics are collected only when adaptive query execution is enabled.
 
 You can refer to the [Configuration](/reference/configuration/) reference page for advanced options for shuffle backends and adaptive query execution.
