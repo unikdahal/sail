@@ -792,3 +792,51 @@ fn statistics_are_folded_from_committed_attempts() {
     assert_eq!(statistics.total_physical_bytes, Some(8 * MIB));
     assert_eq!(statistics.total_logical_bytes, 32 * MIB);
 }
+
+#[test]
+fn pipelined_output_is_released_when_its_region_reruns_the_producer() {
+    // Under Flight, every stage of this job is in one region, so a retry reruns the
+    // producer and recreates its output. Cleanup timing stays as before.
+    let input = MemorySourceConfig::try_new_exec(&vec![vec![]; 4], schema(), None).unwrap();
+    let shuffle =
+        Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(4)).unwrap());
+    let ordering = datafusion::physical_expr::LexOrdering::new(vec![
+        datafusion::physical_expr::PhysicalSortExpr::new_default(Arc::new(Column::new("k", 0))),
+    ])
+    .unwrap();
+    let sort = Arc::new(SortExec::new(ordering.clone(), shuffle).with_preserve_partitioning(true));
+    let merge = Arc::new(SortPreservingMergeExec::new(ordering, sort));
+    let flight = ShuffleBackendKind::Flight {
+        compression: crate::shuffle::ShuffleCompression::None,
+        connection_count: std::num::NonZeroUsize::MIN,
+        initial_stream_window_size: None,
+        initial_connection_window_size: None,
+    };
+    let graph = JobGraph::try_new(
+        merge,
+        JobGraphOptions {
+            shuffle_backend: flight.clone(),
+        },
+    )
+    .unwrap();
+    let mut job = job(graph);
+    assert_eq!(job.topology.regions.len(), 1);
+    let options = JobSchedulerOptions::new_for_test(flight, AdaptiveOptions::default(), None);
+    succeed(&mut job, 0, |_| TaskOutputStatistics::default());
+    succeed(&mut job, 1, |_| TaskOutputStatistics::default());
+    job.stages[2].tasks[0].attempts.push(TaskAttemptDescriptor {
+        state: TaskState::Running,
+        messages: vec![],
+        cause: None,
+        job_output_fetched: false,
+        statistics: None,
+    });
+    JobScheduler::update_task_regions(&mut job, &options);
+    let actions =
+        JobScheduler::clean_up_job_by_stage(JobId::from(1), &mut job, &reporter(), "test");
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, JobAction::CleanUpJob { stage: Some(0), .. }))
+    );
+}
