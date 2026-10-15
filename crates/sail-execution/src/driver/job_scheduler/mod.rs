@@ -2,6 +2,10 @@ mod adaptive;
 mod core;
 mod options;
 mod state;
+#[cfg(test)]
+mod test_utils;
+#[cfg(test)]
+mod tests;
 mod topology;
 
 use std::sync::Arc;
