@@ -121,7 +121,7 @@ impl JobRunner for ClusterJobRunner {
     fn explain(&self, plan: Arc<dyn ExecutionPlan>) -> Result<String> {
         let graph = explain_job_graph(plan, self.shuffle_backend.clone())?;
         if self.adaptive {
-            // The final decisions are visible in the `cluster.stages` system table.
+            // The final decisions are visible in the `system.execution.stages` table.
             Ok(format!(
                 "initial job graph (adaptive execution may re-plan stages before they run)\n{graph}"
             ))
