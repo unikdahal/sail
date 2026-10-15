@@ -86,6 +86,7 @@ def celeborn_endpoint_overrides(workers: dict[str, WorkerService]) -> str:
             for port, mapped_port in zip(
                 worker.internal_ports,
                 (worker.rpc_port, worker.push_port, worker.fetch_port, worker.replicate_port),
+                strict=True,
             )
         )
     )
@@ -346,7 +347,7 @@ def celeborn_endpoint_resolver(celeborn_workers: dict[str, WorkerService]) -> ob
             (name.split(":")[0], port): (worker.host, mapped_port)
             for name, worker in celeborn_workers.items()
             for port, mapped_port in zip(
-                worker.internal_ports[:3], (worker.rpc_port, worker.push_port, worker.fetch_port)
+                worker.internal_ports[:3], (worker.rpc_port, worker.push_port, worker.fetch_port), strict=True
             )
         }
     )

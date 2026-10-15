@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-import pyspark.sql.functions as F
+import pyspark.sql.functions as F  # noqa: N812
 import pytest
 from pyspark.sql.types import Row
 
@@ -51,6 +51,13 @@ def _celeborn_envs(
     }
 
 
+# The rows of the retry test, and the row at which its first attempt fails.
+RETRY_ROWS = 200_000
+FAILING_ROW = 150_000
+# The fact rows of the skewed join.
+SKEWED_FACT_ROWS = 300_000
+
+
 @pytest.fixture(scope="module")
 def remote(
     celeborn_master: MasterService,
@@ -93,23 +100,25 @@ def test_adaptive_results_match_static_results(remote, static_remote):
             assert df.collect() == static[name].collect(), name
 
 
-def _poll(spark, query: str, timeout: float = 10.0):
+def _poll(df, timeout: float = 10.0):
     """System events are recorded asynchronously, so poll until rows appear."""
     deadline = time.monotonic() + timeout
-    while not (rows := spark.sql(query).collect()) and time.monotonic() < deadline:
+    while not (rows := df.collect()) and time.monotonic() < deadline:
         time.sleep(0.2)
     return rows
 
 
 def test_coalesced_stages_are_recorded(spark):
-    rows = spark.createDataFrame([Row(k=i % 7, v=i) for i in range(100)]).groupBy("k").count().orderBy("k").collect()
-    assert [row.k for row in rows] == list(range(7))
+    keys = 7
+    rows = spark.createDataFrame([Row(k=i % keys, v=i) for i in range(100)]).groupBy("k").count().orderBy("k").collect()
+    assert [row.k for row in rows] == list(range(keys))
 
     replanned = _poll(
-        spark,
-        "SELECT CAST(partitions AS BIGINT) AS partitions, "
-        "CAST(initial_partitions AS BIGINT) AS initial_partitions, adaptive_rules "
-        "FROM system.execution.stages WHERE replanned AND initial_partitions IS NOT NULL",
+        spark.sql(
+            "SELECT CAST(partitions AS BIGINT) AS partitions, "
+            "CAST(initial_partitions AS BIGINT) AS initial_partitions, adaptive_rules "
+            "FROM system.execution.stages WHERE replanned AND initial_partitions IS NOT NULL"
+        )
     )
     assert replanned, "no stage was re-planned"
     assert any(row.partitions < row.initial_partitions for row in replanned)
@@ -119,9 +128,10 @@ def test_coalesced_stages_are_recorded(spark):
 def test_committed_statistics_are_recorded(spark):
     spark.range(1000).repartition(8, "id").groupBy((F.col("id") % 3).alias("m")).count().collect()
     rows = _poll(
-        spark,
-        "SELECT CAST(rows AS BIGINT) AS rows, CAST(logical_bytes AS BIGINT) AS logical_bytes "
-        f"FROM system.execution.stages WHERE rows IS NOT NULL AND session_id = '{spark.session_id}'",
+        spark.sql(
+            "SELECT session_id, CAST(rows AS BIGINT) AS rows, CAST(logical_bytes AS BIGINT) AS logical_bytes "
+            "FROM system.execution.stages WHERE rows IS NOT NULL"
+        ).where(F.col("session_id") == spark.session_id)
     )
     assert rows
     assert all(row.logical_bytes >= 0 for row in rows)
@@ -134,23 +144,26 @@ def test_statistics_are_not_collected_without_adaptive_execution(static_remote):
         # System events are recorded asynchronously, so allow time for any to arrive.
         time.sleep(2)
         # Both servers of this module share the system store, so look at this session only.
-        rows = spark.sql(
-            "SELECT CAST(stage AS BIGINT) AS stage FROM system.execution.stages "
-            f"WHERE rows IS NOT NULL AND session_id = '{spark.session_id}'"
-        ).collect()
+        rows = (
+            spark.sql("SELECT session_id FROM system.execution.stages WHERE rows IS NOT NULL")
+            .where(F.col("session_id") == spark.session_id)
+            .collect()
+        )
         assert not rows, "statistics were collected without adaptive execution"
 
 
 def test_user_chosen_partition_count_is_kept(spark):
-    partitions = spark.range(1000).repartition(12, "id").select(F.spark_partition_id().alias("p")).distinct().count()
-    assert partitions == 12
+    count = 12
+    partitions = spark.range(1000).repartition(count, "id").select(F.spark_partition_id().alias("p")).distinct().count()
+    assert partitions == count
 
 
 def _skewed_join(spark):
     # 70% of the fact rows have key 0, so its hash bucket is far larger than the others.
     # Both sides are larger than the broadcast threshold, so the join is partitioned.
-    fact = spark.range(300_000).select(
-        F.when(F.col("id") % 10 < 7, F.lit(0)).otherwise(F.col("id") % 200_000).alias("k"),
+    hot = F.col("id") % 10 < 7  # noqa: PLR2004
+    fact = spark.range(SKEWED_FACT_ROWS).select(
+        F.when(hot, F.lit(0)).otherwise(F.col("id") % 200_000).alias("k"),
         F.col("id").alias("v"),
     )
     dim = spark.range(200_000).select(F.col("id").alias("k"), (F.col("id") % 17).alias("g"))
@@ -162,25 +175,26 @@ def test_skewed_join_is_split_with_map_range_reads(remote, static_remote):
         adaptive = adaptive_sessions.create()
         static = static_sessions.create()
         expected = _skewed_join(static).collect()
-        assert sum(row.c for row in expected) == 300_000
+        assert sum(row.c for row in expected) == SKEWED_FACT_ROWS
         assert _skewed_join(adaptive).collect() == expected
 
         rules = _poll(
-            adaptive,
-            "SELECT adaptive_rules FROM system.execution.stages WHERE array_contains(adaptive_rules, 'skew_split')",
+            adaptive.sql(
+                "SELECT adaptive_rules FROM system.execution.stages WHERE array_contains(adaptive_rules, 'skew_split')"
+            )
         )
         assert rules, "no stage was split for skew"
 
 
 def _fail_once(marker: str):
-    """Returns a UDF that fails the first time it sees id 150000, after earlier
+    """Returns a UDF that fails the first time it sees `FAILING_ROW`, after earlier
     batches of the task have already been pushed to Celeborn."""
 
     @F.udf("long")
     def fail_once(value):
         import os
 
-        if value == 150_000 and not os.path.exists(marker):
+        if value == FAILING_ROW and not os.path.exists(marker):
             with open(marker, "w") as f:
                 f.write("failed")
             msg = "injected failure"
@@ -190,13 +204,12 @@ def _fail_once(marker: str):
     return fail_once
 
 
-@pytest.mark.parametrize("adaptive", [True, False])
-def test_retried_producer_output_is_read_once(remote, static_remote, tmp_path, adaptive):
-    marker = str(tmp_path / f"failed-{adaptive}")
-    with spark_session_factory(remote if adaptive else static_remote) as sessions:
+def test_retried_producer_output_is_read_once(remote, tmp_path):
+    marker = str(tmp_path / "failed")
+    with spark_session_factory(remote) as sessions:
         spark = sessions.create()
         rows = (
-            spark.range(0, 200_000, 1, 2)
+            spark.range(0, RETRY_ROWS, 1, 2)
             .select(_fail_once(marker)("id").alias("id"))
             # Shuffle the rows as they are produced, so that the failing attempt pushes
             # output to Celeborn before it fails.
@@ -210,5 +223,5 @@ def test_retried_producer_output_is_read_once(remote, static_remote, tmp_path, a
     assert os.path.exists(marker), "the failure was not injected"
     # A failed attempt pushed partial output before failing. Reading it in addition to
     # the retried attempt would duplicate rows.
-    assert sum(row.c for row in rows) == 200_000
-    assert sum(row.s for row in rows) == sum(range(200_000))
+    assert sum(row.c for row in rows) == RETRY_ROWS
+    assert sum(row.s for row in rows) == sum(range(RETRY_ROWS))

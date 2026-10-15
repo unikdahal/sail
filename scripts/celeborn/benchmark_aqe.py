@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """Benchmark adaptive query execution on the Celeborn shuffle backend.
 
 The script starts a Sail server in local-cluster mode with adaptive execution off,
@@ -23,7 +24,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import pyspark.sql.functions as F
+import pyspark.sql.functions as F  # noqa: N812
+
 from pysail.testing.spark.session import spark_connect_server, spark_session_factory
 
 if TYPE_CHECKING:
@@ -65,7 +67,7 @@ def over_partitioned_aggregate(spark: SparkSession, scale: int) -> DataFrame:
 def skewed_join(spark: SparkSession, scale: int) -> DataFrame:
     """A partitioned join where 60% of the fact rows share one key."""
     fact = spark.range(4_000_000 * scale).select(
-        F.when(F.col("id") % 10 < 6, F.lit(0)).otherwise(F.col("id") % 200_000).alias("k"),
+        F.when(F.col("id") % 10 < 6, F.lit(0)).otherwise(F.col("id") % 200_000).alias("k"),  # noqa: PLR2004
         F.col("id").alias("v"),
     )
     # The dimension is too large to broadcast, so the join is partitioned.
@@ -96,18 +98,21 @@ WORKLOADS: dict[str, Callable[[SparkSession, int], DataFrame]] = {
 
 
 def _max_job_id(spark: SparkSession) -> int:
-    row = spark.sql(
-        f"SELECT CAST(MAX(job_id) AS BIGINT) AS m FROM system.execution.jobs WHERE session_id = '{spark.session_id}'"
-    ).collect()[0]
+    row = (
+        spark.sql("SELECT session_id, CAST(job_id AS BIGINT) AS job_id FROM system.execution.jobs")
+        .where(F.col("session_id") == spark.session_id)
+        .agg(F.max("job_id").alias("m"))
+        .collect()[0]
+    )
     return -1 if row.m is None else row.m
 
 
-def _settled(spark: SparkSession, query: str, timeout: float = 15.0) -> list[Any]:
+def _settled(df: DataFrame, timeout: float = 15.0) -> list[Any]:
     """System events are recorded asynchronously, so wait until the rows stop changing."""
     deadline = time.monotonic() + timeout
     previous = None
     while True:
-        rows = spark.sql(query).collect()
+        rows = df.collect()
         if (rows and rows == previous) or time.monotonic() > deadline:
             return rows
         previous = rows
@@ -115,20 +120,30 @@ def _settled(spark: SparkSession, query: str, timeout: float = 15.0) -> list[Any
 
 
 def _record(spark: SparkSession, measurement: Measurement, first: int, last: int) -> None:
-    scope = f"session_id = '{spark.session_id}' AND job_id > {first} AND job_id <= {last}"
+    def scoped(df: DataFrame) -> DataFrame:
+        return df.where(
+            (F.col("session_id") == spark.session_id) & (F.col("job_id") > first) & (F.col("job_id") <= last)
+        )
+
     stages = _settled(
-        spark,
-        "SELECT CAST(job_id AS BIGINT) AS job_id, CAST(stage AS BIGINT) AS stage, "
-        "CAST(partitions AS BIGINT) AS partitions, "
-        "CAST(initial_partitions AS BIGINT) AS initial_partitions, replanned, adaptive_rules "
-        f"FROM system.execution.stages WHERE {scope} ORDER BY job_id, stage",
+        scoped(
+            spark.sql(
+                "SELECT session_id, CAST(job_id AS BIGINT) AS job_id, CAST(stage AS BIGINT) AS stage, "
+                "CAST(partitions AS BIGINT) AS partitions, "
+                "CAST(initial_partitions AS BIGINT) AS initial_partitions, replanned, adaptive_rules "
+                "FROM system.execution.stages"
+            )
+        ).orderBy("job_id", "stage")
     )
     tasks = _settled(
-        spark,
-        "SELECT CAST(job_id AS BIGINT) AS job_id, CAST(stage AS BIGINT) AS stage, "
-        "CAST(partition AS BIGINT) AS partition, CAST(attempt AS BIGINT) AS attempt, "
-        "CAST(unix_micros(stopped_at) - unix_micros(created_at) AS DOUBLE) / 1e6 AS seconds "
-        f"FROM system.execution.tasks WHERE {scope}",
+        scoped(
+            spark.sql(
+                "SELECT session_id, CAST(job_id AS BIGINT) AS job_id, CAST(stage AS BIGINT) AS stage, "
+                "CAST(partition AS BIGINT) AS partition, CAST(attempt AS BIGINT) AS attempt, "
+                "CAST(unix_micros(stopped_at) - unix_micros(created_at) AS DOUBLE) / 1e6 AS seconds "
+                "FROM system.execution.tasks"
+            )
+        ).orderBy("job_id", "stage", "partition", "attempt")
     )
     measurement.jobs = len({row.job_id for row in stages})
     measurement.stages = len(stages)
@@ -163,7 +178,7 @@ def _run_mode(args: argparse.Namespace, *, adaptive: bool) -> dict[str, tuple[li
     ):
         spark = sessions.create()
         for name, workload in WORKLOADS.items():
-            print(f"[adaptive={'on' if adaptive else 'off'}] {name}", flush=True)
+            print(f"[adaptive={'on' if adaptive else 'off'}] {name}", flush=True)  # noqa: T201
             measurement = Measurement()
             # The first run is measured from the system tables and also warms up.
             first = _max_job_id(spark)
@@ -190,12 +205,12 @@ def _print_table(report: dict[str, Any]) -> None:
         "task s",
         "slowest task s",
     ]
-    print("\n| " + " | ".join(columns) + " |")
-    print("|" + "---|" * len(columns))
+    print("\n| " + " | ".join(columns) + " |")  # noqa: T201
+    print("|" + "---|" * len(columns))  # noqa: T201
     for name, entry in report.items():
         for mode in ("off", "on"):
             m = entry[mode]
-            print(
+            print(  # noqa: T201
                 f"| {name} | {mode} | {entry['parity']} | {m['median_wall_seconds']:.2f} | {m['tasks']} "
                 f"| {m['partitions']} ({m['initial_partitions']}) | {m['replanned_stages']} "
                 f"| {', '.join(m['rules']) or '-'} | {m['task_seconds']:.1f} | {m['slowest_task_seconds']:.2f} |"
@@ -219,7 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in WORKLOADS:
         parity = off[name][0] == on[name][0]
         if not parity:
-            print(f"error: results of {name} differ with adaptive execution", file=sys.stderr)
+            print(f"error: results of {name} differ with adaptive execution", file=sys.stderr)  # noqa: T201
         report[name] = {
             "parity": parity,
             "off": {**asdict(off[name][1]), "median_wall_seconds": off[name][1].median_wall_seconds},
