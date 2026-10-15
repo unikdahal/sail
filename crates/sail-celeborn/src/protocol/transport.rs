@@ -207,10 +207,14 @@ impl TransportFrame<'_> {
             .map_err(|_| CelebornError::Protocol("transport header is too large".to_string()))?;
         let body_length = i32::try_from(self.body.len())
             .map_err(|_| CelebornError::Protocol("transport body is too large".to_string()))?;
-        writer.write_i32(header_length).await?;
-        writer.write_u8(self.frame_type.into()).await?;
-        writer.write_i32(body_length).await?;
-        writer.write_all(&self.header).await?;
+        // The fixed fields and the header are written at once, so that a frame is not
+        // split into many small TCP segments.
+        let mut prefix = Vec::with_capacity(9 + self.header.len());
+        prefix.extend_from_slice(&header_length.to_be_bytes());
+        prefix.push(self.frame_type.into());
+        prefix.extend_from_slice(&body_length.to_be_bytes());
+        prefix.extend_from_slice(&self.header);
+        writer.write_all(&prefix).await?;
         self.body.write(writer).await?;
         writer.flush().await?;
         Ok(())
@@ -384,7 +388,11 @@ impl TransportConnection {
         let mut stream = self.stream.lock().await;
         let result = tokio::time::timeout(self.timeout, async {
             if stream.is_none() {
-                *stream = Some(TcpStream::connect((&*self.host, self.port)).await?);
+                let connection = TcpStream::connect((&*self.host, self.port)).await?;
+                // Every request waits for its response, so Nagle's algorithm would hold
+                // back the last segment of each request until a delayed acknowledgement.
+                connection.set_nodelay(true)?;
+                *stream = Some(connection);
             }
             let stream = stream.as_mut().ok_or_else(|| {
                 CelebornError::Protocol("connection was not initialized".to_string())
