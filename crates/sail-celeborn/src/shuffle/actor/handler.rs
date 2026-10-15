@@ -6,13 +6,14 @@ use futures::stream::{self, BoxStream};
 use sail_common::actor::{ActorAction, ActorContext};
 use tokio::sync::oneshot;
 
-use crate::common::{PartitionLocation, SlotReservation};
+use crate::common::{CompressionCodec, PartitionLocation, PushDataSize, SlotReservation};
+use crate::endpoint::EndpointResolver;
 use crate::error::{CelebornError, CelebornResult};
-use crate::lifecycle::ReviveRequest;
+use crate::lifecycle::{LifecycleManager, ReviveRequest};
 use crate::protocol::StatusCode;
 use crate::shuffle::ShuffleClientMessage;
 use crate::shuffle::actor::ShuffleClientActor;
-use crate::worker::WorkerClientOptions;
+use crate::worker::{WorkerClient, WorkerClientOptions, WorkerClientPool, compress};
 
 impl ShuffleClientActor {
     pub(super) fn handle_get_shuffle_id(
@@ -161,7 +162,7 @@ impl ShuffleClientActor {
         map_id: i32,
         attempt_id: i32,
         data: Bytes,
-        reply: oneshot::Sender<CelebornResult<usize>>,
+        reply: oneshot::Sender<CelebornResult<PushDataSize>>,
     ) -> ActorAction {
         let Some(location) = self.locations.get(&(shuffle_id, partition_id)).cloned() else {
             let _ = reply.send(Err(CelebornError::Application(format!(
@@ -186,67 +187,38 @@ impl ShuffleClientActor {
         let compression = self.options.compression;
         let handle = ctx.handle().clone();
         ctx.spawn(async move {
-            let push_result = client
-                .push_data(
-                    &shuffle_key,
-                    map_id,
-                    attempt_id,
-                    current_batch_id,
-                    data.clone(),
-                    compression,
-                )
-                .await;
-            let (location, result) = match push_result {
-                Ok(result) => (None, Ok(result)),
-                Err(CelebornError::Worker { status }) if status == StatusCode::SoftSplit as i32 => {
-                    match lifecycle_manager
-                        .revive(ReviveRequest {
+            // Compress once, so that a retry after a revive sends the same payload and
+            // the compressed size is known whichever path accepts the batch.
+            let uncompressed = data.len() as u64;
+            let (location, result) = match compress(data, compression) {
+                Ok(data) => {
+                    let size = PushDataSize {
+                        uncompressed,
+                        compressed: data.len() as u64,
+                    };
+                    push_compressed(
+                        client,
+                        &shuffle_key,
+                        PushTarget {
                             shuffle_id,
                             partition_id,
                             map_id,
                             attempt_id,
-                            old_location: location,
-                            cause: status,
-                        })
-                        .await
-                    {
-                        Ok(location) => (Some(location), Ok(data.len() + 16)),
-                        Err(error) => (None, Err(error)),
-                    }
+                            batch_id: current_batch_id,
+                        },
+                        location,
+                        data,
+                        lifecycle_manager,
+                        worker_clients,
+                        endpoint_resolver,
+                    )
+                    .await
+                    .map_or_else(
+                        |(location, error)| (location, Err(error)),
+                        |location| (location, Ok(size)),
+                    )
                 }
-                Err(error) => match push_failure_cause(&error) {
-                    Some(cause) => match lifecycle_manager
-                        .revive(ReviveRequest {
-                            shuffle_id,
-                            partition_id,
-                            map_id,
-                            attempt_id,
-                            old_location: location,
-                            cause,
-                        })
-                        .await
-                    {
-                        Ok(location) => {
-                            let retry = worker_clients
-                                .client(
-                                    WorkerClientOptions::new(location.clone())
-                                        .with_endpoint_resolver(endpoint_resolver),
-                                )
-                                .push_data(
-                                    &shuffle_key,
-                                    map_id,
-                                    attempt_id,
-                                    current_batch_id,
-                                    data.clone(),
-                                    compression,
-                                )
-                                .await;
-                            (Some(location), retry)
-                        }
-                        Err(error) => (None, Err(error)),
-                    },
-                    None => (None, Err(error)),
-                },
+                Err(error) => (None, Err(error)),
             };
             let _ = handle
                 .send(ShuffleClientMessage::PushDataComplete {
@@ -266,8 +238,8 @@ impl ShuffleClientActor {
         shuffle_id: i32,
         partition_id: i32,
         location: Option<PartitionLocation>,
-        result: CelebornResult<usize>,
-        reply: oneshot::Sender<CelebornResult<usize>>,
+        result: CelebornResult<PushDataSize>,
+        reply: oneshot::Sender<CelebornResult<PushDataSize>>,
     ) -> ActorAction {
         if let Some(location) = location {
             debug_assert_eq!(location.id, partition_id);
@@ -482,5 +454,89 @@ fn push_failure_cause(error: &CelebornError) -> Option<i32> {
         CelebornError::Io(_) => Some(StatusCode::PushDataCreateConnectionFailPrimary as i32),
         CelebornError::Timeout => Some(StatusCode::PushDataTimeoutPrimary as i32),
         _ => None,
+    }
+}
+
+/// The batch that a push writes.
+struct PushTarget {
+    shuffle_id: i32,
+    partition_id: i32,
+    map_id: i32,
+    attempt_id: i32,
+    batch_id: i32,
+}
+
+/// Pushes an already compressed payload, reviving the partition location once when
+/// the worker asks for a split or the push fails. Returns the new location, if any.
+async fn push_compressed(
+    client: WorkerClient,
+    shuffle_key: &str,
+    target: PushTarget,
+    location: PartitionLocation,
+    data: Bytes,
+    lifecycle_manager: Arc<dyn LifecycleManager>,
+    worker_clients: WorkerClientPool,
+    endpoint_resolver: Option<Arc<dyn EndpointResolver>>,
+) -> Result<Option<PartitionLocation>, (Option<PartitionLocation>, CelebornError)> {
+    let PushTarget {
+        shuffle_id,
+        partition_id,
+        map_id,
+        attempt_id,
+        batch_id,
+    } = target;
+    let push = |client: WorkerClient, data: Bytes| async move {
+        client
+            .push_data(
+                shuffle_key,
+                map_id,
+                attempt_id,
+                batch_id,
+                data,
+                CompressionCodec::None,
+            )
+            .await
+            .map(|_| ())
+    };
+    let revive = |cause: i32, old_location: PartitionLocation| {
+        let lifecycle_manager = Arc::clone(&lifecycle_manager);
+        async move {
+            lifecycle_manager
+                .revive(ReviveRequest {
+                    shuffle_id,
+                    partition_id,
+                    map_id,
+                    attempt_id,
+                    old_location,
+                    cause,
+                })
+                .await
+        }
+    };
+    match push(client, data.clone()).await {
+        Ok(()) => Ok(None),
+        // The worker accepted the batch before asking for a split.
+        Err(CelebornError::Worker { status }) if status == StatusCode::SoftSplit as i32 => {
+            match revive(status, location).await {
+                Ok(location) => Ok(Some(location)),
+                Err(error) => Err((None, error)),
+            }
+        }
+        Err(error) => match push_failure_cause(&error) {
+            Some(cause) => match revive(cause, location).await {
+                Ok(location) => {
+                    let client = worker_clients.client(
+                        WorkerClientOptions::new(location.clone())
+                            .with_endpoint_resolver(endpoint_resolver),
+                    );
+                    match push(client, data).await {
+                        Ok(()) => Ok(Some(location)),
+                        Err(error) => Err((Some(location), error)),
+                    }
+                }
+                Err(error) => Err((None, error)),
+            },
+            None => Err((None, error)),
+        },
     }
 }

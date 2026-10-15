@@ -402,9 +402,7 @@ impl TaskStreamWriter for MultiChannelTaskStreamWriter {
                 .await?
             }
         };
-        Ok(Box::new(MultiChannelTaskStreamSink {
-            sinks: sinks.into_iter().map(Some).collect(),
-        }))
+        Ok(Box::new(MultiChannelTaskStreamSink::new(sinks)))
     }
 }
 

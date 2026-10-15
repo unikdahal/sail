@@ -6,7 +6,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
-use sail_celeborn::lifecycle::LifecycleManagerActor;
+use sail_celeborn::lifecycle::{LifecycleManagerActor, ShuffleCommitReport};
 use sail_common::actor::ActorHandle;
 use sail_common::telemetry::{SpanAssociation, SpanAttribute};
 use sail_common_datafusion::error::CommonErrorCause;
@@ -18,6 +18,7 @@ use crate::driver::output::JobOutputOutcome;
 use crate::driver::worker_scaler::WorkerRetryRequest;
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
 
 pub enum DriverMessage {
@@ -69,6 +70,9 @@ pub enum DriverMessage {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        /// The committed output statistics, present only for a succeeded attempt
+        /// whose shuffle output was committed.
+        statistics: Option<TaskOutputStatistics>,
         /// The sequence number from the worker,
         /// or [None] if it is a forced update within the driver.
         sequence: Option<u64>,
@@ -88,6 +92,11 @@ pub enum DriverMessage {
     },
     CelebornGetLifecycleManager {
         result: oneshot::Sender<Option<ActorHandle<LifecycleManagerActor>>>,
+    },
+    /// The Celeborn lifecycle manager committed (or failed to commit) the shuffle
+    /// written by a stage.
+    CelebornShuffleCommitted {
+        report: ShuffleCommitReport,
     },
     Shutdown {
         result: Option<oneshot::Sender<()>>,
@@ -155,6 +164,7 @@ impl SpanAssociation for DriverMessage {
             DriverMessage::FetchDriverStream { .. } => "FetchDriverStream",
             DriverMessage::FetchWorkerStream { .. } => "FetchWorkerStream",
             DriverMessage::CelebornGetLifecycleManager { .. } => "CelebornGetLifecycleManager",
+            DriverMessage::CelebornShuffleCommitted { .. } => "CelebornShuffleCommitted",
             DriverMessage::Shutdown { .. } => "Shutdown",
         };
         name.into()
@@ -216,6 +226,7 @@ impl SpanAssociation for DriverMessage {
                 status,
                 message,
                 cause,
+                statistics: _,
                 sequence: _,
             } => {
                 p.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
@@ -285,6 +296,10 @@ impl SpanAssociation for DriverMessage {
                 p.push((SpanAttribute::EXECUTION_CHANNEL, channel.to_string()));
             }
             DriverMessage::CelebornGetLifecycleManager { result: _ } => {}
+            DriverMessage::CelebornShuffleCommitted { report } => {
+                p.push((SpanAttribute::EXECUTION_JOB_ID, report.job_id.to_string()));
+                p.push((SpanAttribute::EXECUTION_STAGE, report.stage.to_string()));
+            }
             DriverMessage::Shutdown { .. } => {}
         }
         p.into_iter().map(|(k, v)| (k.into(), v.into()))

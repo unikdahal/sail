@@ -4,10 +4,11 @@ use std::sync::Arc;
 use log::{error, info};
 use sail_celeborn::lifecycle::{
     LifecycleManager, LifecycleManagerActor, LifecycleManagerOptions, LocalLifecycleManager,
+    ShuffleCommitObserver, ShuffleCommitReport,
 };
 use sail_celeborn::master::MasterClientOptions;
 use sail_celeborn::shuffle::{ShuffleClient, ShuffleClientActor, ShuffleClientOptions};
-use sail_common::actor::{Actor, ActorAction, ActorContext};
+use sail_common::actor::{Actor, ActorAction, ActorContext, ActorHandle};
 
 use crate::driver::job_scheduler::{JobScheduler, JobSchedulerOptions};
 use crate::driver::task_assigner::{TaskAssigner, TaskAssignerOptions};
@@ -22,6 +23,21 @@ use crate::task_runner::{
     TaskRunnerActor, TaskRunnerComponents, TaskRunnerExtensions, TaskRunnerMessage,
     TaskRunnerPlacement,
 };
+
+/// Forwards Celeborn shuffle commit reports to the driver actor.
+struct DriverShuffleCommitObserver {
+    driver: ActorHandle<DriverActor>,
+}
+
+#[tonic::async_trait]
+impl ShuffleCommitObserver for DriverShuffleCommitObserver {
+    async fn shuffle_committed(&self, report: ShuffleCommitReport) {
+        let _ = self
+            .driver
+            .send(DriverMessage::CelebornShuffleCommitted { report })
+            .await;
+    }
+}
 
 impl Actor for DriverActor {
     type Message = DriverMessage;
@@ -95,6 +111,10 @@ impl Actor for DriverActor {
                 };
                 let options =
                     options.with_partition_split(*partition_split_threshold, *partition_split_mode);
+                // The scheduler needs to know which attempt of each mapper Celeborn committed.
+                let options = options.with_commit_observer(Arc::new(DriverShuffleCommitObserver {
+                    driver: ctx.handle().clone(),
+                }));
                 let options = options.with_heartbeat_interval(std::time::Duration::from_secs(
                     *heartbeat_interval_secs,
                 ));
@@ -175,8 +195,9 @@ impl Actor for DriverActor {
                 status,
                 message,
                 cause,
+                statistics,
                 sequence,
-            } => self.handle_update_task(ctx, key, status, message, cause, sequence),
+            } => self.handle_update_task(ctx, key, status, message, cause, statistics, sequence),
             DriverMessage::ProbePendingTask { key } => self.handle_probe_pending_task(ctx, key),
             DriverMessage::FetchDriverStream { key, result } => {
                 self.handle_fetch_driver_stream(ctx, key, result)
@@ -189,6 +210,9 @@ impl Actor for DriverActor {
             } => self.handle_fetch_worker_stream(ctx, worker_id, key, schema, result),
             DriverMessage::CelebornGetLifecycleManager { result } => {
                 self.handle_celeborn_get_lifecycle_manager(result)
+            }
+            DriverMessage::CelebornShuffleCommitted { report } => {
+                self.handle_celeborn_shuffle_committed(ctx, report)
             }
             DriverMessage::Shutdown { result } => self.handle_shutdown(ctx, result),
         }

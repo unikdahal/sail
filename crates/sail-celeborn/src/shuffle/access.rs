@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 
 use crate::common::SlotReservation;
 use crate::error::{CelebornError, CelebornResult};
-use crate::shuffle::{ShuffleClientActor, ShuffleClientMessage};
+use crate::shuffle::{PushDataSize, ShuffleClientActor, ShuffleClientMessage};
 
 /// A local handle to a Celeborn shuffle client actor.
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ impl ShuffleClient {
         map_id: i32,
         attempt_id: i32,
         data: Bytes,
-    ) -> CelebornResult<usize> {
+    ) -> CelebornResult<PushDataSize> {
         let (result, receiver) = oneshot::channel();
         self.handle
             .send(ShuffleClientMessage::PushData {

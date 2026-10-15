@@ -1,10 +1,9 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Result, plan_err};
+use datafusion::common::{Result, internal_err, plan_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::UnKnownColumn;
 use datafusion::physical_expr::{
@@ -20,6 +19,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use sail_physical_plan::repartition::RowRoundRobinPartitioner;
 
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::writer::{TaskStreamWriteState, TaskStreamWriter};
 
 enum ShufflePartitioner {
@@ -120,12 +120,14 @@ impl ShuffleWriteExec {
     ) -> Self {
         let partitioning = partitioning.normalize();
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::new(Schema::empty())),
+            EquivalenceProperties::new(TaskOutputStatistics::schema()),
             // The shuffle write plan has the same number of partitions as the input plan.
             // For each partition that are executed, the data is further partitioned according to
             // the shuffle partitioning, resulting in multiple output streams.
             // These output streams are written to locations managed by the worker,
-            // while the return value of `.execute()` is always an empty stream.
+            // while the return value of `.execute()` is a single completion batch.
+            // The completion batch carries the committed output statistics with one row
+            // per channel, or no rows if the output was not committed.
             Partitioning::UnknownPartitioning(plan.output_partitioning().partition_count()),
             EmissionType::Final,
             Boundedness::Unbounded {
@@ -252,8 +254,10 @@ impl ExecutionPlan for ShuffleWriteExec {
         let empty = RecordBatch::new_empty(self.schema());
         let channels = self.partitioning.partition_count();
         let output = futures::stream::once(async move {
-            shuffle_write(writer, stream, partition, channels, partitioner).await?;
-            Ok(empty)
+            match shuffle_write(writer, stream, partition, channels, partitioner).await? {
+                Some(statistics) => statistics.to_record_batch(),
+                None => Ok(empty),
+            }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -268,7 +272,7 @@ async fn shuffle_write(
     partition: usize,
     channels: usize,
     mut partitioner: ShufflePartitioner,
-) -> Result<()> {
+) -> Result<Option<TaskOutputStatistics>> {
     let mut sink = writer.open(partition).await?;
     let result = async {
         while let Some(batch) = stream.next().await {
@@ -289,10 +293,22 @@ async fn shuffle_write(
     }
     .await;
     match result {
-        Ok(true) => sink.commit().await,
+        Ok(true) => {
+            let statistics = sink.commit().await?;
+            if statistics.channels() != channels {
+                return internal_err!(
+                    "expected statistics for {channels} shuffle output channels, got {}",
+                    statistics.channels()
+                );
+            }
+            Ok(Some(statistics))
+        }
         Ok(false) => {
             // TODO: model successful early-stop separately from error-triggered aborts
-            sink.abort().await
+            // An aborted output has nothing committed to describe, so the attempt
+            // reports no statistics even though the task succeeds.
+            sink.abort().await?;
+            Ok(None)
         }
         Err(error) => {
             let _ = sink.abort().await;

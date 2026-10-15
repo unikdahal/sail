@@ -169,6 +169,54 @@
           sql_type: TIMESTAMP_LTZ(6)
           arrow_type: crate::types::timestamp()
           nullable: true
+        - name: rows
+          description: The number of rows committed across all output channels of the stage, if reported.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: physical_bytes
+          description: The physical (backend-stored, compressed) bytes committed by the stage, if known.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: logical_bytes
+          description: The logical (uncompressed Arrow) bytes committed by the stage, if reported.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: max_partition_bytes
+          description: The size of the largest output partition of the stage in bytes, if reported. Physical bytes are used when known, otherwise logical bytes.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: median_partition_bytes
+          description: The median size of the output partitions of the stage in bytes, if reported. Physical bytes are used when known, otherwise logical bytes.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: replanned
+          description: Whether the stage was re-planned by adaptive query execution.
+          rust_type: bool
+          sql_type: BOOLEAN
+          arrow_type: crate::types::boolean()
+          nullable: false
+        - name: adaptive_rules
+          description: The names of the adaptive rules that re-planned the stage, if any.
+          rust_type: Option<Vec<String>>
+          sql_type: ARRAY<STRING>
+          arrow_type: crate::types::string_list()
+          nullable: true
+        - name: initial_partitions
+          description: The number of partitions for the stage before re-planning, if the stage was re-planned.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
 
     - name: tasks
       row_name: task

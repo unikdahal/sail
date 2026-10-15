@@ -7,6 +7,7 @@ mod plan;
 mod proto;
 mod rpc;
 mod shuffle;
+mod statistics;
 mod stream;
 mod task;
 mod task_runner;

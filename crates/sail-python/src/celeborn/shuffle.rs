@@ -166,6 +166,9 @@ impl PyShuffleClient {
                 Bytes::from(data),
             ))
         })
+        // Like Celeborn's Java client, report the accepted input bytes plus the
+        // 16-byte batch header, independent of the codec.
+        .map(|size| size.uncompressed as usize + 16)
         .map_err(to_py_error)
     }
 

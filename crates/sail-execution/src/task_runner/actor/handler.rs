@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use crate::driver::{DriverMessage, TaskStatus};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
@@ -105,6 +106,7 @@ impl TaskRunnerActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        statistics: Option<TaskOutputStatistics>,
     ) -> ActorAction {
         if !matches!(status, TaskStatus::Running) {
             self.signals.remove(&key);
@@ -119,6 +121,7 @@ impl TaskRunnerActor {
                             status,
                             message,
                             cause,
+                            statistics,
                             sequence: None,
                         })
                         .await;
@@ -149,9 +152,12 @@ impl TaskRunnerActor {
                             let key = key.clone();
                             let message = message.clone();
                             let cause = cause.clone();
+                            let statistics = statistics.clone();
                             async move {
                                 driver
-                                    .report_task_status(key, status, message, cause, seq)
+                                    .report_task_status(
+                                        key, status, message, cause, statistics, seq,
+                                    )
                                     .await
                             }
                         })

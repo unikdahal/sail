@@ -12,12 +12,19 @@ use datafusion_physical_expr::Partitioning;
 use sail_physical_plan::coalesce::CoalesceExec;
 use sail_physical_plan::repartition::ExplicitRepartitionExec;
 
-pub struct RewriteExplicitRepartition {}
+pub struct RewriteExplicitRepartition {
+    /// Leave hash `ExplicitRepartitionExec` nodes untouched.
+    preserve_hash: bool,
+}
 
 /// Rewrites explicit repartition nodes to executable physical operators.
 impl RewriteExplicitRepartition {
     pub fn new() -> Self {
-        Self {}
+        Self::new_with_options(false)
+    }
+
+    pub fn new_with_options(preserve_hash: bool) -> Self {
+        Self { preserve_hash }
     }
 }
 
@@ -40,6 +47,7 @@ impl PhysicalOptimizerRule for RewriteExplicitRepartition {
                 let input_partition_count = input.output_partitioning().partition_count();
                 match partitioning {
                     Partitioning::RoundRobinBatch(_) => Ok(Transformed::no(plan)),
+                    Partitioning::Hash(_, _) if self.preserve_hash => Ok(Transformed::no(plan)),
                     Partitioning::Hash(_, _) | Partitioning::Range(_) => Ok(Transformed::yes(
                         Arc::new(RepartitionExec::try_new(input, partitioning)?),
                     )),
@@ -156,6 +164,34 @@ mod tests {
         assert!(optimized.is::<UnionExec>());
         assert!(!optimized.is::<CoalesceExec>());
         assert_eq!(optimized.output_partitioning().partition_count(), 2);
+    }
+
+    #[test]
+    fn test_hash_partitioning_respects_preserve_option() {
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion_physical_expr::expressions::Column;
+
+        let build = || {
+            let input = multi_partition_plan(&schema());
+            let expr =
+                Arc::new(Column::new("id", 0)) as Arc<dyn datafusion_physical_expr::PhysicalExpr>;
+            Arc::new(ExplicitRepartitionExec::new(
+                input,
+                Partitioning::Hash(vec![expr], 4),
+            )) as Arc<dyn ExecutionPlan>
+        };
+
+        let rewritten = RewriteExplicitRepartition::new_with_options(false)
+            .optimize(build(), &ConfigOptions::default())
+            .unwrap();
+        assert!(rewritten.is::<RepartitionExec>());
+        assert_eq!(rewritten.output_partitioning().partition_count(), 4);
+
+        let preserved = RewriteExplicitRepartition::new_with_options(true)
+            .optimize(build(), &ConfigOptions::default())
+            .unwrap();
+        assert!(preserved.is::<ExplicitRepartitionExec>());
+        assert_eq!(preserved.output_partitioning().partition_count(), 4);
     }
 
     #[test]

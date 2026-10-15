@@ -36,7 +36,7 @@ impl ApplicationRegistration {
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct ShuffleKey {
     job_id: u64,
     stage: u64,

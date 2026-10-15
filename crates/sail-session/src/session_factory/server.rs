@@ -149,6 +149,10 @@ impl ServerSessionFactory {
             .with_optimizer_rules(default_optimizer_rules())
             .with_physical_optimizer_rules(get_physical_optimizers(PhysicalOptimizerOptions {
                 enable_join_reorder: self.config.optimizer.enable_join_reorder,
+                preserve_explicit_hash_repartition: matches!(
+                    self.config.mode,
+                    ExecutionMode::LocalCluster | ExecutionMode::KubernetesCluster
+                ) && self.config.cluster.adaptive.enabled,
                 ..Default::default()
             }))
             .with_query_planner(new_query_planner());

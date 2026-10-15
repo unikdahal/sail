@@ -4,6 +4,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use fastrace::Span;
 use fastrace::future::FutureExt;
 use futures::StreamExt;
+use log::warn;
 use sail_common::actor::ActorHandle;
 use sail_common::telemetry::SpanAttribute;
 use sail_common_datafusion::error::CommonErrorCause;
@@ -13,6 +14,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::driver::TaskStatus;
 use crate::id::{TaskKey, TaskKeyDisplay};
+use crate::statistics::TaskOutputStatistics;
 use crate::task_runner::{TaskRunnerActor, TaskRunnerMessage};
 
 pub struct TaskMonitor {
@@ -118,6 +120,17 @@ impl TaskMonitor {
             status,
             message,
             cause,
+            statistics: None,
+        }
+    }
+
+    fn succeeded(key: TaskKey, statistics: Option<TaskOutputStatistics>) -> TaskRunnerMessage {
+        TaskRunnerMessage::ReportTaskStatus {
+            key,
+            status: TaskStatus::Succeeded,
+            message: None,
+            cause: None,
+            statistics,
         }
     }
 
@@ -142,18 +155,35 @@ impl TaskMonitor {
         )
     }
 
+    /// Drains the task stream, whose only data is the completion batch of the
+    /// shuffle writer, and attaches the committed output statistics to the status.
     async fn execute(key: TaskKey, mut stream: SendableRecordBatchStream) -> TaskRunnerMessage {
+        let mut statistics = None;
         loop {
-            let Some(batch) = stream.next().await else {
-                break Self::status(key, TaskStatus::Succeeded, None, None);
+            let batch = match stream.next().await {
+                None => break Self::succeeded(key, statistics),
+                Some(Ok(batch)) => batch,
+                Some(Err(error)) => {
+                    break Self::status(
+                        key,
+                        TaskStatus::Failed,
+                        Some(format!("task error: {error}")),
+                        Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
+                    );
+                }
             };
-            if let Err(error) = batch {
-                break Self::status(
-                    key,
-                    TaskStatus::Failed,
-                    Some(format!("task error: {error}")),
-                    Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
-                );
+            // Statistics are advisory, so a malformed completion batch drops them
+            // instead of failing a task whose output has been committed.
+            match TaskOutputStatistics::try_from_record_batch(&batch) {
+                Ok(Some(x)) => statistics = Some(x),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        "{} ignoring task output statistics: {error}",
+                        TaskKeyDisplay(&key)
+                    );
+                    statistics = None;
+                }
             }
         }
     }
@@ -209,6 +239,7 @@ mod tests {
             status: TaskStatus::Failed,
             message: Some(message),
             cause: Some(CommonErrorCause::Internal(cause)),
+            statistics: None,
         } = message
         else {
             return Err("expected a failed task status".to_string());
@@ -216,6 +247,36 @@ mod tests {
         assert_eq!(key, task_key());
         assert_eq!(message, "task panicked: test monitor panic");
         assert_eq!(cause, message);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attaches_statistics_from_the_completion_batch() -> Result<(), String> {
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let statistics = TaskOutputStatistics {
+            rows: vec![3, 4],
+            physical_bytes: None,
+            logical_bytes: vec![30, 40],
+        };
+        let batch = statistics.to_record_batch().map_err(|e| e.to_string())?;
+        let empty = RecordBatch::new_empty(TaskOutputStatistics::schema());
+        for (batches, expected) in [(vec![batch], Some(statistics.clone())), (vec![empty], None)] {
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                TaskOutputStatistics::schema(),
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            ));
+            let TaskRunnerMessage::ReportTaskStatus {
+                status: TaskStatus::Succeeded,
+                statistics,
+                ..
+            } = TaskMonitor::execute(task_key(), stream).await
+            else {
+                return Err("expected a succeeded task status".to_string());
+            };
+            assert_eq!(statistics, expected);
+        }
         Ok(())
     }
 

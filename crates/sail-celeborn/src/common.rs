@@ -304,6 +304,15 @@ impl TryFrom<PbPartitionLocation> for PartitionLocation {
     }
 }
 
+/// Sizes of one pushed payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PushDataSize {
+    /// Bytes of the payload before compression, as handed to `push_data`.
+    pub uncompressed: u64,
+    /// Bytes sent to the Celeborn worker for this payload after compression, excluding protocol headers.
+    pub compressed: u64,
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {

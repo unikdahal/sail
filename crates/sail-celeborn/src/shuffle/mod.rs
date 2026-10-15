@@ -4,3 +4,5 @@ mod actor;
 pub use access::ShuffleClient;
 pub(crate) use actor::ShuffleClientMessage;
 pub use actor::{ShuffleClientActor, ShuffleClientOptions};
+
+pub use crate::common::PushDataSize;

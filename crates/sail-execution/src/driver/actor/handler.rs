@@ -6,7 +6,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use log::{debug, error, info, warn};
-use sail_celeborn::lifecycle::{LifecycleManagerActor, LocalLifecycleManager};
+use sail_celeborn::lifecycle::{LifecycleManagerActor, LocalLifecycleManager, ShuffleCommitReport};
 use sail_common::actor::{ActorAction, ActorContext, ActorHandle};
 use sail_common_datafusion::error::CommonErrorCause;
 use sail_python_udf::error::PyErrExtractor;
@@ -22,12 +22,36 @@ use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{
     JobId, TaskAttempt, TaskKey, TaskKeyDisplay, TaskStreamKey, TaskStreamKeyDisplay, WorkerId,
 };
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter, TaskStreamAssignment};
 use crate::task_runner::TaskRunnerMessage;
 
 impl DriverActor {
+    pub(super) fn handle_celeborn_shuffle_committed(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        report: ShuffleCommitReport,
+    ) -> ActorAction {
+        let ShuffleCommitReport {
+            job_id,
+            stage,
+            shuffle_id: _,
+            map_attempts,
+            result,
+        } = report;
+        let job_id = JobId::from(job_id);
+        let Ok(stage) = usize::try_from(stage) else {
+            return ActorAction::Continue;
+        };
+        self.job_scheduler
+            .record_shuffle_commit(job_id, stage, map_attempts, result);
+        self.refresh_job(ctx, job_id);
+        self.run_tasks(ctx);
+        ActorAction::Continue
+    }
+
     pub(super) fn handle_celeborn_get_lifecycle_manager(
         &mut self,
         result: oneshot::Sender<Option<ActorHandle<LifecycleManagerActor>>>,
@@ -193,6 +217,7 @@ impl DriverActor {
                     TaskState::Failed,
                     Some(message.clone()),
                     Some(CommonErrorCause::Execution(message.clone())),
+                    None,
                 );
             }
 
@@ -242,6 +267,7 @@ impl DriverActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        statistics: Option<TaskOutputStatistics>,
         sequence: Option<u64>,
     ) -> ActorAction {
         if let Some(sequence) = sequence {
@@ -259,12 +285,17 @@ impl DriverActor {
         match status {
             TaskStatus::Running => {
                 self.job_scheduler
-                    .update_task(&key, TaskState::Running, message, cause);
+                    .update_task(&key, TaskState::Running, message, cause, None);
                 self.refresh_job(ctx, key.job_id);
             }
             TaskStatus::Succeeded => {
-                self.job_scheduler
-                    .update_task(&key, TaskState::Succeeded, message, cause);
+                self.job_scheduler.update_task(
+                    &key,
+                    TaskState::Succeeded,
+                    message,
+                    cause,
+                    statistics,
+                );
                 self.unassign_task(ctx, &key);
                 self.refresh_job(ctx, key.job_id);
                 self.run_tasks(ctx);
@@ -274,7 +305,7 @@ impl DriverActor {
                 // Some canceled tasks may report failed status due to closed streams,
                 // but it is fine to handle them as failed tasks again.
                 self.job_scheduler
-                    .update_task(&key, TaskState::Failed, message, cause);
+                    .update_task(&key, TaskState::Failed, message, cause, None);
                 self.unassign_task(ctx, &key);
                 self.refresh_job(ctx, key.job_id);
                 self.run_tasks(ctx);
@@ -284,7 +315,7 @@ impl DriverActor {
                 // The task attempt state should already be "canceled" but we update it
                 // for the message and cause.
                 self.job_scheduler
-                    .update_task(&key, TaskState::Canceled, message, cause);
+                    .update_task(&key, TaskState::Canceled, message, cause, None);
                 // Task cancellation must have been initiated by the driver itself,
                 // so it is a no-op to handle canceled tasks here.
             }
@@ -330,6 +361,7 @@ impl DriverActor {
                     status: TaskStatus::Failed,
                     message: Some(message),
                     cause: Some(cause),
+                    statistics: None,
                     sequence: None,
                 })
             }
@@ -418,6 +450,7 @@ impl DriverActor {
                             status: TaskStatus::Failed,
                             message: Some(e.to_string()),
                             cause: Some(CommonErrorCause::new::<PyErrExtractor>(&e)),
+                            statistics: None,
                             sequence: None,
                         });
                     }
@@ -620,6 +653,7 @@ impl DriverActor {
                         status: TaskStatus::Failed,
                         message: Some("task region not found".into()),
                         cause: None,
+                        statistics: None,
                         sequence: None,
                     });
                     continue;
@@ -660,6 +694,7 @@ impl DriverActor {
                             status: TaskStatus::Failed,
                             message: Some(message.clone()),
                             cause: Some(cause.clone()),
+                            statistics: None,
                             sequence: None,
                         });
                     }
@@ -668,7 +703,7 @@ impl DriverActor {
             };
             for key in &keys {
                 self.job_scheduler
-                    .update_task(key, TaskState::Scheduled, None, None);
+                    .update_task(key, TaskState::Scheduled, None, None, None);
             }
             let tasks = keys
                 .into_iter()
@@ -716,6 +751,7 @@ impl DriverActor {
                                     status: TaskStatus::Failed,
                                     message: Some(error.to_string()),
                                     cause: Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
+                                    statistics: None,
                                     sequence: None,
                                 })
                                 .await;

@@ -18,7 +18,7 @@ use crate::id::{JobId, TaskStreamKey};
 use crate::shuffle::ShuffleCompression;
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
-use crate::stream::writer::{TaskStreamChannelSink, TaskStreamWriteState};
+use crate::stream::writer::{TaskStreamChannelCommit, TaskStreamChannelSink, TaskStreamWriteState};
 
 /// Object-storage implementation for a blocking shuffle stream. Every task attempt owns a
 /// directory, allowing retries to be selected by the task scheduler without overwriting an
@@ -215,6 +215,8 @@ struct StorageStreamSink {
     writer: Option<StreamWriter<Vec<u8>>>,
     file_index: usize,
     has_batches: bool,
+    /// The total size of the files written so far.
+    written_bytes: u64,
 }
 
 impl StorageStreamSink {
@@ -237,6 +239,7 @@ impl StorageStreamSink {
             writer: Some(writer),
             file_index: 0,
             has_batches: false,
+            written_bytes: 0,
         })
     }
 
@@ -262,11 +265,13 @@ impl StorageStreamSink {
             .prefix
             .clone()
             .join(format!("part-{:020}.arrow", self.file_index));
+        let size = bytes.len() as u64;
         self.store
             .put(&path, PutPayload::from(bytes))
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         self.file_index += 1;
+        self.written_bytes = self.written_bytes.saturating_add(size);
         self.has_batches = false;
         self.writer = Some(self.new_writer()?);
         Ok(())
@@ -292,8 +297,11 @@ impl TaskStreamChannelSink for StorageStreamSink {
         Ok(TaskStreamWriteState::Active)
     }
 
-    async fn commit(mut self: Box<Self>) -> Result<()> {
-        self.flush_file().await
+    async fn commit(mut self: Box<Self>) -> Result<TaskStreamChannelCommit> {
+        self.flush_file().await?;
+        Ok(TaskStreamChannelCommit {
+            physical_bytes: Some(self.written_bytes),
+        })
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {

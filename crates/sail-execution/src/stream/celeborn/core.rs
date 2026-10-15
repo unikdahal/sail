@@ -11,10 +11,12 @@ use futures::{StreamExt, TryStreamExt};
 use sail_celeborn::shuffle::ShuffleClient;
 
 use crate::id::{JobId, TaskKey};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{
-    MultiChannelTaskStreamSink, TaskStreamChannelSink, TaskStreamSink, TaskStreamWriteState,
+    MultiChannelTaskStreamSink, TaskStreamChannelCommit, TaskStreamChannelSink, TaskStreamSink,
+    TaskStreamWriteState,
 };
 
 #[derive(Clone)]
@@ -92,7 +94,7 @@ impl CelebornStreamManager {
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let sinks = (0..channels)
             .map(|channel| {
-                Ok(Some(Box::new(CelebornStreamSink {
+                Ok(Box::new(CelebornStreamSink {
                     client: self.client.clone(),
                     shuffle_id,
                     partition_id: i32::try_from(channel)
@@ -100,11 +102,12 @@ impl CelebornStreamManager {
                     map_id,
                     attempt_id,
                     schema: schema.clone(),
-                }) as Box<dyn TaskStreamChannelSink>))
+                    pushed_bytes: 0,
+                }) as Box<dyn TaskStreamChannelSink>)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Box::new(CelebornTaskStreamSink {
-            channels: MultiChannelTaskStreamSink { sinks },
+            channels: MultiChannelTaskStreamSink::new(sinks),
             client: self.client.clone(),
             shuffle_id,
             map_id,
@@ -175,6 +178,8 @@ struct CelebornStreamSink {
     map_id: i32,
     attempt_id: i32,
     schema: SchemaRef,
+    /// The compressed payload bytes pushed for this channel.
+    pushed_bytes: u64,
 }
 
 #[tonic::async_trait]
@@ -199,7 +204,8 @@ impl TaskStreamChannelSink for CelebornStreamSink {
         let length =
             u32::try_from(length).map_err(|error| DataFusionError::External(Box::new(error)))?;
         data[..size_of::<u32>()].copy_from_slice(&length.to_be_bytes());
-        self.client
+        let size = self
+            .client
             .push_data(
                 self.shuffle_id,
                 self.partition_id,
@@ -209,11 +215,16 @@ impl TaskStreamChannelSink for CelebornStreamSink {
             )
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        self.pushed_bytes = self.pushed_bytes.saturating_add(size.compressed);
         Ok(TaskStreamWriteState::Active)
     }
 
-    async fn commit(self: Box<Self>) -> Result<()> {
-        Ok(())
+    async fn commit(self: Box<Self>) -> Result<TaskStreamChannelCommit> {
+        // The data is committed by `mapper_end` for the whole task, which happens only
+        // after every channel has been committed here.
+        Ok(TaskStreamChannelCommit {
+            physical_bytes: Some(self.pushed_bytes),
+        })
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {
@@ -236,8 +247,11 @@ impl TaskStreamSink for CelebornTaskStreamSink {
         self.channels.write(batches).await
     }
 
-    async fn commit(self: Box<Self>) -> Result<()> {
-        Box::new(self.channels).commit().await?;
+    async fn commit(self: Box<Self>) -> Result<TaskOutputStatistics> {
+        let statistics = Box::new(self.channels).commit().await?;
+        // The statistics become visible only once `mapper_end` succeeds. Whether this
+        // attempt's output is the one Celeborn serves is decided by the lifecycle manager,
+        // which reports the selected attempt of every mapper to the driver.
         self.client
             .mapper_end(
                 self.shuffle_id,
@@ -246,7 +260,8 @@ impl TaskStreamSink for CelebornTaskStreamSink {
                 self.num_mappers,
             )
             .await
-            .map_err(|error| DataFusionError::External(Box::new(error)))
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        Ok(statistics)
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {

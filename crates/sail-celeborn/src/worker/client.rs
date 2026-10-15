@@ -8,7 +8,8 @@ use futures::stream::{self, BoxStream};
 use prost::Message;
 
 use crate::common::{
-    CompressionCodec, PartitionLocation, PartitionSplitMode, UserIdentifier, WorkerIdentity,
+    CompressionCodec, PartitionLocation, PartitionSplitMode, PushDataSize, UserIdentifier,
+    WorkerIdentity,
 };
 use crate::endpoint::EndpointResolver;
 use crate::error::{CelebornError, CelebornResult};
@@ -312,9 +313,10 @@ impl WorkerClient {
         batch_id: i32,
         data: Bytes,
         compression: CompressionCodec,
-    ) -> CelebornResult<usize> {
+    ) -> CelebornResult<PushDataSize> {
         let uncompressed_len = data.len();
         let data = compress(data, compression)?;
+        let compressed_len = data.len();
         let location_id = self.location.unique_id();
         self.push
             .push_data(
@@ -326,8 +328,10 @@ impl WorkerClient {
                 &data,
             )
             .await?;
-        // The public acknowledgement represents accepted input bytes, independent of the codec.
-        Ok(uncompressed_len + 16)
+        Ok(PushDataSize {
+            uncompressed: uncompressed_len as u64,
+            compressed: compressed_len as u64,
+        })
     }
 
     async fn request_worker(
@@ -348,7 +352,8 @@ impl WorkerClient {
     }
 }
 
-fn compress(data: Bytes, compression: CompressionCodec) -> CelebornResult<Bytes> {
+/// Compresses a payload into Celeborn's block format for the codec.
+pub(crate) fn compress(data: Bytes, compression: CompressionCodec) -> CelebornResult<Bytes> {
     match compression {
         CompressionCodec::None => Ok(data),
         CompressionCodec::Lz4 => {

@@ -42,4 +42,20 @@ You can also specify multiple master endpoints in the array if your Celeborn clu
 Sail implements a native Celeborn client that communicates with the Celeborn master and workers.
 The master advertises worker endpoints when the shuffle is registered. Worker hosts must be on the same network as Sail so that Sail workers can connect to Celeborn workers to read and write shuffle data.
 
-You can refer to the [Configuration](/reference/configuration/) reference page for advanced options for shuffle backends.
+### Adaptive Query Execution
+
+With the `celeborn` shuffle backend, Sail can re-plan a stage just before it first runs, using the committed sizes of the shuffle data it reads. This experimental feature is disabled by default and can be enabled with the following environment variable.
+
+```bash
+export SAIL_CLUSTER__ADAPTIVE__ENABLED=true
+```
+
+When adaptive query execution is enabled, Sail applies the following rules to each stage whose inputs come from completed Celeborn shuffles.
+
+- Small hash shuffle partitions are coalesced into fewer partitions of about `cluster.adaptive.coalesce.target_size` bytes, so fewer tasks and task slots are needed. Partition counts that you chose explicitly, for example with `repartition(n, ...)`, are kept.
+- A join or grouped aggregation whose result must be empty because an input has no rows is replaced with an empty result.
+- A partitioned hash join swaps its inputs when its build side is measured larger than its probe side, and becomes a sort-merge join when a build partition exceeds `cluster.adaptive.join.max_build_partition_size` bytes.
+
+Each decision is made once and is kept when tasks are retried. If a rule cannot be applied safely, the stage runs as originally planned. `EXPLAIN` shows the initial job graph, and the `system.execution.stages` table shows the committed statistics of each stage and the stages that were re-planned.
+
+You can refer to the [Configuration](/reference/configuration/) reference page for advanced options for shuffle backends and adaptive query execution.

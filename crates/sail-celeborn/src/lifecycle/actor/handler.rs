@@ -7,7 +7,9 @@ use crate::common::{
 };
 use crate::error::{CelebornError, CelebornResult};
 use crate::lifecycle::actor::{LifecycleManagerActor, ShuffleKey};
-use crate::lifecycle::{LifecycleManagerMessage, ReviveRequest};
+use crate::lifecycle::{
+    LifecycleManagerMessage, ReviveRequest, ShuffleCommitReport, resolve_shuffle_key,
+};
 use crate::protocol::StatusCode;
 use crate::worker::WorkerClientOptions;
 
@@ -493,6 +495,7 @@ impl LifecycleManagerActor {
             let _ = handle
                 .send(LifecycleManagerMessage::MapperEndComplete {
                     shuffle_id,
+                    map_attempts,
                     result,
                     reply,
                 })
@@ -503,11 +506,34 @@ impl LifecycleManagerActor {
 
     pub(super) fn handle_mapper_end_complete(
         &mut self,
+        ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
+        map_attempts: Vec<i32>,
         result: CelebornResult<ApplicationMetrics>,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
         self.committing_shuffles.remove(&shuffle_id);
+        let report = self.options.commit_observer.as_ref().and_then(|observer| {
+            match resolve_shuffle_key(&self.shuffle_ids, shuffle_id) {
+                Some(key) => Some((
+                    observer.clone(),
+                    ShuffleCommitReport {
+                        job_id: key.job_id,
+                        stage: key.stage,
+                        shuffle_id,
+                        map_attempts,
+                        result: result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                    },
+                )),
+                None => {
+                    warn!("cannot report commit of unknown shuffle {shuffle_id}");
+                    None
+                }
+            }
+        });
         let result = match result {
             Ok(metrics) => {
                 self.committed_shuffles.insert(shuffle_id);
@@ -516,7 +542,19 @@ impl LifecycleManagerActor {
             }
             Err(error) => Err(error),
         };
-        let _ = reply.send(result);
+        match report {
+            Some((observer, report)) => {
+                // The observer learns about the commit before the last mapper does, so
+                // the commit is known before any task of the shuffle reports success.
+                ctx.spawn(async move {
+                    observer.shuffle_committed(report).await;
+                    let _ = reply.send(result);
+                });
+            }
+            None => {
+                let _ = reply.send(result);
+            }
+        }
         ActorAction::Continue
     }
 

@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use crate::driver::TaskStatus;
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
@@ -33,6 +34,8 @@ pub enum TaskRunnerMessage {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        /// Committed output statistics, sent only with a succeeded status.
+        statistics: Option<TaskOutputStatistics>,
     },
     ProbePendingLocalStream {
         key: TaskStreamKey,
@@ -162,6 +165,7 @@ impl SpanAssociation for TaskRunnerMessage {
                 status,
                 message,
                 cause,
+                statistics: _,
             } => {
                 properties.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
                 properties.push((SpanAttribute::EXECUTION_STAGE, stage.to_string()));

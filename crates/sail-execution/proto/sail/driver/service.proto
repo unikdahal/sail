@@ -40,7 +40,24 @@ message ReportTaskStatusRequest {
   optional string message = 7;
   // An optional JSON string that contains the cause of the task failure.
   optional string cause = 8;
+  // Committed output statistics, sent only with a SUCCEEDED status after the
+  // shuffle sink committed the output.
+  optional TaskOutputStatistics output_statistics = 9;
   uint64 sequence = 101;
+}
+
+// Committed shuffle output statistics of one task attempt.
+// Each repeated field has one entry per output channel, counted by the sinks.
+message TaskOutputStatistics {
+  // Rows accepted by the sink.
+  repeated uint64 rows = 1;
+  // Bytes the backend stores after its own compression.
+  // Empty when the backend cannot tell.
+  repeated uint64 physical_bytes = 2;
+  // Uncompressed Arrow bytes the accepted batches reference.
+  repeated uint64 logical_bytes = 3;
+  // Field 4 is reserved for per-channel committed file sizes of the storage backend.
+  reserved 4;
 }
 
 enum TaskStatus {

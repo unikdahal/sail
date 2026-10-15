@@ -1,6 +1,9 @@
 mod access;
 mod actor;
 
+use std::collections::HashMap;
+use std::hash::Hash;
+
 pub use access::LocalLifecycleManager;
 pub use actor::{LifecycleManagerActor, LifecycleManagerMessage, LifecycleManagerOptions};
 
@@ -16,6 +19,37 @@ pub struct ReviveRequest {
     pub attempt_id: i32,
     pub old_location: PartitionLocation,
     pub cause: i32,
+}
+
+/// The outcome of a shuffle's global commit.
+#[derive(Debug, Clone)]
+pub struct ShuffleCommitReport {
+    pub job_id: u64,
+    pub stage: u64,
+    pub shuffle_id: i32,
+    /// The attempt selected for each map ID, indexed by map ID.
+    pub map_attempts: Vec<i32>,
+    /// `Ok(())` when every worker committed its files.
+    pub result: Result<(), String>,
+}
+
+/// Receives shuffle commit reports from the lifecycle manager.
+#[tonic::async_trait]
+pub trait ShuffleCommitObserver: Send + Sync + 'static {
+    /// Called once per global commit attempt. The mapper that triggered the commit
+    /// gets its reply only after this returns.
+    async fn shuffle_committed(&self, report: ShuffleCommitReport);
+}
+
+/// Find the key associated with `shuffle_id` in a key-to-shuffle-ID map.
+pub(crate) fn resolve_shuffle_key<K: Hash + Eq + Copy>(
+    shuffle_ids: &HashMap<K, i32>,
+    shuffle_id: i32,
+) -> Option<K> {
+    shuffle_ids
+        .iter()
+        .find(|(_, id)| **id == shuffle_id)
+        .map(|(key, _)| *key)
 }
 
 /// Operations supported by a shuffle lifecycle manager.
@@ -52,4 +86,18 @@ pub trait LifecycleManager: Send + Sync + 'static {
     async fn report_metrics(&self, metrics: ApplicationMetrics) -> CelebornResult<()>;
 
     async fn stop(&self) -> CelebornResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_shuffle_key_by_id() {
+        let mut ids = HashMap::new();
+        ids.insert((1_u64, 2_u64), 7);
+        ids.insert((1, 3), 8);
+        assert_eq!(resolve_shuffle_key(&ids, 8), Some((1, 3)));
+        assert_eq!(resolve_shuffle_key(&ids, 9), None);
+    }
 }
