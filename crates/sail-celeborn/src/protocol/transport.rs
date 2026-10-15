@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::common::BatchHeader;
 use crate::error::{CelebornError, CelebornResult};
 use crate::protocol::StatusCode;
 use crate::protocol::proto::MessageType;
@@ -281,11 +282,16 @@ impl TransportConnection {
         header.push(0);
         write_bytes(&mut header, shuffle_key)?;
         write_bytes(&mut header, partition_unique_id)?;
-        let mut prefix = Vec::with_capacity(16);
-        prefix.extend_from_slice(&map_id.to_be_bytes());
-        prefix.extend_from_slice(&attempt_id.to_be_bytes());
-        prefix.extend_from_slice(&batch_id.to_be_bytes());
-        prefix.extend_from_slice(&data_length.to_be_bytes());
+        // The batch header uses the byte order of Celeborn's Java client
+        // (`Platform.putInt`, little-endian), which the worker reads to sort partition
+        // files by map ID for map-range reads.
+        let prefix = BatchHeader {
+            map_id,
+            attempt_id,
+            batch_id,
+            length: data_length,
+        }
+        .encode();
 
         let response = self
             .request(TransportFrame {

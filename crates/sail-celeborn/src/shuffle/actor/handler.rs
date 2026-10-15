@@ -6,14 +6,16 @@ use futures::stream::{self, BoxStream};
 use sail_common::actor::{ActorAction, ActorContext};
 use tokio::sync::oneshot;
 
-use crate::common::{CompressionCodec, PartitionLocation, PushDataSize, SlotReservation};
+use crate::common::{
+    CompressionCodec, PartitionLocation, PartitionReadOptions, PushDataSize, SlotReservation,
+};
 use crate::endpoint::EndpointResolver;
 use crate::error::{CelebornError, CelebornResult};
 use crate::lifecycle::{LifecycleManager, ReviveRequest};
 use crate::protocol::StatusCode;
 use crate::shuffle::ShuffleClientMessage;
 use crate::shuffle::actor::ShuffleClientActor;
-use crate::worker::{WorkerClient, WorkerClientOptions, WorkerClientPool, compress};
+use crate::worker::{BatchFilter, WorkerClient, WorkerClientOptions, WorkerClientPool, compress};
 
 impl ShuffleClientActor {
     pub(super) fn handle_get_shuffle_id(
@@ -324,6 +326,7 @@ impl ShuffleClientActor {
         ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
         partition_id: i32,
+        options: PartitionReadOptions,
         reply: oneshot::Sender<BoxStream<'static, CelebornResult<Bytes>>>,
     ) -> ActorAction {
         if !self
@@ -347,6 +350,7 @@ impl ShuffleClientActor {
                 .send(ShuffleClientMessage::ReadPartitionStreamComplete {
                     shuffle_id,
                     partition_id,
+                    options,
                     result,
                     reply,
                 })
@@ -360,6 +364,7 @@ impl ShuffleClientActor {
         ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
         partition_id: i32,
+        options: PartitionReadOptions,
         result: CelebornResult<SlotReservation>,
         reply: oneshot::Sender<BoxStream<'static, CelebornResult<Bytes>>>,
     ) -> ActorAction {
@@ -403,17 +408,27 @@ impl ShuffleClientActor {
                 )
             })
             .collect::<Vec<_>>();
+        // Every location (one per split or revived epoch) is read with the same map
+        // range, and one filter spans all of them so that a batch stored in two
+        // locations is returned once.
+        let filter = BatchFilter::new(&options, compression);
+        let map_range = options.map_range;
         ctx.spawn(async move {
             let stream = stream::iter(clients)
                 .then(move |client| {
                     let shuffle_key = shuffle_key.clone();
-                    async move {
-                        client
-                            .read_partition_stream(&shuffle_key, compression)
-                            .await
-                    }
+                    let map_range = map_range.clone();
+                    async move { client.read_partition_stream(&shuffle_key, map_range).await }
                 })
-                .flatten();
+                .flatten()
+                .scan(filter, |filter, item| {
+                    let item = match item {
+                        Ok((header, payload)) => filter.accept(header, payload).transpose(),
+                        Err(error) => Some(Err(error)),
+                    };
+                    std::future::ready(Some(item))
+                })
+                .filter_map(std::future::ready);
             let _ = reply.send(Box::pin(stream));
         });
         ActorAction::Continue

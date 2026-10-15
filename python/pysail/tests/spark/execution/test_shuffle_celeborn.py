@@ -10,6 +10,7 @@ import pyspark.sql.functions as F  # noqa: N812
 import pytest
 from pyspark.sql.types import Row
 
+from pysail.testing.containers.celeborn import celeborn_endpoint_overrides
 from pysail.testing.spark.session import spark_connect_server, spark_session_factory
 from pysail.testing.spark.utils.common import is_jvm_spark
 
@@ -30,18 +31,7 @@ def remote(
     celeborn_workers: dict[str, WorkerService],
 ) -> Generator[str, None, None]:
     """Run Spark Connect with a Celeborn shuffle backend."""
-    endpoint_overrides = "[{}]".format(
-        ", ".join(
-            f'{{ internal = "{hostname}:{port}", external = "{worker.host}:{mapped_port}" }}'
-            for hostname, worker in celeborn_workers.items()
-            for port, mapped_port in [
-                (12000, worker.rpc_port),
-                (12001, worker.push_port),
-                (12002, worker.fetch_port),
-                (12003, worker.replicate_port),
-            ]
-        )
-    )
+    endpoint_overrides = celeborn_endpoint_overrides(celeborn_workers)
     envs = {
         "SAIL_MODE": "local-cluster",
         "SAIL_CLUSTER__SHUFFLE_BACKEND__TYPE": "celeborn",

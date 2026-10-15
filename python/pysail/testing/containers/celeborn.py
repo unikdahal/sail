@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import struct
 import time
@@ -41,6 +42,53 @@ class WorkerService:
     push_port: int
     fetch_port: int
     replicate_port: int
+    # The host and ports that the worker advertises to the master, which clients
+    # must map to the reachable host and ports above.
+    internal_ports: tuple[int, int, int, int] = (12000, 12001, 12002, 12003)
+
+
+# An existing Celeborn cluster can be used instead of Docker containers by setting:
+#   SAIL_TEST_CELEBORN_MASTER=<host>:<port>:<http-port>
+#   SAIL_TEST_CELEBORN_WORKERS=<host>:<rpc>:<push>:<fetch>:<replicate>,...
+# The workers must advertise the same host and ports that the tests connect to.
+_EXTERNAL_MASTER_ENV = "SAIL_TEST_CELEBORN_MASTER"
+_EXTERNAL_WORKERS_ENV = "SAIL_TEST_CELEBORN_WORKERS"
+
+
+def _external_master() -> MasterService | None:
+    value = os.environ.get(_EXTERNAL_MASTER_ENV)
+    if not value:
+        return None
+    host, port, http_port = value.rsplit(":", 2)
+    return MasterService(host, int(port), int(http_port))
+
+
+def _external_workers() -> dict[str, WorkerService] | None:
+    value = os.environ.get(_EXTERNAL_WORKERS_ENV)
+    if not value:
+        return None
+    workers = {}
+    for item in value.split(","):
+        host, *ports = item.rsplit(":", 4)
+        rpc, push, fetch, replicate = (int(p) for p in ports)
+        workers[f"{host}:{rpc}"] = WorkerService(
+            host, rpc, push, fetch, replicate, internal_ports=(rpc, push, fetch, replicate)
+        )
+    return workers
+
+
+def celeborn_endpoint_overrides(workers: dict[str, WorkerService]) -> str:
+    """Returns the `cluster.shuffle_backend.celeborn.endpoint_overrides` value for the workers."""
+    return "[{}]".format(
+        ", ".join(
+            f'{{ internal = "{name.split(":")[0]}:{port}", external = "{worker.host}:{mapped_port}" }}'
+            for name, worker in workers.items()
+            for port, mapped_port in zip(
+                worker.internal_ports,
+                (worker.rpc_port, worker.push_port, worker.fetch_port, worker.replicate_port),
+            )
+        )
+    )
 
 
 class CelebornMessageType:
@@ -160,7 +208,10 @@ def _wait_for_port(host: str, port: int, timeout: float = 60) -> None:
 
 
 @pytest.fixture(scope="session")
-def celeborn_network() -> Generator[Network, None, None]:
+def celeborn_network() -> Generator[Network | None, None, None]:
+    if _external_master() is not None:
+        yield None
+        return
     network = Network()
     network.create()
     try:
@@ -171,6 +222,9 @@ def celeborn_network() -> Generator[Network, None, None]:
 
 @pytest.fixture(scope="session")
 def celeborn_master(celeborn_network: Network) -> Generator[MasterService, None, None]:
+    if (external := _external_master()) is not None:
+        yield external
+        return
     master = (
         DockerContainer(_IMAGE)
         .with_kwargs(hostname="celeborn-master")
@@ -227,6 +281,9 @@ def celeborn_workers(
     celeborn_master: MasterService,
 ) -> Generator[dict[str, WorkerService], None, None]:
     """Start the independent Celeborn workers concurrently after the master is ready."""
+    if (external := _external_workers()) is not None:
+        yield external
+        return
     containers = {name: _create_worker(celeborn_network, name) for name in _WORKER_NAMES}
     try:
         with ThreadPoolExecutor(max_workers=len(containers)) as executor:
@@ -286,13 +343,11 @@ def celeborn_endpoint_resolver(celeborn_workers: dict[str, WorkerService]) -> ob
     """Map Docker-network worker endpoints to the host-published ports."""
     return _celeborn_endpoint_resolver(
         {
-            (name, port): (worker.host, mapped_port)
+            (name.split(":")[0], port): (worker.host, mapped_port)
             for name, worker in celeborn_workers.items()
-            for port, mapped_port in [
-                (12000, worker.rpc_port),
-                (12001, worker.push_port),
-                (12002, worker.fetch_port),
-            ]
+            for port, mapped_port in zip(
+                worker.internal_ports[:3], (worker.rpc_port, worker.push_port, worker.fetch_port)
+            )
         }
     )
 

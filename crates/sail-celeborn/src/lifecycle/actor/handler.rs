@@ -495,6 +495,7 @@ impl LifecycleManagerActor {
             let _ = handle
                 .send(LifecycleManagerMessage::MapperEndComplete {
                     shuffle_id,
+                    map_id,
                     map_attempts,
                     result,
                     reply,
@@ -508,11 +509,21 @@ impl LifecycleManagerActor {
         &mut self,
         ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
+        map_id: usize,
         map_attempts: Vec<i32>,
         result: CelebornResult<ApplicationMetrics>,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
         self.committing_shuffles.remove(&shuffle_id);
+        if result.is_err()
+            && let Some(attempts) = self.mapper_attempts.get_mut(&shuffle_id)
+            && let Some(attempt) = attempts.get_mut(map_id)
+        {
+            // The mapper that triggered the commit gets the error and is retried. Clear
+            // its slot so that the retried attempt's `mapper_end` triggers a new commit,
+            // instead of being acknowledged with nothing committed.
+            *attempt = -1;
+        }
         let report = self.options.commit_observer.as_ref().and_then(|observer| {
             match resolve_shuffle_key(&self.shuffle_ids, shuffle_id) {
                 Some(key) => Some((

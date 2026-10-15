@@ -311,6 +311,30 @@
     sort-merge join.
   experimental: true
 
+- key: cluster.adaptive.skew.enabled
+  type: boolean
+  default: "true"
+  description: |
+    Whether to split skewed join partitions when adaptive query execution is enabled.
+    A skewed partition is split by producer partition and read with Celeborn
+    map-range reads.
+  experimental: true
+
+- key: cluster.adaptive.skew.factor
+  type: number
+  default: "5.0"
+  description: |
+    A partition is skewed if it is larger than this factor times the median
+    partition size of its join input, and larger than `cluster.adaptive.skew.threshold`.
+  experimental: true
+
+- key: cluster.adaptive.skew.threshold
+  type: number
+  default: "268435456"
+  description: |
+    The minimum size in physical (compressed) bytes of a skewed partition.
+  experimental: true
+
 - key: cluster.rpc_retry_strategy.type
   type: string
   default: "fixed"

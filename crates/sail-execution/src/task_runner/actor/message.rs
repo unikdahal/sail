@@ -13,7 +13,7 @@ use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
-use crate::task::definition::TaskDefinition;
+use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
 use crate::worker::WorkerLocation;
 
 pub enum TaskRunnerMessage {
@@ -83,7 +83,8 @@ pub enum TaskRunnerMessage {
     FetchCelebornStream {
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
     },

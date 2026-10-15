@@ -7,6 +7,7 @@ import pyspark.sql.functions as F
 import pytest
 from pyspark.sql.types import Row
 
+from pysail.testing.containers.celeborn import celeborn_endpoint_overrides
 from pysail.testing.spark.session import spark_connect_server, spark_session_factory
 from pysail.testing.spark.utils.common import is_jvm_spark
 
@@ -27,18 +28,7 @@ def _celeborn_envs(
     *,
     adaptive: bool,
 ) -> dict[str, str]:
-    endpoint_overrides = "[{}]".format(
-        ", ".join(
-            f'{{ internal = "{hostname}:{port}", external = "{worker.host}:{mapped_port}" }}'
-            for hostname, worker in celeborn_workers.items()
-            for port, mapped_port in [
-                (12000, worker.rpc_port),
-                (12001, worker.push_port),
-                (12002, worker.fetch_port),
-                (12003, worker.replicate_port),
-            ]
-        )
-    )
+    endpoint_overrides = celeborn_endpoint_overrides(celeborn_workers)
     return {
         "SAIL_MODE": "local-cluster",
         "SAIL_CLUSTER__SHUFFLE_BACKEND__TYPE": "celeborn",
@@ -49,6 +39,15 @@ def _celeborn_envs(
         "SAIL_CLUSTER__ADAPTIVE__ENABLED": "true" if adaptive else "false",
         # Hash shuffles start over-partitioned so that coalescing has an effect.
         "SAIL_EXECUTION__DEFAULT_PARALLELISM": "16",
+        # Small sizes so that coalescing and skew splitting apply to test-sized data.
+        "SAIL_CLUSTER__ADAPTIVE__COALESCE__TARGET_SIZE": "65536",
+        "SAIL_CLUSTER__ADAPTIVE__COALESCE__MIN_PARTITION_SIZE": "1024",
+        "SAIL_CLUSTER__ADAPTIVE__SKEW__THRESHOLD": "65536",
+        "SAIL_CLUSTER__ADAPTIVE__SKEW__FACTOR": "2.0",
+        # Retry failed tasks so that failure injection can be observed.
+        "SAIL_CLUSTER__TASK_MAX_ATTEMPTS": "3",
+        # Small batches, so that a task pushes output to Celeborn before an injected failure.
+        "SAIL_EXECUTION__BATCH_SIZE": "1024",
     }
 
 
@@ -108,7 +107,8 @@ def test_coalesced_stages_are_recorded(spark):
 
     replanned = _poll(
         spark,
-        "SELECT partitions, initial_partitions, adaptive_rules "
+        "SELECT CAST(partitions AS BIGINT) AS partitions, "
+        "CAST(initial_partitions AS BIGINT) AS initial_partitions, adaptive_rules "
         "FROM system.execution.stages WHERE replanned AND initial_partitions IS NOT NULL",
     )
     assert replanned, "no stage was re-planned"
@@ -118,7 +118,11 @@ def test_coalesced_stages_are_recorded(spark):
 
 def test_committed_statistics_are_recorded(spark):
     spark.range(1000).repartition(8, "id").groupBy((F.col("id") % 3).alias("m")).count().collect()
-    rows = _poll(spark, "SELECT rows, logical_bytes FROM system.execution.stages WHERE rows IS NOT NULL")
+    rows = _poll(
+        spark,
+        "SELECT CAST(rows AS BIGINT) AS rows, CAST(logical_bytes AS BIGINT) AS logical_bytes "
+        "FROM system.execution.stages WHERE rows IS NOT NULL",
+    )
     assert rows
     assert all(row.logical_bytes >= 0 for row in rows)
 
@@ -126,3 +130,71 @@ def test_committed_statistics_are_recorded(spark):
 def test_user_chosen_partition_count_is_kept(spark):
     partitions = spark.range(1000).repartition(12, "id").select(F.spark_partition_id().alias("p")).distinct().count()
     assert partitions == 12
+
+
+def _skewed_join(spark):
+    # 70% of the fact rows have key 0, so its hash bucket is far larger than the others.
+    # Both sides are larger than the broadcast threshold, so the join is partitioned.
+    fact = spark.range(300_000).select(
+        F.when(F.col("id") % 10 < 7, F.lit(0)).otherwise(F.col("id") % 200_000).alias("k"),
+        F.col("id").alias("v"),
+    )
+    dim = spark.range(200_000).select(F.col("id").alias("k"), (F.col("id") % 17).alias("g"))
+    return fact.join(dim, "k").groupBy("g").agg(F.count("*").alias("c"), F.sum("v").alias("s")).orderBy("g")
+
+
+def test_skewed_join_is_split_with_map_range_reads(remote, static_remote):
+    with spark_session_factory(remote) as adaptive_sessions, spark_session_factory(static_remote) as static_sessions:
+        adaptive = adaptive_sessions.create()
+        static = static_sessions.create()
+        expected = _skewed_join(static).collect()
+        assert sum(row.c for row in expected) == 300_000  # noqa: PLR2004
+        assert _skewed_join(adaptive).collect() == expected
+
+        rules = _poll(
+            adaptive,
+            "SELECT adaptive_rules FROM system.execution.stages WHERE array_contains(adaptive_rules, 'skew_split')",
+        )
+        assert rules, "no stage was split for skew"
+
+
+def _fail_once(marker: str):
+    """Returns a UDF that fails the first time it sees id 150000, after earlier
+    batches of the task have already been pushed to Celeborn."""
+
+    @F.udf("long")
+    def fail_once(value):
+        import os  # noqa: PLC0415
+
+        if value == 150_000 and not os.path.exists(marker):  # noqa: PLR2004
+            with open(marker, "w") as f:  # noqa: PTH123
+                f.write("failed")
+            msg = "injected failure"
+            raise RuntimeError(msg)
+        return value
+
+    return fail_once
+
+
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_retried_producer_output_is_read_once(remote, static_remote, tmp_path, adaptive):
+    marker = str(tmp_path / f"failed-{adaptive}")
+    with spark_session_factory(remote if adaptive else static_remote) as sessions:
+        spark = sessions.create()
+        rows = (
+            spark.range(0, 200_000, 1, 2)
+            .select(_fail_once(marker)("id").alias("id"))
+            # Shuffle the rows as they are produced, so that the failing attempt pushes
+            # output to Celeborn before it fails.
+            .repartition(8, "id")
+            .groupBy((F.col("id") % 100).alias("m"))
+            .agg(F.count("*").alias("c"), F.sum("id").alias("s"))
+            .collect()
+        )
+    import os  # noqa: PLC0415
+
+    assert os.path.exists(marker), "the failure was not injected"
+    # A failed attempt pushed partial output before failing. Reading it in addition to
+    # the retried attempt would duplicate rows.
+    assert sum(row.c for row in rows) == 200_000  # noqa: PLR2004
+    assert sum(row.s for row in rows) == sum(range(200_000))

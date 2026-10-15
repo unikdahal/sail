@@ -65,3 +65,4 @@ tonic-prost-build = { workspace = true }
 h2 = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+proptest = { workspace = true }

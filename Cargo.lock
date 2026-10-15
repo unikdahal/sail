@@ -8034,6 +8034,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "proptest",
  "prost",
  "prost-build",
  "rand 0.10.3",

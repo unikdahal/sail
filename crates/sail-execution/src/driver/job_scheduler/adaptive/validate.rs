@@ -4,7 +4,7 @@
 //! serialization cannot catch a broken rewrite. Every check here is necessary for
 //! the rewritten job to produce the same rows as the static plan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -18,8 +18,9 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use prost::Message;
 
+use crate::driver::job_scheduler::adaptive::spec::{SpecInput, check_group};
 use crate::driver::job_scheduler::topology::JobTopology;
-use crate::job_graph::{AdaptiveProperty, BucketLayout, InputMode, JobGraph, TaskPlacement};
+use crate::job_graph::{BucketLayout, InputMode, JobGraph, TaskPlacement};
 use crate::plan::StageInputExec;
 use crate::proto::{encode_remote_physical_plan, proto_to_physical_plan};
 
@@ -55,8 +56,8 @@ pub(crate) fn validate(ctx: &ValidationContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Each input's spec covers every bucket of its producer exactly once, in order,
-/// and its length equals the partition count the placeholder declares.
+/// Each adapted input reads a direct-layout shuffle, and its placeholder declares
+/// `UnknownPartitioning` with as many partitions as its spec has entries.
 fn validate_inputs(ctx: &ValidationContext, s: usize) -> Result<(), String> {
     let stage = &ctx.new.stages()[s];
     let declared = placeholder_partitions(&stage.plan);
@@ -73,35 +74,6 @@ fn validate_inputs(ctx: &ValidationContext, s: usize) -> Result<(), String> {
             return Err(format!(
                 "stage {s} input {i} does not have a direct bucket layout"
             ));
-        }
-        let buckets = ctx.new.stages()[input.stage].distribution.channels();
-        let mut next = 0;
-        for slices in &adaptive.spec {
-            for slice in slices {
-                if slice.buckets.start != next || slice.buckets.is_empty() {
-                    return Err(format!(
-                        "stage {s} input {i} does not read buckets contiguously: {adaptive}"
-                    ));
-                }
-                next = slice.buckets.end;
-            }
-        }
-        if next != buckets {
-            return Err(format!(
-                "stage {s} input {i} reads {next} of {buckets} buckets"
-            ));
-        }
-        let AdaptiveProperty::CoalescedHash { from, boundaries } = &adaptive.property;
-        {
-            let expected = adaptive
-                .spec
-                .iter()
-                .filter_map(|slices| slices.first().map(|slice| slice.buckets.start))
-                .chain([buckets])
-                .collect::<Vec<_>>();
-            if *from != buckets || *boundaries != expected {
-                return Err(format!("stage {s} input {i} has inconsistent boundaries"));
-            }
         }
         // An input whose placeholder was pruned from the plan is never read.
         if let Some(&partitions) = declared.get(&i) {
@@ -210,21 +182,43 @@ fn validate_codec(ctx: &ValidationContext, s: usize) -> Result<(), String> {
     validate_plan(&decoded).map_err(|e| format!("stage {s} after the codec round trip: {e}"))
 }
 
-/// Inputs that an operator pairs partition by partition share bucket boundaries.
+/// The specs satisfy the exact-coverage contract: within each alignment group, and
+/// for every adapted input outside the groups on its own.
 fn validate_groups(ctx: &ValidationContext) -> Result<(), String> {
     let stage = &ctx.new.stages()[ctx.stage];
+    let spec_input = |i: usize| -> Result<Option<SpecInput<'_>>, String> {
+        let input = stage
+            .inputs
+            .get(i)
+            .ok_or_else(|| format!("stage {} input {i} not found", ctx.stage))?;
+        let producer = &ctx.new.stages()[input.stage];
+        Ok(input.adaptive.as_deref().map(|spec| SpecInput {
+            spec,
+            buckets: producer.distribution.channels(),
+            producers: producer.plan.output_partitioning().partition_count(),
+        }))
+    };
+    let mut grouped = HashSet::new();
     for group in ctx.groups {
-        let mut specs = group
+        let specs = group
             .iter()
-            .filter_map(|&i| stage.inputs.get(i))
-            .map(|input| input.adaptive.as_ref().map(|x| &x.spec));
-        if let Some(first) = specs.next()
-            && specs.any(|spec| spec != first)
-        {
+            .map(|&i| spec_input(i))
+            .collect::<Result<Vec<_>, _>>()?;
+        grouped.extend(group.iter().copied());
+        if specs.iter().all(Option::is_none) {
+            continue;
+        }
+        let Some(specs) = specs.into_iter().collect::<Option<Vec<_>>>() else {
             return Err(format!(
-                "stage {} inputs {group:?} have different bucket boundaries",
+                "stage {} inputs {group:?} are only partly adapted",
                 ctx.stage
             ));
+        };
+        check_group(&specs).map_err(|e| format!("stage {} inputs {group:?}: {e}", ctx.stage))?;
+    }
+    for i in (0..stage.inputs.len()).filter(|i| !grouped.contains(i)) {
+        if let Some(spec) = spec_input(i)? {
+            check_group(&[spec]).map_err(|e| format!("stage {} input {i}: {e}", ctx.stage))?;
         }
     }
     Ok(())

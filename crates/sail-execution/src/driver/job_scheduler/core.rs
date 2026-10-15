@@ -25,7 +25,7 @@ use crate::driver::output::{JobOutputOutcome, build_job_output};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey};
 use crate::job_graph::{
-    InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, TaskPlacement,
+    InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, SubRange, TaskPlacement,
 };
 use crate::proto::{
     encode_remote_partitioning, encode_remote_physical_expr, encode_remote_physical_plan,
@@ -33,8 +33,8 @@ use crate::proto::{
 use crate::shuffle::ShuffleBackendKind;
 use crate::statistics::{CompactOutputStatistics, ShuffleStatistics, TaskOutputStatistics};
 use crate::task::definition::{
-    TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
-    TaskOutputLocator,
+    ShuffleServiceRead, TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput,
+    TaskOutputDistribution, TaskOutputLocator,
 };
 use crate::task::scheduling::{
     TaskAssignment, TaskAssignmentGetter, TaskOutputKind, TaskRegion, TaskSet, TaskSetEntry,
@@ -1140,44 +1140,84 @@ impl<'a> TaskInputBuilder<'a> {
     fn build_shuffle_service_locator(&self) -> ExecutionResult<TaskInputLocator> {
         let input_channels = self.producer.distribution.channels();
         let output_partitions = self.consumer.plan.output_partitioning().partition_count();
-        if let Some(adaptive) = &self.input.adaptive {
-            // Consumer partition `i` of this input's own domain reads the channels in
-            // the bucket ranges of its spec entry. Celeborn reads whole partitions only.
-            let channels = adaptive
+        let map_attempts = self.committed_map_attempts()?;
+        let reads = if let Some(adaptive) = &self.input.adaptive {
+            // Partition `i` of this input's own domain reads the bucket slices of its
+            // spec entry: whole channels, or one channel restricted to a range of
+            // producer partitions for a skew split.
+            adaptive
                 .spec
                 .iter()
                 .map(|slices| {
-                    slices
-                        .iter()
-                        .map(|slice| {
-                            if slice.buckets.end > input_channels {
+                    let mut read = ShuffleServiceRead::channels(vec![]);
+                    for slice in slices {
+                        if slice.buckets.end > input_channels {
+                            return Err(ExecutionError::InternalError(format!(
+                                "invalid Celeborn bucket slice {slice} for {input_channels} channels"
+                            )));
+                        }
+                        read.channels.extend(slice.buckets.clone());
+                        if let Some(SubRange::Producers(mappers)) = &slice.part {
+                            if slices.len() != 1 || slice.buckets.len() != 1 {
                                 return Err(ExecutionError::InternalError(format!(
-                                    "invalid Celeborn bucket slice {slice} for {input_channels} channels"
+                                    "a partial bucket must be read alone: {slice}"
                                 )));
                             }
-                            Ok(slice.buckets.clone())
-                        })
-                        .collect::<ExecutionResult<Vec<_>>>()
-                        .map(|ranges| ranges.into_iter().flatten().collect::<Vec<_>>())
+                            read.mappers = Some(mappers.clone());
+                        }
+                    }
+                    if read.mappers.is_some() && map_attempts.is_none() {
+                        return Err(ExecutionError::InternalError(
+                            "a partial bucket read requires the committed map attempts"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(read)
                 })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            return Ok(TaskInputLocator::ShuffleService { channels });
-        }
-        let channels = match self.input.mode {
-            InputMode::Shuffle => (0..output_partitions)
-                .map(|partition| vec![partition])
-                .collect(),
-            InputMode::Broadcast => {
-                let channels = (0..input_channels).collect::<Vec<_>>();
-                vec![channels; output_partitions]
-            }
-            mode => {
-                return Err(ExecutionError::InvalidArgument(format!(
-                    "Celeborn shuffle service does not support {mode} input"
-                )));
+                .collect::<ExecutionResult<Vec<_>>>()?
+        } else {
+            match self.input.mode {
+                InputMode::Shuffle => (0..output_partitions)
+                    .map(|partition| ShuffleServiceRead::channels(vec![partition]))
+                    .collect(),
+                InputMode::Broadcast => {
+                    let channels = (0..input_channels).collect::<Vec<_>>();
+                    vec![ShuffleServiceRead::channels(channels); output_partitions]
+                }
+                mode => {
+                    return Err(ExecutionError::InvalidArgument(format!(
+                        "Celeborn shuffle service does not support {mode} input"
+                    )));
+                }
             }
         };
-        Ok(TaskInputLocator::ShuffleService { channels })
+        Ok(TaskInputLocator::ShuffleService {
+            reads,
+            map_attempts,
+        })
+    }
+
+    /// Returns the attempt that Celeborn committed for each producer partition, so
+    /// that readers skip output of other attempts (e.g. partial data of a failed
+    /// attempt). Reading a shuffle whose global commit failed is an error, since its
+    /// files are not verified.
+    fn committed_map_attempts(&self) -> ExecutionResult<Option<Arc<[i32]>>> {
+        match &self.job.stages[self.input.stage].commit {
+            Some(commit) if commit.succeeded => commit
+                .attempts
+                .iter()
+                .map(|&a| {
+                    i32::try_from(a).map_err(|e| ExecutionError::InternalError(e.to_string()))
+                })
+                .collect::<ExecutionResult<Vec<_>>>()
+                .map(|x| Some(Arc::from(x))),
+            Some(_) => Err(ExecutionError::InternalError(format!(
+                "job {} stage {} Celeborn shuffle commit failed",
+                self.key.job_id, self.input.stage
+            ))),
+            // A producer without partitions never commits a shuffle.
+            None => Ok(None),
+        }
     }
 
     fn assignment(&self, key: &TaskInputKey) -> Option<&TaskAssignment> {

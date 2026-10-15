@@ -3,7 +3,7 @@ use futures::stream::{self, BoxStream};
 use sail_common::actor::ActorHandle;
 use tokio::sync::oneshot;
 
-use crate::common::SlotReservation;
+use crate::common::{PartitionReadOptions, SlotReservation};
 use crate::error::{CelebornError, CelebornResult};
 use crate::shuffle::{PushDataSize, ShuffleClientActor, ShuffleClientMessage};
 
@@ -102,10 +102,27 @@ impl ShuffleClient {
         receiver.await.map_err(|_| CelebornError::ActorStopped)?
     }
 
+    /// Read every batch of a reduce partition.
     pub async fn read_partition_stream(
         &self,
         shuffle_id: i32,
         partition_id: i32,
+    ) -> BoxStream<'static, CelebornResult<Bytes>> {
+        self.read_partition_stream_with_options(
+            shuffle_id,
+            partition_id,
+            PartitionReadOptions::default(),
+        )
+        .await
+    }
+
+    /// Read the batches of a reduce partition, optionally restricted to the committed
+    /// attempts and to a range of mappers.
+    pub async fn read_partition_stream_with_options(
+        &self,
+        shuffle_id: i32,
+        partition_id: i32,
+        options: PartitionReadOptions,
     ) -> BoxStream<'static, CelebornResult<Bytes>> {
         let (result, receiver) = oneshot::channel();
         if self
@@ -113,6 +130,7 @@ impl ShuffleClient {
             .send(ShuffleClientMessage::ReadPartitionStream {
                 shuffle_id,
                 partition_id,
+                options,
                 result,
             })
             .await

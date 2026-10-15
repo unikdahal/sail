@@ -17,9 +17,12 @@
 mod coalesce;
 mod domain;
 mod joins;
+mod skew;
+mod spec;
 mod validate;
 mod view;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,7 +41,12 @@ use crate::driver::job_scheduler::adaptive::coalesce::{
     CoalesceParams, coalesce, within_build_cap,
 };
 use crate::driver::job_scheduler::adaptive::domain::{AlignmentGroup, alignment_groups};
-use crate::driver::job_scheduler::adaptive::joins::{apply_join_rules, exact_statistics};
+use crate::driver::job_scheduler::adaptive::joins::{
+    apply_join_rules, apply_sort_merge_joins, exact_statistics,
+};
+use crate::driver::job_scheduler::adaptive::skew::{
+    RULE_SKEW_SPLIT, skew_joins, split_skewed_buckets,
+};
 use crate::driver::job_scheduler::adaptive::validate::{ValidationContext, validate};
 pub(crate) use crate::driver::job_scheduler::adaptive::view::{InputView, StageRewrite, StageView};
 use crate::driver::job_scheduler::state::{
@@ -49,7 +57,7 @@ use crate::driver::job_scheduler::{AdaptiveOptions, JobScheduler, JobSchedulerOp
 use crate::id::JobId;
 use crate::job_graph::{
     AdaptiveInput, AdaptiveProperty, BucketLayout, BucketSlice, InputMode, OutputDistribution,
-    OutputMode, ShuffleOrigin, StageKind, TaskPlacement,
+    OutputMode, ShuffleOrigin, StageKind, SubRange, TaskPlacement,
 };
 use crate::plan::StageInputExec;
 use crate::shuffle::ShuffleBackendKind;
@@ -184,7 +192,7 @@ impl JobScheduler {
         options: &JobSchedulerOptions,
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<Option<AppliedRewrite>, String> {
-        let view = Self::stage_view(job, s, &options.adaptive)?;
+        let view = Self::stage_view(job, s, &options.adaptive, options.slot_cap)?;
         let Some(rewrite) = adapt(&view)? else {
             return Ok(None);
         };
@@ -200,6 +208,7 @@ impl JobScheduler {
         job: &JobDescriptor,
         s: usize,
         options: &AdaptiveOptions,
+        slot_cap: Option<usize>,
     ) -> Result<StageView, String> {
         let stage = &job.graph.stages()[s];
         if stage.placement != TaskPlacement::Worker || stage.kind != StageKind::Compute {
@@ -247,13 +256,35 @@ impl JobScheduler {
                 hash_partitioned: matches!(producer.distribution, OutputDistribution::Hash { .. }),
                 buckets: producer.distribution.channels(),
                 statistics,
+                producers: producer.plan.output_partitioning().partition_count(),
+                committed: Self::committed_attempt_statistics(job, input.stage).map(Arc::new),
             });
         }
         Ok(StageView {
             plan: stage.plan.clone(),
             inputs,
             options: options.clone(),
+            slot_cap,
         })
+    }
+
+    /// Returns the statistics of the committed attempt of each partition of a stage,
+    /// or `None` if any of them is unknown.
+    fn committed_attempt_statistics(
+        job: &JobDescriptor,
+        stage: usize,
+    ) -> Option<Vec<Arc<crate::statistics::CompactOutputStatistics>>> {
+        Self::committed_attempts(job, stage)?
+            .iter()
+            .enumerate()
+            .map(|(p, &a)| {
+                job.stages[stage].tasks[p]
+                    .attempts
+                    .get(a)?
+                    .statistics
+                    .clone()
+            })
+            .collect()
     }
 
     /// Validates the rewrite and commits it atomically.
@@ -367,57 +398,107 @@ struct AppliedRewrite {
 /// Runs the adaptive rules over a stage view.
 /// Returns a rewrite proposal, nothing if no rule applies, or why the stage is skipped.
 pub(crate) fn adapt(view: &StageView) -> Result<Option<StageRewrite>, String> {
-    let mut rules = vec![];
+    let mut rules: Vec<&'static str> = vec![];
     let mut notes = vec![];
+    let add_rule = |rules: &mut Vec<&'static str>, rule: &'static str| {
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    };
     let mut plan = view.plan.clone();
     if view.options.join_enabled {
         let outcome = apply_join_rules(plan, view).map_err(|e| e.to_string())?;
         plan = outcome.plan;
-        rules.extend(outcome.rules);
+        for rule in outcome.rules {
+            add_rule(&mut rules, rule);
+        }
         notes.extend(outcome.notes);
     }
 
     let groups = alignment_groups(&plan)?;
+    let skew_joins = if view.options.skew_enabled {
+        skew_joins(&plan)
+    } else {
+        vec![]
+    };
     let mut inputs: Vec<Option<Arc<AdaptiveInput>>> = vec![None; view.inputs.len()];
-    if view.options.coalesce_enabled {
-        let mut coalesced = false;
-        for group in &groups {
-            match coalesce_group(view, group) {
-                Ok(Some((buckets, ranges))) => {
-                    let boundaries = ranges
-                        .iter()
-                        .map(|r| r.start)
-                        .chain([buckets])
-                        .collect::<Vec<_>>();
-                    let adaptive = Arc::new(AdaptiveInput {
-                        spec: ranges
-                            .iter()
-                            .map(|r| vec![BucketSlice::whole(r.clone())])
-                            .collect(),
-                        property: AdaptiveProperty::CoalescedHash {
-                            from: buckets,
-                            boundaries,
-                        },
-                    });
-                    notes.push(format!(
-                        "coalesce inputs {:?}: {buckets} -> {} partitions",
-                        group.inputs,
-                        ranges.len()
-                    ));
-                    for &i in &group.inputs {
-                        inputs[i] = Some(adaptive.clone());
+    for group in &groups {
+        let sizes = match group_sizes(view, group) {
+            Ok(Some(sizes)) => sizes,
+            Ok(None) => continue,
+            Err(reason) => {
+                notes.push(format!("inputs {:?} not adapted: {reason}", group.inputs));
+                continue;
+            }
+        };
+        let identity = (0..sizes.buckets).map(|b| b..b + 1).collect::<Vec<_>>();
+        let ranges = if view.options.coalesce_enabled {
+            coalesce_ranges(view, &sizes).unwrap_or_else(|reason| {
+                notes.push(format!("inputs {:?} not coalesced: {reason}", group.inputs));
+                identity.clone()
+            })
+        } else {
+            identity.clone()
+        };
+        let coalesced = ranges.len() < sizes.buckets;
+
+        // A skew split needs the group to be exactly the inputs that one join pairs.
+        let skew = skew_joins.iter().find(|join| {
+            join.sides.iter().map(|(i, _)| *i).collect::<BTreeSet<_>>() == group.inputs
+        });
+        if let Some(join) = skew {
+            match split_skewed_buckets(view, join, &ranges, &mut notes) {
+                Ok(Some(specs)) => {
+                    for (&(i, _), spec) in join.sides.iter().zip(specs) {
+                        inputs[i] = Some(Arc::new(spec));
                     }
-                    coalesced = true;
+                    add_rule(&mut rules, RULE_SKEW_SPLIT);
+                    if coalesced {
+                        add_rule(&mut rules, RULE_COALESCE);
+                    }
+                    continue;
                 }
                 Ok(None) => {}
-                Err(reason) => {
-                    notes.push(format!("inputs {:?} not coalesced: {reason}", group.inputs))
-                }
+                Err(reason) => notes.push(format!("skew split not applicable: {reason}")),
             }
         }
         if coalesced {
-            rules.push(RULE_COALESCE);
+            let adaptive = Arc::new(AdaptiveInput {
+                spec: ranges
+                    .iter()
+                    .map(|r| vec![BucketSlice::whole(r.clone())])
+                    .collect(),
+                property: AdaptiveProperty::CoalescedHash {
+                    from: sizes.buckets,
+                    boundaries: ranges
+                        .iter()
+                        .map(|r| r.start)
+                        .chain([sizes.buckets])
+                        .collect(),
+                },
+            });
+            notes.push(format!(
+                "coalesce inputs {:?}: {} -> {} partitions",
+                group.inputs,
+                sizes.buckets,
+                ranges.len()
+            ));
+            for &i in &group.inputs {
+                inputs[i] = Some(adaptive.clone());
+            }
+            add_rule(&mut rules, RULE_COALESCE);
         }
+    }
+
+    if view.options.join_enabled {
+        let build_sizes = |i: usize| partition_logical_sizes(view, i, inputs.get(i)?.as_deref());
+        let outcome =
+            apply_sort_merge_joins(plan, view, &build_sizes).map_err(|e| e.to_string())?;
+        plan = outcome.plan;
+        for rule in outcome.rules {
+            add_rule(&mut rules, rule);
+        }
+        notes.extend(outcome.notes);
     }
     if rules.is_empty() {
         return Ok(None);
@@ -435,16 +516,53 @@ pub(crate) fn adapt(view: &StageView) -> Result<Option<StageRewrite>, String> {
     }))
 }
 
-/// Coalesces one alignment group, returning the original bucket count and the new
-/// bucket ranges, nothing if coalescing does not reduce the partition count, or why
-/// the group is not eligible.
-/// The original bucket count of a group and the coalesced bucket ranges.
-type CoalescedGroup = (usize, Vec<std::ops::Range<usize>>);
-
-fn coalesce_group(
+/// Returns the logical size of each partition of an input's own domain:
+/// per bucket without a spec, or per spec entry with one.
+fn partition_logical_sizes(
     view: &StageView,
-    group: &AlignmentGroup,
-) -> Result<Option<CoalescedGroup>, String> {
+    input: usize,
+    spec: Option<&AdaptiveInput>,
+) -> Option<Vec<u64>> {
+    let statistics = view.statistics(input)?;
+    let Some(spec) = spec else {
+        return Some(statistics.logical_bytes.clone());
+    };
+    let committed = view.inputs.get(input)?.committed.clone();
+    spec.spec
+        .iter()
+        .map(|slices| {
+            slices.iter().try_fold(0u64, |total, slice| {
+                let size = match &slice.part {
+                    None => statistics.logical_bytes[slice.buckets.clone()]
+                        .iter()
+                        .fold(0u64, |a, b| a.saturating_add(*b)),
+                    Some(SubRange::Producers(producers)) => committed
+                        .as_ref()?
+                        .get(producers.clone())?
+                        .iter()
+                        .fold(0u64, |a, s| {
+                            a.saturating_add(s.logical_bytes(slice.buckets.start))
+                        }),
+                };
+                Some(total.saturating_add(size))
+            })
+        })
+        .collect()
+}
+
+/// The per-bucket sizes of an eligible alignment group.
+struct GroupSizes {
+    buckets: usize,
+    /// Physical bytes per bucket, summed across the group's inputs.
+    sizes: Vec<u64>,
+    /// Logical bytes per bucket of the inputs that feed the build side of a
+    /// partitioned hash join.
+    build_sizes: Option<Vec<u64>>,
+}
+
+/// Returns the sizes of an alignment group, nothing for a group without inputs, or
+/// why the group's partitioning cannot be rewritten.
+fn group_sizes(view: &StageView, group: &AlignmentGroup) -> Result<Option<GroupSizes>, String> {
     if group.fixed {
         return Err("the group reads a source that is not a stage input".to_string());
     }
@@ -493,28 +611,35 @@ fn coalesce_group(
             }
         }
     }
-    let Some(buckets) = buckets else {
-        return Ok(None);
-    };
+    Ok(buckets.map(|buckets| GroupSizes {
+        buckets,
+        sizes,
+        build_sizes,
+    }))
+}
+
+/// Coalesces the buckets of a group into contiguous ranges.
+fn coalesce_ranges(
+    view: &StageView,
+    sizes: &GroupSizes,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
     let options = &view.options;
     let params = CoalesceParams {
         target_size: options.coalesce_target_size,
         min_partition_size: options.coalesce_min_partition_size,
         min_partitions: options.coalesce_min_partitions,
-        build_cap: build_sizes
+        build_cap: sizes
+            .build_sizes
             .as_ref()
             .map(|_| options.join_max_build_partition_size),
     };
-    let ranges = coalesce(&sizes, build_sizes.as_deref(), &params);
-    if let Some(build) = &build_sizes
+    let ranges = coalesce(&sizes.sizes, sizes.build_sizes.as_deref(), &params);
+    if let Some(build) = &sizes.build_sizes
         && !within_build_cap(&ranges, build, options.join_max_build_partition_size)
     {
         return Err("a coalesced build partition would exceed the build cap".to_string());
     }
-    if ranges.len() >= buckets {
-        return Ok(None);
-    }
-    Ok(Some((buckets, ranges)))
+    Ok(ranges)
 }
 
 /// Rewrites the stage input placeholders: an adapted input declares

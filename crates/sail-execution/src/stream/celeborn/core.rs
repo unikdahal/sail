@@ -8,7 +8,7 @@ use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::{DataFusionError, Result};
 use futures::{StreamExt, TryStreamExt};
-use sail_celeborn::shuffle::ShuffleClient;
+use sail_celeborn::shuffle::{PartitionReadOptions, ShuffleClient};
 
 use crate::id::{JobId, TaskKey};
 use crate::statistics::TaskOutputStatistics;
@@ -18,6 +18,7 @@ use crate::stream::writer::{
     MultiChannelTaskStreamSink, TaskStreamChannelCommit, TaskStreamChannelSink, TaskStreamSink,
     TaskStreamWriteState,
 };
+use crate::task::definition::ShuffleServiceRead;
 
 #[derive(Clone)]
 pub(crate) struct CelebornStreamManager {
@@ -121,9 +122,32 @@ impl CelebornStreamManager {
         &self,
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
+        let ShuffleServiceRead { channels, mappers } = read;
+        let map_range = mappers
+            .map(|range| {
+                Ok::<_, DataFusionError>(
+                    i32::try_from(range.start)
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?
+                        ..i32::try_from(range.end)
+                            .map_err(|error| DataFusionError::External(Box::new(error)))?,
+                )
+            })
+            .transpose()?;
+        if map_range.is_some() && map_attempts.is_none() {
+            // A partial read is planned only from committed statistics, so the commit
+            // must be known. Without it, a range could include output of failed attempts.
+            return Err(DataFusionError::Internal(
+                "a Celeborn map-range read requires the committed map attempts".to_string(),
+            ));
+        }
+        let options = PartitionReadOptions {
+            map_range,
+            map_attempts,
+        };
         let shuffle_id = self
             .client
             .get_shuffle_id(job_id.into(), stage as u64)
@@ -141,11 +165,13 @@ impl CelebornStreamManager {
             .register_shuffle(shuffle_id, partition_ids.clone(), false, 0)
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let streams = futures::future::join_all(
-            partition_ids
-                .into_iter()
-                .map(|partition_id| self.client.read_partition_stream(shuffle_id, partition_id)),
-        )
+        let streams = futures::future::join_all(partition_ids.into_iter().map(|partition_id| {
+            self.client.read_partition_stream_with_options(
+                shuffle_id,
+                partition_id,
+                options.clone(),
+            )
+        }))
         .await;
         let streams = streams
             .into_iter()

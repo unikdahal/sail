@@ -25,9 +25,7 @@ use datafusion::physical_plan::joins::{
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{
-    ExecutionPlan, ExecutionPlanProperties, replace_children_if_necessary,
-};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::driver::job_scheduler::adaptive::view::StageView;
 use crate::plan::StageInputExec;
@@ -163,7 +161,6 @@ fn rewrite_partitioned_hash_join(
     rules: &mut Vec<&'static str>,
     notes: &mut Vec<String>,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let mut swapped: Option<Arc<dyn ExecutionPlan>> = None;
     if let (Some(build), Some(probe)) = (
         input_statistics(join.left(), view),
         input_statistics(join.right(), view),
@@ -174,46 +171,62 @@ fn rewrite_partitioned_hash_join(
             build.total_logical_bytes, probe.total_logical_bytes
         ));
         rules.push(RULE_SWAP_JOIN_INPUTS);
-        swapped = Some(join.swap_inputs(PartitionMode::Partitioned)?);
+        return Ok(Some(join.swap_inputs(PartitionMode::Partitioned)?));
     }
-    // After a swap, the join may sit below a projection that restores the column order.
-    let (parent, join_node) = match &swapped {
-        Some(plan) => match find_hash_join(plan)? {
-            Some(join) => (Some(Arc::clone(plan)), Some(join)),
-            None => (None, Some(Arc::clone(plan))),
-        },
-        None => (None, None),
-    };
-    let join = match &join_node {
-        Some(node) => node
-            .downcast_ref::<HashJoinExec>()
-            .ok_or_else(|| internal_datafusion_err!("expected a hash join"))?,
-        None => join,
-    };
+    Ok(None)
+}
 
+/// Converts partitioned hash joins whose largest build partition exceeds the build
+/// cap into sort-merge joins. This runs after the partition specs are decided, so
+/// `build_sizes` returns the logical size of each partition of a stage input's own
+/// domain, after coalescing and skew splits.
+pub(crate) fn apply_sort_merge_joins(
+    plan: Arc<dyn ExecutionPlan>,
+    view: &StageView,
+    build_sizes: &dyn Fn(usize) -> Option<Vec<u64>>,
+) -> Result<JoinRuleOutcome> {
+    let mut rules = vec![];
+    let mut notes = vec![];
     let cap = view.options.join_max_build_partition_size;
-    if let Some(build) = input_statistics(join.left(), view)
-        && let Some(largest) = build.logical_bytes.iter().max().copied()
-        && largest > cap
-        && supports_sort_merge(join)
-    {
-        // A join that cannot be expressed as a sort-merge join keeps its hash join,
-        // without giving up the other rules for the stage.
-        match to_sort_merge_join(join) {
-            Ok(smj) => {
-                notes.push(format!(
-                    "sort-merge join: largest build partition {largest} bytes exceeds {cap} bytes"
-                ));
-                rules.push(RULE_SORT_MERGE_JOIN);
-                return Ok(Some(match parent {
-                    Some(parent) => replace_children_if_necessary(parent, vec![smj])?,
-                    None => smj,
-                }));
+    let plan = plan
+        .transform_up(|node| {
+            let Some(join) = node.downcast_ref::<HashJoinExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            if join.mode != PartitionMode::Partitioned || !supports_sort_merge(join) {
+                return Ok(Transformed::no(node));
             }
-            Err(error) => notes.push(format!("sort-merge join not applicable: {error}")),
-        }
-    }
-    Ok(swapped)
+            let Some(input) = row_subset_base(join.left())
+                .downcast_ref::<StageInputExec<usize>>()
+                .map(|x| *x.input())
+            else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(largest) = build_sizes(input).and_then(|x| x.into_iter().max()) else {
+                return Ok(Transformed::no(node));
+            };
+            if largest <= cap {
+                return Ok(Transformed::no(node));
+            }
+            // A join that cannot be expressed as a sort-merge join keeps its hash join,
+            // without giving up the other rules for the stage.
+            match to_sort_merge_join(join) {
+                Ok(smj) => {
+                    notes.push(format!(
+                        "sort-merge join: largest build partition {largest} bytes exceeds {cap} bytes"
+                    ));
+                    rules.push(RULE_SORT_MERGE_JOIN);
+                    Ok(Transformed::yes(smj))
+                }
+                Err(error) => {
+                    notes.push(format!("sort-merge join not applicable: {error}"));
+                    Ok(Transformed::no(node))
+                }
+            }
+        })?
+        .data;
+    rules.dedup();
+    Ok(JoinRuleOutcome { plan, rules, notes })
 }
 
 /// Swaps only when the build side is clearly larger, to absorb small measurement
@@ -226,22 +239,6 @@ fn should_swap(join: &HashJoinExec, build: &ShuffleStatistics, probe: &ShuffleSt
             > probe
                 .total_logical_bytes
                 .saturating_add(probe.total_logical_bytes / 10)
-}
-
-/// Returns the hash join below the projection that a swap adds, or `None` if the
-/// swapped plan is the join itself.
-fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if plan.is::<HashJoinExec>() {
-        return Ok(None);
-    }
-    match plan.children().as_slice() {
-        [child] if plan.is::<ProjectionExec>() && child.is::<HashJoinExec>() => {
-            Ok(Some(Arc::clone(child)))
-        }
-        _ => Err(internal_datafusion_err!(
-            "expected a hash join after swapping inputs"
-        )),
-    }
 }
 
 fn supports_sort_merge(join: &HashJoinExec) -> bool {

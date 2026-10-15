@@ -5,7 +5,7 @@ use futures::stream::BoxStream;
 use sail_common::telemetry::SpanAssociation;
 use tokio::sync::oneshot;
 
-use crate::common::{PartitionLocation, PushDataSize, SlotReservation};
+use crate::common::{PartitionLocation, PartitionReadOptions, PushDataSize, SlotReservation};
 use crate::error::CelebornResult;
 
 pub enum ShuffleClientMessage {
@@ -80,11 +80,13 @@ pub enum ShuffleClientMessage {
     ReadPartitionStream {
         shuffle_id: i32,
         partition_id: i32,
+        options: PartitionReadOptions,
         result: oneshot::Sender<BoxStream<'static, CelebornResult<Bytes>>>,
     },
     ReadPartitionStreamComplete {
         shuffle_id: i32,
         partition_id: i32,
+        options: PartitionReadOptions,
         result: CelebornResult<SlotReservation>,
         reply: oneshot::Sender<BoxStream<'static, CelebornResult<Bytes>>>,
     },

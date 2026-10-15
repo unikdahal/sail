@@ -105,10 +105,18 @@ impl Actor for LifecycleManagerActor {
             } => self.handle_mapper_end(ctx, shuffle_id, map_id, attempt_id, num_mappers, result),
             LifecycleManagerMessage::MapperEndComplete {
                 shuffle_id,
+                map_id,
                 map_attempts,
                 result,
                 reply,
-            } => self.handle_mapper_end_complete(ctx, shuffle_id, map_attempts, result, reply),
+            } => self.handle_mapper_end_complete(
+                ctx,
+                shuffle_id,
+                map_id,
+                map_attempts,
+                result,
+                reply,
+            ),
             LifecycleManagerMessage::UnregisterShuffle { shuffle_id, result } => {
                 self.handle_unregister_shuffle(ctx, shuffle_id, result)
             }

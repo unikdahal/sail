@@ -56,11 +56,22 @@ message TaskInputStorageLocator {
 }
 
 message TaskInputShuffleServiceLocator {
+  // One entry per partition of the stage input.
   repeated TaskInputChannelList channels = 1;
+  // The committed attempt of each producer partition, if known.
+  optional TaskInputMapAttempts map_attempts = 2;
 }
 
 message TaskInputChannelList {
   repeated uint64 channels = 1;
+  // Read only the output of producer partitions in `[mapper_start, mapper_end)`.
+  // This is set only for a single channel split by an adaptive skew rewrite.
+  optional uint64 mapper_start = 2;
+  optional uint64 mapper_end = 3;
+}
+
+message TaskInputMapAttempts {
+  repeated int32 attempts = 1;
 }
 
 message TaskInputRemoteKey {

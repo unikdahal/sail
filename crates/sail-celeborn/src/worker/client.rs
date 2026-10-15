@@ -8,8 +8,8 @@ use futures::stream::{self, BoxStream};
 use prost::Message;
 
 use crate::common::{
-    CompressionCodec, PartitionLocation, PartitionSplitMode, PushDataSize, UserIdentifier,
-    WorkerIdentity,
+    BatchHeader, CompressionCodec, PartitionLocation, PartitionReadOptions, PartitionSplitMode,
+    PushDataSize, UserIdentifier, WorkerIdentity,
 };
 use crate::endpoint::EndpointResolver;
 use crate::error::{CelebornError, CelebornResult};
@@ -215,17 +215,24 @@ impl WorkerClient {
         })
     }
 
-    /// Open a lazy stream of committed batches for this primary partition.
+    /// Open a lazy stream of the raw (still compressed) batches of this primary
+    /// partition, optionally restricted to the mappers in `map_range`.
     pub async fn read_partition_stream(
         &self,
         shuffle_key: &str,
-        compression: CompressionCodec,
-    ) -> BoxStream<'static, CelebornResult<Bytes>> {
+        map_range: Option<std::ops::Range<i32>>,
+    ) -> BoxStream<'static, CelebornResult<(BatchHeader, Bytes)>> {
+        // `(0, i32::MAX)` reads the whole file. Any other range makes the worker sort
+        // the file by map ID and return only the chunks of mappers in `[start, end)`.
+        let (start_index, end_index) = match &map_range {
+            Some(range) => (range.start, range.end),
+            None => (0, i32::MAX),
+        };
         let request = PbOpenStream {
             shuffle_key: shuffle_key.to_string(),
             file_name: format!("{}-{}-0", self.location.id, self.location.epoch),
-            start_index: 0,
-            end_index: i32::MAX,
+            start_index,
+            end_index,
             initial_credit: 0,
             read_local_shuffle: false,
         };
@@ -247,6 +254,16 @@ impl WorkerClient {
             Ok(handler) => handler,
             Err(error) => return Box::pin(stream::once(async move { Err(error.into()) })),
         };
+        if !handler.full_path.is_empty() {
+            // Files on distributed storage are not served through chunk fetches. Reading
+            // them as an empty stream would silently lose data.
+            let path = handler.full_path;
+            return Box::pin(stream::once(async move {
+                Err(CelebornError::Protocol(format!(
+                    "reading Celeborn partition files from distributed storage is not supported: {path}"
+                )))
+            }));
+        }
         let client = self.clone();
         Box::pin(stream::try_unfold(
             (
@@ -255,22 +272,13 @@ impl WorkerClient {
                 0,
                 handler.num_chunks,
                 BytesMut::new(),
-                compression,
             ),
-            |(client, stream_id, mut chunk_index, num_chunks, mut buffered, compression)| async move {
+            |(client, stream_id, mut chunk_index, num_chunks, mut buffered)| async move {
                 loop {
                     if let Some(batch) = take_batch(&mut buffered)? {
-                        let batch = decompress(batch, compression)?;
                         return Ok(Some((
                             batch,
-                            (
-                                client,
-                                stream_id,
-                                chunk_index,
-                                num_chunks,
-                                buffered,
-                                compression,
-                            ),
+                            (client, stream_id, chunk_index, num_chunks, buffered),
                         )));
                     }
                     if chunk_index == num_chunks {
@@ -515,26 +523,84 @@ fn decompress_block(
     Ok(output)
 }
 
-fn take_batch(buffered: &mut BytesMut) -> CelebornResult<Option<Bytes>> {
-    const HEADER_LENGTH: usize = 16;
-    if buffered.len() < HEADER_LENGTH {
+fn take_batch(buffered: &mut BytesMut) -> CelebornResult<Option<(BatchHeader, Bytes)>> {
+    if buffered.len() < BatchHeader::SIZE {
         return Ok(None);
     }
-    let length = i32::from_be_bytes(
-        buffered[12..HEADER_LENGTH]
-            .try_into()
-            .map_err(|_| CelebornError::Protocol("invalid batch header".to_string()))?,
-    );
-    let length = usize::try_from(length)
+    let header = BatchHeader::decode(&buffered[..BatchHeader::SIZE])
+        .ok_or_else(|| CelebornError::Protocol("invalid batch header".to_string()))?;
+    let length = usize::try_from(header.length)
         .map_err(|_| CelebornError::Protocol("invalid batch length".to_string()))?;
-    let end = HEADER_LENGTH
+    let end = BatchHeader::SIZE
         .checked_add(length)
         .ok_or_else(|| CelebornError::Protocol("invalid batch length".to_string()))?;
     if buffered.len() < end {
         return Ok(None);
     }
     let mut batch = buffered.split_to(end);
-    Ok(Some(batch.split_off(HEADER_LENGTH).freeze()))
+    Ok(Some((header, batch.split_off(BatchHeader::SIZE).freeze())))
+}
+
+/// Filters and decompresses the raw batches read from every location of one reduce
+/// partition, so that each committed batch is returned exactly once:
+///   - batches of attempts other than the committed attempt of their mapper are
+///     skipped, since a failed attempt may have pushed partial data;
+///   - a batch pushed again after a revive may be stored in two locations, so
+///     batches are deduplicated by `(map ID, attempt ID, batch ID)` across locations;
+///   - with a map range, batches of mappers outside the range are skipped.
+pub(crate) struct BatchFilter {
+    map_range: Option<std::ops::Range<i32>>,
+    map_attempts: Option<Arc<[i32]>>,
+    seen: std::collections::HashSet<(i32, i32, i32)>,
+    compression: CompressionCodec,
+}
+
+impl BatchFilter {
+    pub(crate) fn new(options: &PartitionReadOptions, compression: CompressionCodec) -> Self {
+        Self {
+            map_range: options.map_range.clone(),
+            map_attempts: options.map_attempts.clone(),
+            seen: Default::default(),
+            compression,
+        }
+    }
+
+    /// Returns the decompressed payload of a batch to keep, or `None` to skip it.
+    pub(crate) fn accept(
+        &mut self,
+        header: BatchHeader,
+        payload: Bytes,
+    ) -> CelebornResult<Option<Bytes>> {
+        if self
+            .map_range
+            .as_ref()
+            .is_some_and(|range| !range.contains(&header.map_id))
+        {
+            return Ok(None);
+        }
+        if let Some(attempts) = &self.map_attempts {
+            let committed = usize::try_from(header.map_id)
+                .ok()
+                .and_then(|i| attempts.get(i))
+                .ok_or_else(|| {
+                    CelebornError::Protocol(format!(
+                        "batch of map {} is outside the {} committed mappers",
+                        header.map_id,
+                        attempts.len()
+                    ))
+                })?;
+            if *committed != header.attempt_id {
+                return Ok(None);
+            }
+        }
+        if !self
+            .seen
+            .insert((header.map_id, header.attempt_id, header.batch_id))
+        {
+            return Ok(None);
+        }
+        decompress(payload, self.compression).map(Some)
+    }
 }
 
 fn endpoint(
@@ -550,10 +616,95 @@ fn endpoint(
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {
-    use bytes::Bytes;
+    use std::sync::Arc;
 
-    use super::{WorkerClientOptions, WorkerClientPool, compress, decompress};
-    use crate::common::{CompressionCodec, PartitionLocation};
+    use bytes::{Bytes, BytesMut};
+
+    use super::{
+        BatchFilter, WorkerClientOptions, WorkerClientPool, compress, decompress, take_batch,
+    };
+    use crate::common::{BatchHeader, CompressionCodec, PartitionLocation, PartitionReadOptions};
+
+    fn header(map_id: i32, attempt_id: i32, batch_id: i32, length: i32) -> BatchHeader {
+        BatchHeader {
+            map_id,
+            attempt_id,
+            batch_id,
+            length,
+        }
+    }
+
+    #[test]
+    fn batch_headers_are_little_endian() {
+        let encoded = header(1, 2, 3, 4).encode();
+        // Celeborn's Java client writes the header with `Platform.putInt`.
+        assert_eq!(
+            encoded,
+            vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
+        );
+        assert_eq!(BatchHeader::decode(&encoded), Some(header(1, 2, 3, 4)));
+        assert_eq!(BatchHeader::decode(&encoded[..15]), None);
+    }
+
+    #[test]
+    fn batches_are_split_from_chunks() {
+        let mut buffered = BytesMut::new();
+        buffered.extend_from_slice(&header(7, 0, 0, 3).encode());
+        buffered.extend_from_slice(b"abc");
+        buffered.extend_from_slice(&header(8, 1, 2, 2).encode());
+        buffered.extend_from_slice(b"d");
+        let (first, payload) = take_batch(&mut buffered).unwrap().unwrap();
+        assert_eq!(first, header(7, 0, 0, 3));
+        assert_eq!(payload.as_ref(), b"abc");
+        // The second batch is incomplete until more data arrives.
+        assert!(take_batch(&mut buffered).unwrap().is_none());
+        buffered.extend_from_slice(b"e");
+        let (second, payload) = take_batch(&mut buffered).unwrap().unwrap();
+        assert_eq!(second.map_id, 8);
+        assert_eq!(payload.as_ref(), b"de");
+    }
+
+    #[test]
+    fn filter_keeps_committed_attempts_once() {
+        let options = PartitionReadOptions {
+            map_range: None,
+            map_attempts: Some(Arc::from(vec![0, 1])),
+        };
+        let mut filter = BatchFilter::new(&options, CompressionCodec::None);
+        let mut accept = |map_id, attempt_id, batch_id| {
+            filter
+                .accept(header(map_id, attempt_id, batch_id, 1), "x".into())
+                .unwrap()
+                .is_some()
+        };
+        assert!(accept(0, 0, 0));
+        // A batch pushed again to another location after a revive.
+        assert!(!accept(0, 0, 0));
+        assert!(accept(0, 0, 1));
+        // Partial data of a failed attempt of map 1.
+        assert!(!accept(1, 0, 0));
+        assert!(accept(1, 1, 0));
+        // A mapper outside the committed mappers is a protocol error.
+        assert!(filter.accept(header(2, 0, 0, 1), "x".into()).is_err());
+    }
+
+    #[test]
+    fn filter_restricts_map_range() {
+        let options = PartitionReadOptions {
+            map_range: Some(1..3),
+            map_attempts: None,
+        };
+        let mut filter = BatchFilter::new(&options, CompressionCodec::None);
+        let kept = (0..4)
+            .filter(|&map_id| {
+                filter
+                    .accept(header(map_id, 0, 0, 1), "x".into())
+                    .unwrap()
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept, vec![1, 2]);
+    }
 
     fn location(id: i32) -> PartitionLocation {
         PartitionLocation {

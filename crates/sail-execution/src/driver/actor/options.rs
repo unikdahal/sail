@@ -93,6 +93,9 @@ impl DriverOptions {
                     coalesce_min_partitions: adaptive.coalesce.min_partitions,
                     join_enabled: adaptive.join.enabled,
                     join_max_build_partition_size: adaptive.join.max_build_partition_size,
+                    skew_enabled: adaptive.skew.enabled,
+                    skew_factor: adaptive.skew.factor,
+                    skew_threshold: adaptive.skew.threshold,
                 }
             },
             shuffle_backend: (&config.cluster.shuffle_backend).into(),

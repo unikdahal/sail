@@ -36,8 +36,31 @@ pub enum TaskInputLocator {
         keys: Vec<Vec<TaskInputKey>>,
     },
     ShuffleService {
-        channels: Vec<Vec<usize>>,
+        /// For each partition of the stage input, the shuffle partitions (channels)
+        /// to read.
+        reads: Vec<ShuffleServiceRead>,
+        /// The committed attempt of each producer partition, so that output of other
+        /// attempts is never read. `None` if the commit is not known.
+        map_attempts: Option<Arc<[i32]>>,
     },
+}
+
+/// The shuffle service data read by one partition of a stage input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleServiceRead {
+    pub channels: Vec<usize>,
+    /// Read only the output of producer partitions in this range. This is set only
+    /// for a single channel split by an adaptive skew rewrite.
+    pub mappers: Option<std::ops::Range<usize>>,
+}
+
+impl ShuffleServiceRead {
+    pub fn channels(channels: Vec<usize>) -> Self {
+        Self {
+            channels,
+            mappers: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -176,18 +199,24 @@ impl From<TaskInputLocator> for r#gen::TaskInputLocator {
                     keys: keys.into_iter().map(|x| x.into()).collect(),
                 })
             }
-            TaskInputLocator::ShuffleService { channels } => {
-                r#gen::task_input_locator::Kind::ShuffleService(
-                    r#gen::TaskInputShuffleServiceLocator {
-                        channels: channels
-                            .into_iter()
-                            .map(|channels| r#gen::TaskInputChannelList {
-                                channels: channels.into_iter().map(|x| x as u64).collect(),
-                            })
-                            .collect(),
-                    },
-                )
-            }
+            TaskInputLocator::ShuffleService {
+                reads,
+                map_attempts,
+            } => r#gen::task_input_locator::Kind::ShuffleService(
+                r#gen::TaskInputShuffleServiceLocator {
+                    channels: reads
+                        .into_iter()
+                        .map(|read| r#gen::TaskInputChannelList {
+                            channels: read.channels.into_iter().map(|x| x as u64).collect(),
+                            mapper_start: read.mappers.as_ref().map(|x| x.start as u64),
+                            mapper_end: read.mappers.as_ref().map(|x| x.end as u64),
+                        })
+                        .collect(),
+                    map_attempts: map_attempts.map(|x| r#gen::TaskInputMapAttempts {
+                        attempts: x.to_vec(),
+                    }),
+                },
+            ),
         };
         r#gen::TaskInputLocator { kind: Some(kind) }
     }
@@ -226,12 +255,30 @@ impl TryFrom<r#gen::TaskInputLocator> for TaskInputLocator {
                 Ok(TaskInputLocator::Storage { keys })
             }
             Some(r#gen::task_input_locator::Kind::ShuffleService(
-                r#gen::TaskInputShuffleServiceLocator { channels },
+                r#gen::TaskInputShuffleServiceLocator {
+                    channels,
+                    map_attempts,
+                },
             )) => Ok(TaskInputLocator::ShuffleService {
-                channels: channels
+                reads: channels
                     .into_iter()
-                    .map(|x| x.channels.into_iter().map(|x| x as usize).collect())
-                    .collect(),
+                    .map(|x| {
+                        let mappers = match (x.mapper_start, x.mapper_end) {
+                            (Some(start), Some(end)) => Some(start as usize..end as usize),
+                            (None, None) => None,
+                            _ => {
+                                return Err(ExecutionError::InvalidArgument(
+                                    "incomplete shuffle service mapper range".to_string(),
+                                ));
+                            }
+                        };
+                        Ok(ShuffleServiceRead {
+                            channels: x.channels.into_iter().map(|x| x as usize).collect(),
+                            mappers,
+                        })
+                    })
+                    .collect::<ExecutionResult<Vec<_>>>()?,
+                map_attempts: map_attempts.map(|x| Arc::from(x.attempts)),
             }),
             None => Err(ExecutionError::InvalidArgument(
                 "cannot decode empty task input locator".to_string(),

@@ -237,6 +237,15 @@ pub struct ClusterAdaptiveConfig {
     pub enabled: bool,
     pub coalesce: ClusterAdaptiveCoalesceConfig,
     pub join: ClusterAdaptiveJoinConfig,
+    pub skew: ClusterAdaptiveSkewConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveSkewConfig {
+    pub enabled: bool,
+    pub factor: f64,
+    pub threshold: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1105,6 +1114,9 @@ mod tests {
         assert_eq!(adaptive.coalesce.min_partitions, 1);
         assert!(adaptive.join.enabled);
         assert_eq!(adaptive.join.max_build_partition_size, 64 * 1024 * 1024);
+        assert!(adaptive.skew.enabled);
+        assert!((adaptive.skew.factor - 5.0).abs() < f64::EPSILON);
+        assert_eq!(adaptive.skew.threshold, 256 * 1024 * 1024);
         Ok(())
     }
 

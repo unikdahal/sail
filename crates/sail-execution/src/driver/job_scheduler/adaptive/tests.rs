@@ -32,7 +32,7 @@ use crate::id::TaskKey;
 use crate::job_graph::{JobGraph, JobGraphOptions};
 use crate::proto::RemoteExecutionCodec;
 use crate::statistics::{CompactOutputStatistics, ShuffleStatistics, TaskOutputStatistics};
-use crate::task::definition::TaskInputLocator;
+use crate::task::definition::{ShuffleServiceRead, TaskInputLocator};
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter};
 
 const MIB: u64 = 1024 * 1024;
@@ -142,6 +142,8 @@ fn shuffle_input(statistics: Arc<ShuffleStatistics>) -> InputView {
         hash_partitioned: true,
         buckets: statistics.rows.len(),
         statistics: Some(statistics),
+        producers: 1,
+        committed: None,
     }
 }
 
@@ -167,6 +169,7 @@ fn view(plan: Arc<dyn ExecutionPlan>, inputs: Vec<InputView>) -> StageView {
         plan,
         inputs,
         options: options(),
+        slot_cap: None,
     }
 }
 
@@ -666,7 +669,9 @@ fn celeborn_stage_is_coalesced_after_the_shuffle_commits() {
     );
     assert!(matches!(
         locator.as_ref(),
-        TaskInputLocator::ShuffleService { channels } if channels == &vec![(0..8).collect::<Vec<_>>()]
+        TaskInputLocator::ShuffleService { reads, map_attempts: Some(attempts) }
+            if reads == &vec![ShuffleServiceRead::channels((0..8).collect())]
+                && attempts.as_ref() == [0, 0, 0, 0]
     ));
 
     // The decision is frozen.
@@ -839,4 +844,457 @@ fn pipelined_output_is_released_when_its_region_reruns_the_producer() {
             .iter()
             .any(|action| matches!(action, JobAction::CleanUpJob { stage: Some(0), .. }))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Skew splits.
+// ---------------------------------------------------------------------------
+
+/// An input whose producer `m` wrote `matrix[m][b]` physical bytes to bucket `b`.
+fn producer_input(matrix: &[Vec<u64>]) -> InputView {
+    let committed = matrix
+        .iter()
+        .map(|physical| {
+            Arc::new(CompactOutputStatistics::new(&TaskOutputStatistics {
+                rows: physical.iter().map(|x| x / 8).collect(),
+                physical_bytes: Some(physical.clone()),
+                logical_bytes: physical.iter().map(|x| x * 2).collect(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let buckets = matrix[0].len();
+    let statistics =
+        Arc::new(ShuffleStatistics::fold(buckets, committed.iter().map(|x| x.as_ref())).unwrap());
+    InputView {
+        producers: matrix.len(),
+        committed: Some(Arc::new(committed)),
+        ..shuffle_input(statistics)
+    }
+}
+
+/// `producers` producers that each write `size` bytes to every bucket, and
+/// `skewed_size` bytes to bucket `skewed`.
+fn skewed_matrix(
+    producers: usize,
+    buckets: usize,
+    size: u64,
+    skewed: usize,
+    skewed_size: u64,
+) -> Vec<Vec<u64>> {
+    (0..producers)
+        .map(|_| {
+            (0..buckets)
+                .map(|b| if b == skewed { skewed_size } else { size })
+                .collect()
+        })
+        .collect()
+}
+
+fn skew_view(plan: Arc<dyn ExecutionPlan>, inputs: Vec<InputView>) -> StageView {
+    let mut view = view(plan, inputs);
+    view.options.skew_threshold = 64 * MIB;
+    view.options.coalesce_target_size = 64 * MIB;
+    view.options.join_enabled = false;
+    view
+}
+
+fn check_specs(rewrite: &StageRewrite, view: &StageView, group: &[usize]) {
+    let specs = group
+        .iter()
+        .map(|&i| spec::SpecInput {
+            spec: rewrite.inputs[i].as_deref().unwrap(),
+            buckets: view.inputs[i].buckets,
+            producers: view.inputs[i].producers,
+        })
+        .collect::<Vec<_>>();
+    spec::check_group(&specs).unwrap();
+}
+
+#[test]
+fn skewed_bucket_of_the_preserved_side_is_split() {
+    let plan = hash_join(
+        placeholder(0, 8),
+        placeholder(1, 8),
+        PartitionMode::Partitioned,
+        JoinType::Left,
+    );
+    // Bucket 3 of the left side holds 8 x 40 MiB; the other buckets 8 x 1 MiB.
+    let view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(8, 8, MIB, 3, 40 * MIB)),
+            producer_input(&skewed_matrix(8, 8, MIB, 3, MIB)),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a rewrite");
+    assert!(rewrite.rules.contains(&skew::RULE_SKEW_SPLIT));
+    check_specs(&rewrite, &view, &[0, 1]);
+    let left = rewrite.inputs[0].as_ref().unwrap();
+    let right = rewrite.inputs[1].as_ref().unwrap();
+    assert_eq!(left.property, AdaptiveProperty::Unknown);
+    // The left bucket is split by producer; the right bucket is read whole per slice.
+    let split = left
+        .spec
+        .iter()
+        .filter(|slices| slices[0].part.is_some())
+        .count();
+    assert!(split > 1);
+    assert!(right.spec.iter().all(|slices| slices[0].part.is_none()));
+    assert_eq!(count(&rewrite.plan), left.partitions());
+    validate::validate_plan(&rewrite.plan).unwrap();
+}
+
+#[test]
+fn inner_join_splits_both_skewed_sides_into_pairs() {
+    let plan = hash_join(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(4, 4, MIB, 2, 50 * MIB)),
+            producer_input(&skewed_matrix(6, 4, MIB, 2, 50 * MIB)),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a rewrite");
+    check_specs(&rewrite, &view, &[0, 1]);
+    let left = rewrite.inputs[0].as_ref().unwrap();
+    let right = rewrite.inputs[1].as_ref().unwrap();
+    let pairs = left
+        .spec
+        .iter()
+        .zip(&right.spec)
+        .filter(|(l, r)| l[0].part.is_some() && r[0].part.is_some())
+        .count();
+    assert!(pairs >= 4, "{pairs} pairs");
+}
+
+#[test]
+fn full_outer_joins_are_not_split() {
+    let plan = hash_join(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Full,
+    );
+    let view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(4, 4, MIB, 2, 100 * MIB)),
+            producer_input(&skewed_matrix(4, 4, MIB, 2, 100 * MIB)),
+        ],
+    );
+    let rules = adapt(&view).unwrap().map(|x| x.rules).unwrap_or_default();
+    assert!(!rules.contains(&skew::RULE_SKEW_SPLIT));
+}
+
+#[test]
+fn joins_below_a_hash_distributed_operator_are_not_split() {
+    // The final aggregate needs every key in one partition.
+    let plan = final_aggregate(hash_join(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    ));
+    let view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(4, 4, MIB, 2, 100 * MIB)),
+            producer_input(&skewed_matrix(4, 4, MIB, 2, MIB)),
+        ],
+    );
+    let rules = adapt(&view).unwrap().map(|x| x.rules).unwrap_or_default();
+    assert!(!rules.contains(&skew::RULE_SKEW_SPLIT));
+}
+
+#[test]
+fn inputs_below_an_aggregate_are_not_split() {
+    // A partial aggregate below the join is not split-safe: a split would produce
+    // two partial groups for one key on the build side.
+    let partial = Arc::new(
+        AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(key(), "k".to_string())]),
+            vec![],
+            vec![],
+            placeholder(0, 4),
+            schema(),
+        )
+        .unwrap(),
+    ) as Arc<dyn ExecutionPlan>;
+    let probe = Arc::new(
+        datafusion::physical_plan::projection::ProjectionExec::try_new(
+            vec![(key(), "k".to_string())],
+            placeholder(1, 4),
+        )
+        .unwrap(),
+    ) as Arc<dyn ExecutionPlan>;
+    let plan = hash_join(partial, probe, PartitionMode::Partitioned, JoinType::Inner);
+    let view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(4, 4, MIB, 2, 100 * MIB)),
+            producer_input(&skewed_matrix(4, 4, MIB, 2, MIB)),
+        ],
+    );
+    let rules = adapt(&view).unwrap().map(|x| x.rules).unwrap_or_default();
+    assert!(!rules.contains(&skew::RULE_SKEW_SPLIT));
+}
+
+#[test]
+fn broadcast_probe_is_split_without_replication() {
+    let plan = hash_join(
+        broadcast_placeholder(0),
+        placeholder(1, 4),
+        PartitionMode::CollectLeft,
+        JoinType::Inner,
+    );
+    let view = skew_view(
+        plan,
+        vec![
+            broadcast_input(statistics(&[MIB])),
+            producer_input(&skewed_matrix(4, 4, MIB, 1, 100 * MIB)),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a rewrite");
+    assert!(rewrite.rules.contains(&skew::RULE_SKEW_SPLIT));
+    assert!(rewrite.inputs[0].is_none());
+    check_specs(&rewrite, &view, &[1]);
+    validate::validate_plan(&rewrite.plan).unwrap();
+}
+
+#[test]
+fn skew_splits_respect_the_slot_cap() {
+    let plan = hash_join(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let mut view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(8, 4, MIB, 2, 100 * MIB)),
+            producer_input(&skewed_matrix(8, 4, MIB, 2, MIB)),
+        ],
+    );
+    view.slot_cap = Some(3);
+    let rules = adapt(&view).unwrap().map(|x| x.rules).unwrap_or_default();
+    assert!(!rules.contains(&skew::RULE_SKEW_SPLIT));
+}
+
+#[test]
+fn uniform_inputs_are_not_split() {
+    let plan = hash_join(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let view = skew_view(
+        plan,
+        vec![
+            producer_input(&skewed_matrix(4, 4, 30 * MIB, 0, 30 * MIB)),
+            producer_input(&skewed_matrix(4, 4, 30 * MIB, 0, 30 * MIB)),
+        ],
+    );
+    let rules = adapt(&view).unwrap().map(|x| x.rules).unwrap_or_default();
+    assert!(!rules.contains(&skew::RULE_SKEW_SPLIT));
+}
+
+/// `SELECT * FROM l JOIN r ON l.k = r.k` with both sides hash-shuffled into 4 buckets:
+///   stages 0 and 1: scan and hash shuffle (blocking under Celeborn)
+///   stage 2: partitioned hash join (final stage)
+fn join_graph(join_type: JoinType) -> JobGraph {
+    let side = || {
+        let input = MemorySourceConfig::try_new_exec(&vec![vec![]; 4], schema(), None).unwrap();
+        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![key()], 4)).unwrap())
+            as Arc<dyn ExecutionPlan>
+    };
+    JobGraph::try_new(
+        hash_join(side(), side(), PartitionMode::Partitioned, join_type),
+        JobGraphOptions {
+            shuffle_backend: celeborn(),
+        },
+    )
+    .unwrap()
+}
+
+fn commit(job: &mut JobDescriptor, stage: usize) {
+    let partitions = job.stages[stage].tasks.len();
+    job.stages[stage].commit = Some(ShuffleCommit {
+        attempts: vec![0; partitions],
+        succeeded: true,
+    });
+}
+
+fn skew_options() -> JobSchedulerOptions {
+    let mut adaptive = options();
+    adaptive.skew_threshold = 64 * MIB;
+    adaptive.join_enabled = false;
+    JobSchedulerOptions::new_for_test(celeborn(), adaptive, None)
+}
+
+#[test]
+fn celeborn_join_stage_is_split_and_reads_mapper_ranges() {
+    let mut job = job(join_graph(JoinType::Inner));
+    assert_eq!(job.graph.stages().len(), 3);
+    // Every producer writes 50 MiB to bucket 1 of the left side and 1 MiB elsewhere.
+    succeed(&mut job, 0, |_| TaskOutputStatistics {
+        rows: vec![100; 4],
+        physical_bytes: Some(vec![MIB, 50 * MIB, MIB, MIB]),
+        logical_bytes: vec![2 * MIB; 4],
+    });
+    succeed(&mut job, 1, |_| TaskOutputStatistics {
+        rows: vec![100; 4],
+        physical_bytes: Some(vec![MIB; 4]),
+        logical_bytes: vec![2 * MIB; 4],
+    });
+    commit(&mut job, 0);
+    commit(&mut job, 1);
+    assert!(adapt_job(&mut job, &skew_options()));
+
+    let stage = &job.graph.stages()[2];
+    let left = stage.inputs[0].adaptive.clone().unwrap();
+    let right = stage.inputs[1].adaptive.clone().unwrap();
+    assert_eq!(left.partitions(), job.stages[2].tasks.len());
+    let split = left
+        .spec
+        .iter()
+        .position(|slices| slices[0].part.is_some())
+        .expect("a split partition");
+
+    struct NoAssignments;
+    impl TaskAssignmentGetter for NoAssignments {
+        fn get(&self, _: &TaskKey) -> Option<&TaskAssignment> {
+            None
+        }
+    }
+    let key = TaskKey {
+        job_id: JobId::from(1),
+        stage: 2,
+        partition: split,
+        attempt: 0,
+    };
+    let left_locator = crate::driver::job_scheduler::core::tests_support::build_input_locator(
+        &job,
+        &key,
+        &stage.inputs[0],
+        &NoAssignments,
+    );
+    let TaskInputLocator::ShuffleService {
+        reads,
+        map_attempts: Some(attempts),
+    } = left_locator.as_ref()
+    else {
+        unreachable!("expected a shuffle service locator with committed attempts");
+    };
+    assert_eq!(attempts.as_ref(), [0, 0, 0, 0]);
+    assert_eq!(reads[split].channels, vec![1]);
+    assert!(reads[split].mappers.is_some());
+    // The other side reads bucket 1 whole for the same partition.
+    let right_locator = crate::driver::job_scheduler::core::tests_support::build_input_locator(
+        &job,
+        &key,
+        &stage.inputs[1],
+        &NoAssignments,
+    );
+    let TaskInputLocator::ShuffleService { reads, .. } = right_locator.as_ref() else {
+        unreachable!("expected a shuffle service locator");
+    };
+    assert_eq!(reads[split], ShuffleServiceRead::channels(vec![1]));
+    assert_eq!(right.spec[split][0].part, None);
+}
+
+#[test]
+fn failed_celeborn_commit_fails_the_consumer_definition() {
+    let mut job = job(aggregate_graph());
+    succeed(&mut job, 0, producer_statistics);
+    job.stages[0].commit = Some(ShuffleCommit {
+        attempts: vec![0; 4],
+        succeeded: false,
+    });
+    struct NoAssignments;
+    impl TaskAssignmentGetter for NoAssignments {
+        fn get(&self, _: &TaskKey) -> Option<&TaskAssignment> {
+            None
+        }
+    }
+    let input = job.graph.stages()[1].inputs[0].clone();
+    let key = TaskKey {
+        job_id: JobId::from(1),
+        stage: 1,
+        partition: 0,
+        attempt: 0,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::driver::job_scheduler::core::tests_support::build_input_locator(
+            &job,
+            &key,
+            &input,
+            &NoAssignments,
+        )
+    }));
+    assert!(result.is_err(), "reading an uncommitted shuffle must fail");
+}
+
+#[test]
+fn rule_failure_keeps_the_static_plan_and_freezes_the_decision() {
+    // A union of two shuffles paired with a third input cannot be rewritten.
+    let side = || {
+        let input = MemorySourceConfig::try_new_exec(&vec![vec![]; 2], schema(), None).unwrap();
+        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![key()], 2)).unwrap())
+            as Arc<dyn ExecutionPlan>
+    };
+    let union = UnionExec::try_new(vec![side(), side()]).unwrap();
+    let plan = hash_join(union, side(), PartitionMode::Partitioned, JoinType::Inner);
+    let graph = JobGraph::try_new(
+        plan,
+        JobGraphOptions {
+            shuffle_backend: celeborn(),
+        },
+    )
+    .unwrap();
+    let mut job = job(graph);
+    let options = adaptive_options();
+    let consumer = job.graph.stages().len() - 1;
+    for s in 0..consumer {
+        succeed(&mut job, s, |_| TaskOutputStatistics {
+            rows: vec![1; 2],
+            physical_bytes: Some(vec![10; 2]),
+            logical_bytes: vec![10; 2],
+        });
+        commit(&mut job, s);
+    }
+    let before = job.graph.to_string();
+    assert!(!adapt_job(&mut job, &options));
+    assert_eq!(job.stages[consumer].adaptive, AdaptiveDecision::Static);
+    assert_eq!(job.graph.to_string(), before);
+}
+
+#[test]
+fn retried_tasks_reuse_the_adapted_plan() {
+    let mut job = job(aggregate_graph());
+    let options = adaptive_options();
+    succeed(&mut job, 0, producer_statistics);
+    commit(&mut job, 0);
+    assert!(adapt_job(&mut job, &options));
+    let adapted = job.graph.to_string();
+    // The consumer region runs, fails, and is retried.
+    for task in &mut job.stages[1].tasks {
+        task.attempts.push(TaskAttemptDescriptor {
+            state: TaskState::Failed,
+            messages: vec![],
+            cause: None,
+            job_output_fetched: false,
+            statistics: None,
+        });
+    }
+    assert!(!adapt_job(&mut job, &options));
+    assert_eq!(job.graph.to_string(), adapted);
+    assert_eq!(job.stages[1].adaptive, AdaptiveDecision::Replanned);
 }
