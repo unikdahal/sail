@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+from threading import Event
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,7 +26,7 @@ from pysail.testing.containers.celeborn import (
     celeborn_with_rpc_payload,
 )
 from pysail.testing.spark.session import spark_session_factory
-from pysail.testing.utils.proxy import FrameReceived, FrameRule, Replace
+from pysail.testing.utils.proxy import Forward, FrameReceived, FrameRule, Replace, RuleApplied
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -130,6 +131,16 @@ def _commit_responses(events: list[object]) -> list[bytes]:
     ]
 
 
+def _commit_requests(events: list[object]) -> list[bytes]:
+    # Proxy observations retain the original request, before mockFailure is set.
+    # Compare protobuf payloads: transport request IDs change on each retry.
+    return [
+        celeborn_rpc_message(event.frame)[1]
+        for event in events
+        if isinstance(event, FrameReceived) and _is_commit(event)
+    ]
+
+
 def _commits(log: Path) -> list[tuple[str, str, str, str]]:
     return re.findall(
         r"job (\S+) stage (\d+) shuffle commit: ShuffleCommit "
@@ -158,17 +169,56 @@ def _run_with_commit_fault(
         expected = _query(spark)
         offsets = {name: len(proxy.events.snapshot()) for name, proxy in proxies.items()}
         failing = sorted(proxies)[worker]
-        proxies[failing].rules.add(FrameRule(CelebornFrame, action=_fail_commit, condition=_is_commit, count=count))
+        healthy = next(name for name in proxies if name != failing)
+        committed = Event()
+
+        def is_successful_commit(event: FrameReceived[CelebornFrame]) -> bool:
+            # Java's protobuf writer emits status (field 1) first and omits zero.
+            return (
+                event.direction == "server_to_client"
+                and event.frame.message_type == CelebornMessageType.RPC_RESPONSE
+                and (message := celeborn_rpc_message(event.frame))[0] == _COMMIT_FILES_RESPONSE
+                and (not message[1].startswith(b"\x08") or message[1].startswith(b"\x08\x00"))
+            )
+
+        def observe_commit(_: FrameReceived[CelebornFrame]) -> Forward:
+            committed.set()
+            return Forward()
+
+        def fail_after_commit(event: FrameReceived[CelebornFrame]) -> Replace[CelebornFrame]:
+            # Worker commits run concurrently. Hold this request until the other
+            # worker has committed, reproducing the original partial-commit bug
+            # regardless of worker iteration order or CI scheduling.
+            if not committed.wait(timeout=10):
+                msg = "the other worker did not finish its commit before fault injection"
+                raise ValueError(msg)
+            return _fail_commit(event)
+
+        proxies[healthy].rules.add(
+            FrameRule(CelebornFrame, action=observe_commit, condition=is_successful_commit, count=1)
+        )
+        proxies[failing].rules.add(
+            FrameRule(CelebornFrame, action=fail_after_commit, condition=_is_commit, count=count)
+        )
         try:
             actual: list[int] | Exception = _query(spark)
         except Exception as error:  # noqa: BLE001
             actual = error
     events = {name: proxy.events.snapshot()[offsets[name] :] for name, proxy in proxies.items()}
+    assert committed.is_set(), "the healthy worker never completed its commit"
+    healthy_response = next(
+        event for event in events[healthy] if isinstance(event, FrameReceived) and is_successful_commit(event)
+    )
+    injected = [
+        event for event in events[failing] if isinstance(event, RuleApplied) and event.decision_name == "Replace"
+    ]
+    assert injected, "no CommitFiles fault was injected"
+    assert all(event.timestamp > healthy_response.timestamp for event in injected)
     return expected, actual, events
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("worker", [0, 1], ids=["first-worker", "second-worker"])
+@pytest.mark.parametrize("worker", [0, 1], ids=["worker-1", "worker-2"])
 def test_failed_worker_commit_is_retried_without_losing_rows(
     commit_remote: tuple[str, Path],
     celeborn_rpc_proxies: dict[str, EndpointProxy],
@@ -180,17 +230,27 @@ def test_failed_worker_commit_is_retried_without_losing_rows(
 
     failing = sorted(celeborn_rpc_proxies)[worker]
     for name, worker_events in events.items():
+        requests = _commit_requests(worker_events)
         responses = _commit_responses(worker_events)
         statuses = [response.startswith(_MOCK_FAILURE_STATUS) for response in responses]
         if name == failing:
             # The worker rejected the first request and accepted the identical retry.
             assert statuses == [True, False], log.read_text()
+            assert len(requests) == len(statuses)
+            assert requests[0] == requests[1], "the retry changed the CommitFiles request"
         else:
             # The other worker committed once, so its commit was final.
             assert statuses == [False], log.read_text()
+            assert len(requests) == 1
 
     commits = _commits(log)
-    assert [commit[3] for commit in commits].count("false") == 0, log.read_text()
+    # The observer reports the final outcome once per query; the retry itself is
+    # visible in the driver warning and in the worker RPCs above.
+    assert [commit[2:] for commit in commits] == [("0", "true"), ("0", "true")], log.read_text()
+    assert len({commit[:2] for commit in commits}) == len(commits), log.read_text()
+    retries = re.findall(r"retrying commit of shuffle \d+ on worker (\S+) \(1/\d+\)", log.read_text())
+    assert retries == [failing.split(":")[0]], log.read_text()
+    assert not isinstance(actual, Exception), str(actual)
     assert actual == expected, f"the shuffle returned {len(actual)} of {len(expected)} rows"
 
 
@@ -206,8 +266,11 @@ def test_persistently_failing_commit_fails_the_query(
     assert "lost" in str(actual), str(actual)
     failing = sorted(celeborn_rpc_proxies)[0]
     responses = _commit_responses(events[failing])
+    requests = _commit_requests(events[failing])
     # The first request and every retry were rejected.
     assert len(responses) > 1
     assert all(response.startswith(_MOCK_FAILURE_STATUS) for response in responses)
+    assert len(requests) == len(responses)
+    assert all(request == requests[0] for request in requests), "a retry changed the CommitFiles request"
     commits = _commits(log)
-    assert [commit[3] for commit in commits].count("false") == 1, log.read_text()
+    assert [commit[2:] for commit in commits] == [("0", "true"), ("0", "false")], log.read_text()
