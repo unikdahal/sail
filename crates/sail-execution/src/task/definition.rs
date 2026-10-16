@@ -91,8 +91,14 @@ pub enum TaskOutputDistribution {
 
 #[derive(Debug, Clone)]
 pub enum TaskOutputLocator {
-    Pipelined { replicas: usize },
-    Blocking,
+    Pipelined {
+        replicas: usize,
+    },
+    Blocking {
+        /// Whether the sinks count the output and the task reports its committed
+        /// statistics.
+        collect_statistics: bool,
+    },
 }
 
 impl From<TaskDefinition> for r#gen::TaskDefinition {
@@ -520,8 +526,10 @@ impl From<TaskOutputLocator> for r#gen::TaskOutputLocator {
                     replicas: replicas as u64,
                 })
             }
-            TaskOutputLocator::Blocking => {
-                r#gen::task_output_locator::Kind::Blocking(r#gen::TaskOutputBlockingLocator {})
+            TaskOutputLocator::Blocking { collect_statistics } => {
+                r#gen::task_output_locator::Kind::Blocking(r#gen::TaskOutputBlockingLocator {
+                    collect_statistics,
+                })
             }
         };
         r#gen::TaskOutputLocator { kind: Some(kind) }
@@ -538,7 +546,9 @@ impl TryFrom<r#gen::TaskOutputLocator> for TaskOutputLocator {
             )) => Ok(TaskOutputLocator::Pipelined {
                 replicas: replicas as usize,
             }),
-            Some(r#gen::task_output_locator::Kind::Blocking(_)) => Ok(TaskOutputLocator::Blocking),
+            Some(r#gen::task_output_locator::Kind::Blocking(
+                r#gen::TaskOutputBlockingLocator { collect_statistics },
+            )) => Ok(TaskOutputLocator::Blocking { collect_statistics }),
             None => Err(ExecutionError::InvalidArgument(
                 "cannot decode empty task output locator".to_string(),
             )),

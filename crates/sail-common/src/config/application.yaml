@@ -254,6 +254,18 @@
   default: "3"
   description: The maximum number of attempts for a task.
 
+- key: cluster.adaptive.enabled
+  type: boolean
+  default: "false"
+  description: |
+    The master switch for adaptive query execution in cluster mode.
+    With a remote shuffle service backend (currently `celeborn`), blocking shuffle outputs
+    report their committed statistics, which are shown in the `system.execution.stages` table.
+    It has no effect on the `flight` and `storage` backends.
+    When disabled, task definitions are identical to non-adaptive execution and no
+    statistics are collected.
+  experimental: true
+
 - key: cluster.rpc_retry_strategy.type
   type: string
   default: "fixed"

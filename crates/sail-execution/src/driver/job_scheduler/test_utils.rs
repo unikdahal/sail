@@ -24,7 +24,10 @@ use crate::driver::job_scheduler::state::{
 use crate::id::TaskKey;
 use crate::job_graph::{JobGraph, JobGraphOptions};
 use crate::shuffle::ShuffleBackendKind;
+use crate::statistics::{ChannelCounts, TaskOutputStatistics};
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter};
+
+pub(crate) const MIB: u64 = 1024 * 1024;
 
 pub(crate) fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -91,14 +94,27 @@ pub(crate) fn aggregate_graph() -> JobGraph {
     .unwrap()
 }
 
-pub(crate) fn succeed(job: &mut JobDescriptor, stage: usize) {
-    for task in &mut job.stages[stage].tasks {
+pub(crate) fn succeed(
+    job: &mut JobDescriptor,
+    stage: usize,
+    statistics: impl Fn(usize) -> ChannelCounts,
+) {
+    for (p, task) in job.stages[stage].tasks.iter_mut().enumerate() {
         task.attempts.push(TaskAttemptDescriptor {
             state: TaskState::Succeeded,
             messages: vec![],
             cause: None,
             job_output_fetched: false,
+            statistics: Some(Arc::new(TaskOutputStatistics::new(&statistics(p)).unwrap())),
         });
+    }
+}
+
+pub(crate) fn producer_statistics(_: usize) -> ChannelCounts {
+    ChannelCounts {
+        rows: vec![100; 8],
+        physical_bytes: Some(vec![MIB / 4; 8]),
+        logical_bytes: vec![MIB; 8],
     }
 }
 

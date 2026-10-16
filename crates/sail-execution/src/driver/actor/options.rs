@@ -5,6 +5,7 @@ use sail_common::runtime::RuntimeHandle;
 use sail_common::utils::retry::RetryStrategy;
 use sail_telemetry::events::SystemEventReporter;
 
+use crate::driver::job_scheduler::AdaptiveOptions;
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::DriverId;
 use crate::shuffle::ShuffleBackendKind;
@@ -31,6 +32,7 @@ pub struct DriverOptions {
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout: Duration,
     pub task_max_attempts: usize,
+    pub adaptive: AdaptiveOptions,
     pub shuffle_backend: ShuffleBackendKind,
     pub rpc_retry_strategy: RetryStrategy,
     pub runtime: RuntimeHandle,
@@ -81,6 +83,12 @@ impl DriverOptions {
                 config.cluster.task_stream_creation_timeout_secs,
             ),
             task_max_attempts: config.cluster.task_max_attempts,
+            adaptive: {
+                let adaptive = &config.cluster.adaptive;
+                AdaptiveOptions {
+                    enabled: adaptive.enabled,
+                }
+            },
             shuffle_backend: (&config.cluster.shuffle_backend).into(),
             runtime,
         })

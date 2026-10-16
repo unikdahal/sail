@@ -169,6 +169,36 @@
           sql_type: TIMESTAMP_LTZ(6)
           arrow_type: crate::types::timestamp()
           nullable: true
+        - name: rows
+          description: The number of rows committed across all output channels of the stage, if reported.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: physical_bytes
+          description: The physical (backend-stored, compressed) bytes committed by the stage, if known.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: logical_bytes
+          description: The logical (uncompressed Arrow) bytes committed by the stage, if reported.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: max_partition_bytes
+          description: The size of the largest output partition of the stage in bytes, if reported. Physical bytes are used when known, otherwise logical bytes.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
+        - name: median_partition_bytes
+          description: The median size of the output partitions of the stage in bytes, if reported. Physical bytes are used when known, otherwise logical bytes.
+          rust_type: Option<u64>
+          sql_type: UNSIGNED LONG
+          arrow_type: crate::types::numeric::<u64>()
+          nullable: true
 
     - name: tasks
       row_name: task

@@ -16,6 +16,7 @@ use crate::driver::{TaskStatus, r#gen};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{DriverId, TaskKey, WorkerId};
 use crate::rpc::{ClientHandle, ClientOptions, ClientService};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::service::{TaskStreamFlightClient, TaskStreamOwner};
 
 #[derive(Clone)]
@@ -248,6 +249,7 @@ impl DriverClient {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        statistics: Option<TaskOutputStatistics>,
         sequence: u64,
     ) -> ExecutionResult<()> {
         let cause = cause
@@ -266,6 +268,7 @@ impl DriverClient {
             status: r#gen::TaskStatus::from(status) as i32,
             message,
             cause,
+            output_statistics: statistics.map(Into::into),
             sequence,
         });
         let response = self.inner.get().await?.report_task_status(request).await?;

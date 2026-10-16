@@ -106,6 +106,27 @@ where
             status,
             updated_at,
         } => write_stage_updated_event(writer, session_id, job_id, stage, status, updated_at),
+        SystemEvent::StageStatisticsReported {
+            session_id,
+            job_id,
+            stage,
+            rows,
+            physical_bytes,
+            logical_bytes,
+            max_partition_bytes,
+            median_partition_bytes,
+            reported_at: _,
+        } => write_stage_statistics_reported_event(
+            writer,
+            session_id,
+            job_id,
+            stage,
+            rows,
+            physical_bytes,
+            logical_bytes,
+            max_partition_bytes,
+            median_partition_bytes,
+        ),
         SystemEvent::TaskCreated {
             session_id,
             job_id,
@@ -293,6 +314,11 @@ fn write_stage_created_event<W: StoreWriter>(
                 status,
                 created_at,
                 stopped_at: None,
+                rows: None,
+                physical_bytes: None,
+                logical_bytes: None,
+                max_partition_bytes: None,
+                median_partition_bytes: None,
             },
         )
         .map(|_| ())
@@ -319,6 +345,40 @@ fn write_stage_updated_event<W: StoreWriter>(
                 if row.stopped_at.is_none() && is_stage_stopped(&row.status) {
                     row.stopped_at = Some(updated_at);
                 }
+            },
+        )
+        .map(|_| ())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the durable stage-statistics event intentionally mirrors its wire representation"
+)]
+fn write_stage_statistics_reported_event<W: StoreWriter>(
+    writer: &mut W,
+    session_id: String,
+    job_id: u64,
+    stage: u64,
+    rows: u64,
+    physical_bytes: Option<u64>,
+    logical_bytes: u64,
+    max_partition_bytes: u64,
+    median_partition_bytes: u64,
+) -> WriteResult<W> {
+    writer
+        .table_mut::<StageTable>()
+        .update_if_present(
+            &StagePrimaryKey {
+                session_id,
+                job_id,
+                stage,
+            },
+            |row| {
+                row.rows = Some(rows);
+                row.physical_bytes = physical_bytes;
+                row.logical_bytes = Some(logical_bytes);
+                row.max_partition_bytes = Some(max_partition_bytes);
+                row.median_partition_bytes = Some(median_partition_bytes);
             },
         )
         .map(|_| ())
