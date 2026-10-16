@@ -235,6 +235,25 @@ pub struct ClusterConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClusterAdaptiveConfig {
     pub enabled: bool,
+    pub coalesce: ClusterAdaptiveCoalesceConfig,
+    pub join: ClusterAdaptiveJoinConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveCoalesceConfig {
+    pub enabled: bool,
+    pub target_size: u64,
+    pub min_partition_size: u64,
+    pub min_partitions: usize,
+    pub max_logical_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveJoinConfig {
+    pub enabled: bool,
+    pub max_build_partition_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +347,13 @@ pub enum ShuffleBackend {
     Flight(FlightShuffleBackend),
     Storage(StorageShuffleBackend),
     Celeborn(CelebornShuffleBackend),
+}
+
+impl ShuffleBackend {
+    /// Whether the backend is a remote shuffle service.
+    pub fn is_remote_shuffle_service(&self) -> bool {
+        matches!(self, ShuffleBackend::Celeborn(_))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1081,6 +1107,13 @@ mod tests {
         let config = AppConfig::load().map_err(|e| e.to_string())?;
         let adaptive = &config.cluster.adaptive;
         assert!(!adaptive.enabled);
+        assert!(adaptive.coalesce.enabled);
+        assert_eq!(adaptive.coalesce.target_size, 64 * 1024 * 1024);
+        assert_eq!(adaptive.coalesce.min_partition_size, 1024 * 1024);
+        assert_eq!(adaptive.coalesce.min_partitions, 1);
+        assert_eq!(adaptive.coalesce.max_logical_size, 256 * 1024 * 1024);
+        assert!(adaptive.join.enabled);
+        assert_eq!(adaptive.join.max_build_partition_size, 64 * 1024 * 1024);
         Ok(())
     }
 

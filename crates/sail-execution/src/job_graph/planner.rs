@@ -34,8 +34,8 @@ use sail_physical_plan::repartition::ExplicitRepartitionExec;
 
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::job_graph::{
-    InputMode, JobGraph, JobGraphOptions, OutputDistribution, OutputMode, Stage, StageInput,
-    TaskPlacement,
+    BucketLayout, InputMode, JobGraph, JobGraphOptions, OutputDistribution, OutputMode,
+    ShuffleOrigin, Stage, StageInput, StageKind, TaskPlacement,
 };
 use crate::plan::{ShuffleConsumption, StageInputExec};
 use crate::shuffle::ShuffleBackendKind;
@@ -64,6 +64,7 @@ impl JobGraph {
             mode: OutputMode::Pipelined,
             distribution: OutputDistribution::RoundRobinBatch { channels: 1 },
             placement: TaskPlacement::Worker,
+            kind: StageKind::Compute,
         });
         Ok(graph)
     }
@@ -558,6 +559,16 @@ fn plan_job_graph_stages(
                 consumption,
                 scalar_context,
             )?,
+            // A user-chosen hash or range repartition is kept as an explicit node only
+            // when adaptive execution is enabled, so that its partition count is preserved.
+            Partitioning::Hash(_, _) | Partitioning::Range(_) => create_shuffle_with_origin(
+                child,
+                graph,
+                properties.clone(),
+                consumption,
+                scalar_context,
+                ShuffleOrigin::User,
+            )?,
             other => {
                 return Err(ExecutionError::DataFusionError(plan_datafusion_err!(
                     "unexpected explicit repartition partitioning in distributed planning: {other:?}"
@@ -817,6 +828,7 @@ fn create_merge_input(
         OutputDistribution::RoundRobinBatch { channels: 1 },
         TaskPlacement::Worker,
         OutputMode::Pipelined,
+        StageKind::Compute,
     )?;
     Ok(stage_input_exec(stage, InputMode::Merge, properties))
 }
@@ -831,6 +843,7 @@ fn create_scalar_subquery_input(
         OutputDistribution::RoundRobinBatch { channels: 1 },
         TaskPlacement::Worker,
         scalar_subquery_output_mode(graph),
+        StageKind::Compute,
     )?;
     // ScalarSubqueryExec reads the link as a scalar value on every output
     // partition, so the materialized stage is exposed as one broadcast input.
@@ -851,6 +864,7 @@ fn create_rescale_input(
         OutputDistribution::RoundRobinBatch { channels: 1 },
         TaskPlacement::Worker,
         OutputMode::Pipelined,
+        StageKind::Compute,
     )?;
     let properties = stage_properties_with_unknown_partitioning(graph, stage, output_partitions);
     Ok(stage_input_exec(
@@ -871,6 +885,24 @@ fn create_shuffle(
     consumption: ShuffleConsumption,
     scalar_context: Option<ScalarSubqueryContext<'_>>,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
+    create_shuffle_with_origin(
+        plan,
+        graph,
+        properties,
+        consumption,
+        scalar_context,
+        ShuffleOrigin::Engine,
+    )
+}
+
+fn create_shuffle_with_origin(
+    plan: PlannedSubtree,
+    graph: &mut JobGraph,
+    properties: Arc<PlanProperties>,
+    consumption: ShuffleConsumption,
+    scalar_context: Option<ScalarSubqueryContext<'_>>,
+    origin: ShuffleOrigin,
+) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
     let distribution = match properties.partitioning.clone() {
         Partitioning::RoundRobinBatch(channels) | Partitioning::UnknownPartitioning(channels) => {
             OutputDistribution::RoundRobinBatch { channels }
@@ -885,12 +917,13 @@ fn create_shuffle(
         distribution,
         TaskPlacement::Worker,
         shuffle_output_mode(graph),
+        StageKind::Compute,
     )?;
     let mode = match consumption {
         ShuffleConsumption::Single => InputMode::Shuffle,
         ShuffleConsumption::Multiple => InputMode::Broadcast,
     };
-    create_shuffle_input(stage, mode, properties, graph)
+    create_shuffle_input(stage, mode, properties, graph, origin)
 }
 
 /// Creates a shuffle stage with row-level round-robin distribution.
@@ -912,12 +945,13 @@ fn create_row_shuffle(
         distribution,
         TaskPlacement::Worker,
         shuffle_output_mode(graph),
+        StageKind::Compute,
     )?;
     let mode = match consumption {
         ShuffleConsumption::Single => InputMode::Shuffle,
         ShuffleConsumption::Multiple => InputMode::Broadcast,
     };
-    create_shuffle_input(stage, mode, properties, graph)
+    create_shuffle_input(stage, mode, properties, graph, ShuffleOrigin::User)
 }
 
 fn shuffle_output_mode(graph: &JobGraph) -> OutputMode {
@@ -946,23 +980,44 @@ fn create_shuffle_input(
     mode: InputMode,
     properties: Arc<PlanProperties>,
     graph: &mut JobGraph,
+    origin: ShuffleOrigin,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
+    let input = StageInput::new(stage, mode).with_origin(origin);
     if !matches!(
         graph.options.shuffle_backend,
         ShuffleBackendKind::Storage { .. }
     ) {
-        return Ok(stage_input_exec(stage, mode, properties));
+        // A remote shuffle service stores the output of every producer, and each
+        // consumer partition reads one shuffle partition (channel) of all of them.
+        let layout = if graph.options.shuffle_backend.is_remote_shuffle_service()
+            && matches!(mode, InputMode::Shuffle)
+        {
+            BucketLayout::Direct
+        } else {
+            BucketLayout::Opaque
+        };
+        return Ok(stage_input_exec_with(input.with_layout(layout), properties));
     }
 
-    let merge = stage_input_exec(stage, mode, properties.clone());
+    let merge = stage_input_exec_with(input, properties.clone());
     let stage = push_stage(
         merge,
         graph,
         OutputDistribution::RoundRobinBatch { channels: 1 },
         TaskPlacement::Worker,
         OutputMode::Blocking,
+        StageKind::ShuffleMerge,
     )?;
-    Ok(stage_input_exec(stage, InputMode::Forward, properties))
+    let layout = match mode {
+        InputMode::Shuffle => BucketLayout::Merged,
+        _ => BucketLayout::Opaque,
+    };
+    Ok(stage_input_exec_with(
+        StageInput::new(stage, InputMode::Forward)
+            .with_origin(origin)
+            .with_layout(layout),
+        properties,
+    ))
 }
 
 fn rewrite_inputs(
@@ -988,6 +1043,7 @@ fn push_stage(
     distribution: OutputDistribution,
     placement: TaskPlacement,
     mode: OutputMode,
+    kind: StageKind,
 ) -> ExecutionResult<usize> {
     let (plan, inputs) = rewrite_inputs(plan)?;
     let stage = Stage {
@@ -997,6 +1053,7 @@ fn push_stage(
         mode,
         distribution,
         placement,
+        kind,
     };
     let index = graph.stages.len();
     graph.stages.push(stage);
@@ -1008,7 +1065,14 @@ fn stage_input_exec(
     mode: InputMode,
     properties: Arc<PlanProperties>,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(StageInputExec::new(StageInput { stage, mode }, properties))
+    stage_input_exec_with(StageInput::new(stage, mode), properties)
+}
+
+fn stage_input_exec_with(
+    input: StageInput,
+    properties: Arc<PlanProperties>,
+) -> Arc<dyn ExecutionPlan> {
+    Arc::new(StageInputExec::new(input, properties))
 }
 
 fn stage_properties_with_unknown_partitioning(
@@ -1037,6 +1101,7 @@ fn create_driver_stage(
         OutputDistribution::RoundRobinBatch { channels: 1 },
         TaskPlacement::Driver,
         OutputMode::Pipelined,
+        StageKind::Driver,
     )?;
     let properties = graph.stages[stage].plan.properties().clone();
     Ok(stage_input_exec(stage, InputMode::Forward, properties))
@@ -1350,6 +1415,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Shuffle,
+                ..
             }]
         ));
 
@@ -1363,6 +1429,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Shuffle,
+                ..
             }]
         ));
     }
@@ -1413,6 +1480,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Shuffle,
+                ..
             }]
         ));
         assert!(matches!(graph.stages()[1].mode, OutputMode::Blocking));
@@ -1421,6 +1489,7 @@ mod tests {
             [StageInput {
                 stage: 1,
                 mode: InputMode::Forward,
+                ..
             }]
         ));
     }
@@ -1442,6 +1511,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Shuffle,
+                ..
             }]
         ));
     }
@@ -1509,6 +1579,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Rescale { partitions: 2 },
+                ..
             }]
         ));
     }
@@ -1639,6 +1710,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Forward,
+                ..
             }]
         ));
     }
@@ -1677,6 +1749,7 @@ mod tests {
             [StageInput {
                 stage: 0,
                 mode: InputMode::Shuffle,
+                ..
             }]
         ));
         assert!(matches!(
@@ -1684,6 +1757,7 @@ mod tests {
             [StageInput {
                 stage: 1,
                 mode: InputMode::Forward,
+                ..
             }]
         ));
     }

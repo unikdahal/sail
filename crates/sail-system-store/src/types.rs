@@ -15,6 +15,17 @@ pub(crate) fn timestamp() -> DataType {
     DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
 }
 
+pub(crate) fn string_list() -> DataType {
+    DataType::List(Arc::new(Field::new(
+        SAIL_LIST_FIELD_NAME,
+        DataType::Utf8,
+        // FIXME: The elements should be non-nullable,
+        //   but the SQL syntax does not yet support specifying nullability
+        //   for `ARRAY` element types or `MAP` value types.
+        true,
+    )))
+}
+
 pub fn string_map() -> DataType {
     DataType::Map(
         Arc::new(Field::new(
@@ -77,7 +88,6 @@ pub enum MetricValue {
     Histogram(MetricHistogram),
 }
 
-#[expect(unused)]
 pub(crate) fn boolean() -> DataType {
     DataType::Boolean
 }

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlanProperties;
@@ -24,6 +25,10 @@ pub struct JobDescriptor {
 /// Overhead of adaptive query execution for one job.
 #[derive(Debug, Default)]
 pub struct AdaptiveMetrics {
+    /// Time spent re-planning stages.
+    pub replanning_time: Duration,
+    /// The number of stages whose plans were rewritten.
+    pub replanned_stages: usize,
     /// Bytes of compact statistics received with task reports.
     pub statistics_payload_bytes: u64,
     /// The number of bytes currently retained for statistics.
@@ -77,6 +82,7 @@ impl JobDescriptor {
                 tasks: vec![],
                 state: StageState::Active,
                 commit: None,
+                adaptive: AdaptiveDecision::Pending,
                 statistics_reported: false,
                 retained_statistics_bytes: 0,
                 shuffle_statistics: None,
@@ -113,13 +119,15 @@ pub struct StageDescriptor {
     /// the backend itself. This is set only for backends whose committed attempt can
     /// differ from the scheduler's latest successful attempt (remote shuffle services).
     pub commit: Option<ShuffleCommit>,
+    /// The adaptive decision for the stage, made once before any of its tasks run.
+    pub adaptive: AdaptiveDecision,
     /// Whether the committed output statistics of the stage have been reported.
     pub statistics_reported: bool,
     /// The number of bytes retained for the statistics of the stage's attempts.
     pub retained_statistics_bytes: u64,
     /// The statistics of the committed attempts folded per bucket, cached so that
-    /// they are folded once. Cleared when the commit changes or the statistics
-    /// are released.
+    /// every consumer shares one fold. Cleared when the commit changes or the
+    /// statistics are released.
     pub shuffle_statistics: Option<Arc<ShuffleStatistics>>,
 }
 
@@ -131,6 +139,26 @@ pub struct ShuffleCommit {
     /// Whether the global commit succeeded. The output of a failed commit is lost:
     /// reading it fails, and it is never used for adaptive decisions.
     pub succeeded: bool,
+}
+
+/// The adaptive decision for a stage.
+/// A decision is made before any region of the stage has an attempt,
+/// and it never changes afterwards, so that retries reuse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveDecision {
+    /// No decision has been made yet.
+    Pending,
+    /// The stage runs as planned, either because it was not eligible or because
+    /// no rule applied.
+    Static,
+    /// The stage was re-planned.
+    Replanned,
+}
+
+impl AdaptiveDecision {
+    pub fn is_frozen(&self) -> bool {
+        !matches!(self, AdaptiveDecision::Pending)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,7 +207,8 @@ pub struct TaskAttemptDescriptor {
     /// the final stages of the job.
     pub job_output_fetched: bool,
     /// The committed output statistics reported with the succeeded status.
-    /// They are released once they have been reported.
+    /// They are released once every consumer of the stage has made its
+    /// adaptive decision.
     pub statistics: Option<Arc<TaskOutputStatistics>>,
 }
 

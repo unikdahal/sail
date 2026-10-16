@@ -89,6 +89,9 @@ impl JobRunner for LocalJobRunner {
 pub struct ClusterJobRunner {
     driver: DriverHandle,
     shuffle_backend: ShuffleBackendKind,
+    /// Whether stages may be re-planned at runtime, so that the explained job graph
+    /// is only the initial plan.
+    adaptive: bool,
 }
 
 impl ClusterJobRunner {
@@ -98,10 +101,12 @@ impl ClusterJobRunner {
         components: DriverComponents,
     ) -> Self {
         let shuffle_backend = options.shuffle_backend.clone();
+        let adaptive = options.adaptive.enabled && shuffle_backend.is_remote_shuffle_service();
         let driver = DriverHandle::new(system.spawn::<DriverActor>((options, components)));
         Self {
             driver,
             shuffle_backend,
+            adaptive,
         }
     }
 
@@ -113,7 +118,15 @@ impl ClusterJobRunner {
 #[tonic::async_trait]
 impl JobRunner for ClusterJobRunner {
     fn explain(&self, plan: Arc<dyn ExecutionPlan>) -> Result<String> {
-        explain_job_graph(plan, self.shuffle_backend.clone())
+        let graph = explain_job_graph(plan, self.shuffle_backend.clone())?;
+        if self.adaptive {
+            // The final decisions are visible in the `system.execution.stages` table.
+            Ok(format!(
+                "initial job graph (adaptive execution may re-plan stages before they run)\n{graph}"
+            ))
+        } else {
+            Ok(graph)
+        }
     }
 
     /// Executes a plan on the cluster. This is where the cool stuff happens.

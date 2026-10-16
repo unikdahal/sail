@@ -259,11 +259,67 @@
   default: "false"
   description: |
     The master switch for adaptive query execution in cluster mode.
-    With a remote shuffle service backend (currently `celeborn`), blocking shuffle outputs
-    report their committed statistics, which are shown in the `system.execution.stages` table.
-    It has no effect on the `flight` and `storage` backends.
-    When disabled, task definitions are identical to non-adaptive execution and no
-    statistics are collected.
+    Adaptive re-planning applies only at the blocking shuffle boundaries of a remote shuffle
+    service backend (currently `celeborn`); it has no effect on the `flight` and `storage`
+    backends.
+    When disabled, job graphs and task definitions are identical to non-adaptive execution.
+  experimental: true
+
+- key: cluster.adaptive.coalesce.enabled
+  type: boolean
+  default: "true"
+  description: |
+    Whether to coalesce small hash shuffle partitions when adaptive query execution is enabled.
+  experimental: true
+
+- key: cluster.adaptive.coalesce.target_size
+  type: number
+  default: "67108864"
+  description: |
+    The advisory post-shuffle partition size in physical (compressed) bytes
+    for coalescing shuffle partitions.
+  experimental: true
+
+- key: cluster.adaptive.coalesce.min_partition_size
+  type: number
+  default: "1048576"
+  description: |
+    The floor for the coalesce target size in bytes. Partition ranges smaller than this
+    are merged into a neighbour.
+  experimental: true
+
+- key: cluster.adaptive.coalesce.min_partitions
+  type: number
+  default: "1"
+  description: |
+    The minimum number of coalesced partitions. Raise this value to keep parallelism.
+  experimental: true
+
+- key: cluster.adaptive.coalesce.max_logical_size
+  type: number
+  default: "268435456"
+  description: |
+    The largest logical (uncompressed Arrow) size in bytes of a coalesced partition.
+    The coalesce target size measures compressed shuffle bytes, so this bounds the data
+    a coalesced task reads when the shuffle data compresses well. A single partition
+    larger than this value is kept as it is.
+  experimental: true
+
+- key: cluster.adaptive.join.enabled
+  type: boolean
+  default: "true"
+  description: |
+    Whether to make runtime join decisions (empty-input pruning, build-side swap, and
+    hash join to sort-merge join conversion) when adaptive query execution is enabled.
+  experimental: true
+
+- key: cluster.adaptive.join.max_build_partition_size
+  type: number
+  default: "67108864"
+  description: |
+    The build cap in logical (uncompressed Arrow) bytes. It limits coalesced build ranges
+    of partitioned hash joins, and above it a partitioned hash join is converted to a
+    sort-merge join.
   experimental: true
 
 - key: cluster.rpc_retry_strategy.type
