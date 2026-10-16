@@ -1,3 +1,4 @@
+use futures::future::try_join_all;
 use log::warn;
 use sail_common::actor::{ActorAction, ActorContext};
 use tokio::sync::oneshot;
@@ -6,8 +7,8 @@ use crate::common::{
     ApplicationMetrics, PartitionLocation, SlotReservation, UserIdentifier, WorkerSlotLocations,
 };
 use crate::error::{CelebornError, CelebornResult};
-use crate::lifecycle::actor::{LifecycleManagerActor, ShuffleKey};
-use crate::lifecycle::{LifecycleManagerMessage, ReviveRequest};
+use crate::lifecycle::actor::{LifecycleManagerActor, ShuffleCommitState, ShuffleKey};
+use crate::lifecycle::{LifecycleManagerMessage, ReviveRequest, ShuffleCommitReport};
 use crate::protocol::StatusCode;
 use crate::worker::WorkerClientOptions;
 
@@ -69,6 +70,7 @@ impl LifecycleManagerActor {
                 Some(next) => {
                     self.next_shuffle_id = next;
                     self.shuffle_ids.insert(key, next);
+                    self.shuffle_keys.insert(next, key);
                     Ok(next)
                 }
                 None => Err(CelebornError::Application(
@@ -216,8 +218,10 @@ impl LifecycleManagerActor {
             let _ = reply.send(Err(error));
             return ActorAction::Continue;
         }
-        if self.committing_shuffles.contains(&request.shuffle_id)
-            || self.committed_shuffles.contains(&request.shuffle_id)
+        if self
+            .shuffle_commits
+            .get(&request.shuffle_id)
+            .is_some_and(|state| !matches!(state, ShuffleCommitState::Collecting { .. }))
         {
             let _ = reply.send(Err(CelebornError::Application(format!(
                 "shuffle {} has already ended",
@@ -417,106 +421,196 @@ impl LifecycleManagerActor {
                 return ActorAction::Continue;
             }
         };
-        if self.committed_shuffles.contains(&shuffle_id) {
-            let _ = reply.send(Ok(()));
-            return ActorAction::Continue;
-        }
+        let state = self.shuffle_commits.entry(shuffle_id).or_insert_with(|| {
+            ShuffleCommitState::Collecting {
+                attempts: vec![-1; num_mappers],
+            }
+        });
+        let attempts = match state {
+            ShuffleCommitState::Committed => {
+                let _ = reply.send(Ok(()));
+                return ActorAction::Continue;
+            }
+            ShuffleCommitState::Lost { reason } => {
+                let _ = reply.send(Err(shuffle_lost(shuffle_id, reason)));
+                return ActorAction::Continue;
+            }
+            ShuffleCommitState::Committing { waiters, .. } => {
+                waiters.push(reply);
+                return ActorAction::Continue;
+            }
+            ShuffleCommitState::Collecting { attempts } => {
+                if attempts.len() != num_mappers {
+                    let _ = reply.send(Err(CelebornError::Application(format!(
+                        "shuffle {shuffle_id} was registered with {} mappers, not {num_mappers}",
+                        attempts.len()
+                    ))));
+                    return ActorAction::Continue;
+                }
+                // Match Celeborn's speculative execution semantics: the first attempt of
+                // each mapper to end is selected. Later attempts are acknowledged
+                // without changing the selection.
+                if attempts[map_id] == -1 {
+                    attempts[map_id] = attempt_id;
+                }
+                if attempts.contains(&-1) {
+                    let _ = reply.send(Ok(()));
+                    return ActorAction::Continue;
+                }
+                std::mem::take(attempts)
+            }
+        };
         let Some(worker_locations) = self.registered_shuffles.get(&shuffle_id).cloned() else {
-            let _ = reply.send(Err(CelebornError::Application(format!(
-                "shuffle {shuffle_id} is not registered"
-            ))));
+            let reason = "the shuffle is not registered".to_string();
+            let _ = reply.send(Err(shuffle_lost(shuffle_id, &reason)));
+            *state = ShuffleCommitState::Lost { reason };
             return ActorAction::Continue;
         };
-        let map_attempts = {
-            let attempts = self
-                .mapper_attempts
-                .entry(shuffle_id)
-                .or_insert_with(|| vec![-1; num_mappers]);
-            if attempts.len() != num_mappers {
-                let _ = reply.send(Err(CelebornError::Application(format!(
-                    "shuffle {shuffle_id} was registered with {} mappers, not {num_mappers}",
-                    attempts.len()
-                ))));
-                return ActorAction::Continue;
-            }
-            // Match Celeborn's speculative execution semantics: the first completed attempt
-            // wins and later attempts are acknowledged without changing the committed output.
-            if attempts[map_id] != -1 {
-                let _ = reply.send(Ok(()));
-                return ActorAction::Continue;
-            }
-            attempts[map_id] = attempt_id;
-            if attempts.contains(&-1) {
-                let _ = reply.send(Ok(()));
-                return ActorAction::Continue;
-            }
-            attempts.clone()
+        *state = ShuffleCommitState::Committing {
+            attempts: attempts.clone(),
+            waiters: vec![reply],
         };
-        self.committing_shuffles.insert(shuffle_id);
         let application_id = self.options.application_id.clone();
         let endpoint_resolver = self.options.endpoint_resolver.clone();
         let worker_clients = self.worker_clients.clone();
+        let max_retries = self.options.commit_max_retries;
+        let retry_wait = self.options.commit_retry_wait;
         let handle = ctx.handle().clone();
         ctx.spawn(async move {
-            let result = async {
-                let mut metrics = ApplicationMetrics::default();
-                for locations in worker_locations.into_values() {
-                    let Some(location) = locations
-                        .primary_locations
-                        .first()
-                        .or_else(|| locations.replica_locations.first())
-                    else {
-                        continue;
-                    };
-                    let commit_metrics = worker_clients
-                        .client(
-                            WorkerClientOptions::new(location.clone())
-                                .with_endpoint_resolver(endpoint_resolver.clone()),
-                        )
-                        .commit_files(
-                            application_id.clone(),
-                            shuffle_id,
-                            locations.primary_locations,
-                            locations.replica_locations,
-                            map_attempts.clone(),
-                        )
-                        .await?;
-                    metrics.total_written = metrics
-                        .total_written
-                        .saturating_add(commit_metrics.total_written);
-                    metrics.file_count =
-                        metrics.file_count.saturating_add(commit_metrics.file_count);
-                }
-                Ok(metrics)
-            }
-            .await;
-            let _ = handle
-                .send(LifecycleManagerMessage::MapperEndComplete {
-                    shuffle_id,
-                    result,
-                    reply,
+            // Workers commit independently, so commit them concurrently.
+            let commits = worker_locations.into_values().filter_map(|locations| {
+                let location = locations
+                    .primary_locations
+                    .first()
+                    .or_else(|| locations.replica_locations.first())?
+                    .clone();
+                let host = location.host.clone();
+                let client = worker_clients.client(
+                    WorkerClientOptions::new(location)
+                        .with_endpoint_resolver(endpoint_resolver.clone()),
+                );
+                let application_id = application_id.clone();
+                let attempts = attempts.clone();
+                Some(async move {
+                    let mut retries = 0;
+                    loop {
+                        // The same request every time: a worker that already committed
+                        // it returns its cached response.
+                        match client
+                            .commit_files(
+                                application_id.clone(),
+                                shuffle_id,
+                                locations.primary_locations.clone(),
+                                locations.replica_locations.clone(),
+                                attempts.clone(),
+                            )
+                            .await
+                        {
+                            Ok(metrics) => break Ok(metrics),
+                            Err(error) if retries < max_retries => {
+                                retries += 1;
+                                warn!(
+                                    "retrying commit of shuffle {shuffle_id} on worker {host} \
+                                     ({retries}/{max_retries}): {error}"
+                                );
+                                tokio::time::sleep(retry_wait).await;
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    }
                 })
+            });
+            let result = try_join_all(commits).await.and_then(|commits| {
+                let mut metrics = ApplicationMetrics::default();
+                let mut unreadable = vec![];
+                for commit in commits {
+                    metrics.total_written =
+                        metrics.total_written.saturating_add(commit.total_written);
+                    metrics.file_count = metrics.file_count.saturating_add(commit.file_count);
+                    unreadable.extend(commit.unreadable_files);
+                }
+                // A commit is final, so a shuffle with files that cannot be read is lost.
+                // Reading them would return no data instead of failing.
+                match unreadable.first() {
+                    None => Ok(metrics),
+                    Some((id, storage)) => Err(CelebornError::Application(format!(
+                        "{} committed partition files are on distributed storage, which is \
+                         not supported (for example, location {id} on {storage})",
+                        unreadable.len()
+                    ))),
+                }
+            });
+            let _ = handle
+                .send(LifecycleManagerMessage::CommitComplete { shuffle_id, result })
                 .await;
         });
         ActorAction::Continue
     }
 
-    pub(super) fn handle_mapper_end_complete(
+    pub(super) fn handle_commit_complete(
         &mut self,
+        ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
         result: CelebornResult<ApplicationMetrics>,
-        reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
-        self.committing_shuffles.remove(&shuffle_id);
-        let result = match result {
+        // The shuffle may have been unregistered during the commit.
+        let Some(state) = self.shuffle_commits.get_mut(&shuffle_id) else {
+            return ActorAction::Continue;
+        };
+        let outcome = match &result {
+            Ok(_) => ShuffleCommitState::Committed,
+            Err(error) => ShuffleCommitState::Lost {
+                reason: error.to_string(),
+            },
+        };
+        let ShuffleCommitState::Committing { attempts, waiters } =
+            std::mem::replace(state, outcome)
+        else {
+            warn!("unexpected commit completion for shuffle {shuffle_id}");
+            return ActorAction::Continue;
+        };
+        let reply = match result {
             Ok(metrics) => {
-                self.committed_shuffles.insert(shuffle_id);
                 self.application_metrics.add_assign(metrics);
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                warn!("shuffle {shuffle_id} is lost: commit failed: {error}");
+                Err(error.to_string())
+            }
         };
-        let _ = reply.send(result);
+        let report = self.options.commit_observer.as_ref().and_then(|observer| {
+            match self.shuffle_keys.get(&shuffle_id) {
+                Some(key) => Some((
+                    observer.clone(),
+                    ShuffleCommitReport {
+                        job_id: key.job_id,
+                        stage: key.stage,
+                        shuffle_id,
+                        map_attempts: attempts,
+                        result: reply.clone(),
+                    },
+                )),
+                None => {
+                    warn!("cannot report commit of unknown shuffle {shuffle_id}");
+                    None
+                }
+            }
+        });
+        // The observer learns about the commit before any mapper does, so the commit
+        // is known before any task of the shuffle reports success.
+        ctx.spawn(async move {
+            if let Some((observer, report)) = report {
+                observer.shuffle_committed(report).await;
+            }
+            for waiter in waiters {
+                let _ = waiter.send(
+                    reply
+                        .clone()
+                        .map_err(|reason| shuffle_lost(shuffle_id, &reason)),
+                );
+            }
+        });
         ActorAction::Continue
     }
 
@@ -553,12 +647,12 @@ impl LifecycleManagerActor {
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
         if result.is_ok() {
-            self.shuffle_ids.retain(|_, id| *id != shuffle_id);
+            if let Some(key) = self.shuffle_keys.remove(&shuffle_id) {
+                self.shuffle_ids.remove(&key);
+            }
             self.registered_shuffles.remove(&shuffle_id);
             self.reservations.remove(&shuffle_id);
-            self.mapper_attempts.remove(&shuffle_id);
-            self.committing_shuffles.remove(&shuffle_id);
-            self.committed_shuffles.remove(&shuffle_id);
+            self.shuffle_commits.remove(&shuffle_id);
         }
         let _ = reply.send(result);
         ActorAction::Continue
@@ -682,4 +776,10 @@ fn append_locations(target: &mut Vec<PartitionLocation>, source: Vec<PartitionLo
             target.push(location);
         }
     }
+}
+
+fn shuffle_lost(shuffle_id: i32, reason: &str) -> CelebornError {
+    CelebornError::Application(format!(
+        "shuffle {shuffle_id} is lost: commit failed: {reason}"
+    ))
 }

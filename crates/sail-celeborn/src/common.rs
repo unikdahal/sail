@@ -304,6 +304,68 @@ impl TryFrom<PbPartitionLocation> for PartitionLocation {
     }
 }
 
+/// The 16-byte header that precedes every batch in a Celeborn reduce partition file.
+///
+/// The fields are written in little-endian order like Celeborn's Java client
+/// (`Platform.putInt`), since the worker reads the map ID to sort partition files
+/// for map-range reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchHeader {
+    pub map_id: i32,
+    pub attempt_id: i32,
+    pub batch_id: i32,
+    /// The length of the (compressed) payload that follows the header.
+    pub length: i32,
+}
+
+impl BatchHeader {
+    pub const SIZE: usize = 16;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(Self::SIZE);
+        output.extend_from_slice(&self.map_id.to_le_bytes());
+        output.extend_from_slice(&self.attempt_id.to_le_bytes());
+        output.extend_from_slice(&self.batch_id.to_le_bytes());
+        output.extend_from_slice(&self.length.to_le_bytes());
+        output
+    }
+
+    pub fn decode(input: &[u8]) -> Option<Self> {
+        let field = |i: usize| -> Option<i32> {
+            Some(i32::from_le_bytes(
+                input.get(i * 4..i * 4 + 4)?.try_into().ok()?,
+            ))
+        };
+        Some(Self {
+            map_id: field(0)?,
+            attempt_id: field(1)?,
+            batch_id: field(2)?,
+            length: field(3)?,
+        })
+    }
+}
+
+/// Options for reading one reduce partition.
+#[derive(Debug, Clone, Default)]
+pub struct PartitionReadOptions {
+    /// Read only the batches of the mappers in `[start, end)`. The worker sorts the
+    /// partition file by map ID on demand and returns only the chunks of these mappers.
+    pub map_range: Option<std::ops::Range<i32>>,
+    /// The committed attempt of each mapper, indexed by map ID. Batches written by
+    /// any other attempt (for example a failed attempt that pushed partial data) are
+    /// skipped. Without it, batches of every attempt are returned.
+    pub map_attempts: Option<std::sync::Arc<[i32]>>,
+}
+
+/// Sizes of one pushed payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PushDataSize {
+    /// Bytes of the payload before compression, as handed to `push_data`.
+    pub uncompressed: u64,
+    /// Bytes sent to the Celeborn worker for this payload after compression, excluding protocol headers.
+    pub compressed: u64,
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {

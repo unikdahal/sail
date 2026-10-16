@@ -6,7 +6,9 @@ use futures::stream::BoxStream;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use sail_celeborn::error::CelebornError;
-use sail_celeborn::shuffle::{ShuffleClient, ShuffleClientActor, ShuffleClientOptions};
+use sail_celeborn::shuffle::{
+    PartitionReadOptions, ShuffleClient, ShuffleClientActor, ShuffleClientOptions,
+};
 use sail_common::actor::ActorSystem;
 use sail_common::runtime::RuntimeHandle;
 
@@ -35,6 +37,7 @@ pub(super) struct PyShufflePartitionStream {
     runtime: RuntimeHandle,
     shuffle_id: i32,
     partition_id: i32,
+    options: PartitionReadOptions,
     stream: Option<BoxStream<'static, Result<Bytes, CelebornError>>>,
 }
 
@@ -50,11 +53,16 @@ impl PyShufflePartitionStream {
         let runtime = self.runtime.clone();
         let shuffle_id = self.shuffle_id;
         let partition_id = self.partition_id;
+        let options = self.options.clone();
         let (result, stream) = py.detach(move || {
             runtime.primary().block_on(async move {
                 let mut stream = match stream {
                     Some(stream) => stream,
-                    None => client.read_partition_stream(shuffle_id, partition_id).await,
+                    None => {
+                        client
+                            .read_partition_stream_with_options(shuffle_id, partition_id, options)
+                            .await
+                    }
                 };
                 let result = stream
                     .next()
@@ -166,6 +174,9 @@ impl PyShuffleClient {
                 Bytes::from(data),
             ))
         })
+        // Like Celeborn's Java client, report the accepted input bytes plus the
+        // 16-byte batch header, independent of the codec.
+        .map(|size| size.uncompressed as usize + 16)
         .map_err(to_py_error)
     }
 
@@ -190,11 +201,16 @@ impl PyShuffleClient {
         .map_err(to_py_error)
     }
 
+    /// Reads a partition, optionally restricted to the mappers in `map_range`
+    /// (`(start, end)`, end exclusive) and to the committed attempt of each mapper.
+    #[pyo3(signature = (shuffle_id, partition_id, map_range=None, map_attempts=None))]
     fn read_partition_stream(
         &self,
         py: Python<'_>,
         shuffle_id: i32,
         partition_id: i32,
+        map_range: Option<(i32, i32)>,
+        map_attempts: Option<Vec<i32>>,
     ) -> PyResult<Py<PyShufflePartitionStream>> {
         let client = self.client()?;
         Py::new(
@@ -204,6 +220,10 @@ impl PyShuffleClient {
                 runtime: self.runtime.clone(),
                 shuffle_id,
                 partition_id,
+                options: PartitionReadOptions {
+                    map_range: map_range.map(|(start, end)| start..end),
+                    map_attempts: map_attempts.map(Arc::from),
+                },
                 stream: None,
             },
         )
