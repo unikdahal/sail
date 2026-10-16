@@ -39,9 +39,11 @@ def _celeborn_envs(
         "SAIL_CLUSTER__ADAPTIVE__ENABLED": "true" if adaptive else "false",
         # Hash shuffles start over-partitioned so that coalescing has an effect.
         "SAIL_EXECUTION__DEFAULT_PARALLELISM": "16",
-        # Small sizes so that coalescing applies to test-sized data.
+        # Small sizes so that coalescing and skew splitting apply to test-sized data.
         "SAIL_CLUSTER__ADAPTIVE__COALESCE__TARGET_SIZE": "65536",
         "SAIL_CLUSTER__ADAPTIVE__COALESCE__MIN_PARTITION_SIZE": "1024",
+        "SAIL_CLUSTER__ADAPTIVE__SKEW__THRESHOLD": "65536",
+        "SAIL_CLUSTER__ADAPTIVE__SKEW__FACTOR": "2.0",
         # Retry failed tasks so that failure injection can be observed.
         "SAIL_CLUSTER__TASK_MAX_ATTEMPTS": "3",
         # Small batches, so that a task pushes output to Celeborn before an injected failure.
@@ -52,6 +54,8 @@ def _celeborn_envs(
 # The rows of the retry test, and the row at which its first attempt fails.
 RETRY_ROWS = 200_000
 FAILING_ROW = 150_000
+# The fact rows of the skewed join.
+SKEWED_FACT_ROWS = 300_000
 
 
 @pytest.fixture(scope="module")
@@ -152,6 +156,34 @@ def test_user_chosen_partition_count_is_kept(spark):
     count = 12
     partitions = spark.range(1000).repartition(count, "id").select(F.spark_partition_id().alias("p")).distinct().count()
     assert partitions == count
+
+
+def _skewed_join(spark):
+    # 70% of the fact rows have key 0, so its hash bucket is far larger than the others.
+    # Both sides are larger than the broadcast threshold, so the join is partitioned.
+    hot = F.col("id") % 10 < 7  # noqa: PLR2004
+    fact = spark.range(SKEWED_FACT_ROWS).select(
+        F.when(hot, F.lit(0)).otherwise(F.col("id") % 200_000).alias("k"),
+        F.col("id").alias("v"),
+    )
+    dim = spark.range(200_000).select(F.col("id").alias("k"), (F.col("id") % 17).alias("g"))
+    return fact.join(dim, "k").groupBy("g").agg(F.count("*").alias("c"), F.sum("v").alias("s")).orderBy("g")
+
+
+def test_skewed_join_is_split_with_map_range_reads(remote, static_remote):
+    with spark_session_factory(remote) as adaptive_sessions, spark_session_factory(static_remote) as static_sessions:
+        adaptive = adaptive_sessions.create()
+        static = static_sessions.create()
+        expected = _skewed_join(static).collect()
+        assert sum(row.c for row in expected) == SKEWED_FACT_ROWS
+        assert _skewed_join(adaptive).collect() == expected
+
+        rules = _poll(
+            adaptive.sql(
+                "SELECT adaptive_rules FROM system.execution.stages WHERE array_contains(adaptive_rules, 'skew_split')"
+            )
+        )
+        assert rules, "no stage was split for skew"
 
 
 def _fail_once(marker: str):

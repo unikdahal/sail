@@ -16,7 +16,9 @@ use crate::stream::writer::{
     MultiChannelTaskStreamSink, ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink,
     TaskStreamWriter,
 };
-use crate::task::definition::{TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator};
+use crate::task::definition::{
+    ShuffleServiceRead, TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator,
+};
 use crate::task_runner::{TaskRunnerActor, TaskRunnerMessage};
 
 pub struct TaskStreamFactory {
@@ -236,7 +238,7 @@ impl TaskStreamAccessor {
         &self,
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
         map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
@@ -245,7 +247,7 @@ impl TaskStreamAccessor {
             TaskRunnerMessage::FetchCelebornStream {
                 job_id,
                 stage,
-                channels,
+                read,
                 map_attempts,
                 schema,
                 result,
@@ -328,10 +330,10 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                 .await?
             }
             TaskInputLocator::ShuffleService {
-                channels,
+                reads,
                 map_attempts,
             } => {
-                let channels = channels.get(partition).ok_or_else(|| {
+                let read = reads.get(partition).ok_or_else(|| {
                     DataFusionError::Execution(format!("input partition {partition} not found"))
                 })?;
                 vec![
@@ -339,7 +341,7 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                         .fetch_celeborn_stream(
                             self.key.job_id,
                             self.input.stage,
-                            channels.clone(),
+                            read.clone(),
                             map_attempts.clone(),
                             self.schema.clone(),
                         )

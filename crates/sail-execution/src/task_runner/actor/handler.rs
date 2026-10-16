@@ -16,7 +16,7 @@ use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink};
-use crate::task::definition::TaskDefinition;
+use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
 use crate::task_runner::monitor::TaskMonitor;
 use crate::task_runner::preparation::TaskPreparation;
 use crate::task_runner::{TaskRunnerActor, TaskRunnerPlacement};
@@ -371,7 +371,7 @@ impl TaskRunnerActor {
         ctx: &mut ActorContext<Self>,
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
         map_attempts: Option<Arc<[i32]>>,
         schema: Arc<Schema>,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
@@ -387,7 +387,7 @@ impl TaskRunnerActor {
             let output = match streams {
                 Some(streams) => {
                     streams
-                        .fetch_stream(job_id, stage, channels, map_attempts, schema)
+                        .fetch_stream(job_id, stage, read, map_attempts, schema)
                         .await
                 }
                 None => Err(DataFusionError::Internal(

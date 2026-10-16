@@ -55,6 +55,7 @@ When adaptive query execution is enabled, Sail applies the following rules to ea
 - Small hash shuffle partitions are coalesced into fewer partitions of about `cluster.adaptive.coalesce.target_size` compressed bytes, so fewer tasks and task slots are needed. A coalesced partition never exceeds `cluster.adaptive.coalesce.max_logical_size` uncompressed bytes. Partition counts that you chose explicitly, for example with `repartition(n, ...)`, are kept.
 - A join or grouped aggregation whose result must be empty because an input has no rows is replaced with an empty result.
 - A partitioned hash join swaps its inputs when its build side is certainly larger than its probe side, and becomes a sort-merge join when a build partition certainly exceeds `cluster.adaptive.join.max_build_partition_size` bytes. Coalescing keeps every build partition of a hash join within the same limit.
+- A skewed partition of a join input is split into several partitions, each reading the output of a subset of the map tasks with a map-range read from the shuffle service, and each paired with the matching partition of the other input. Only the join sides whose results do not depend on seeing the whole other side are split, so full outer joins are never split.
 
 Sizes are known only for the shuffle data itself. A rule that depends on the size of an operator's output, such as a join input behind a filter or a nested join, is applied only when the shuffle sizes bound that output. Otherwise the stage keeps its static plan for that rule.
 

@@ -189,7 +189,7 @@ fn rewrite_partitioned_hash_join(
 /// Converts partitioned hash joins whose largest build partition exceeds the build
 /// cap into sort-merge joins. This runs after the partition specs are decided, so
 /// `build_sizes` returns the logical size of each partition of a stage input's own
-/// domain, after coalescing. Only a build side whose size is exact
+/// domain, after coalescing and skew splits. Only a build side whose size is exact
 /// is converted; an upper bound above the cap does not show that the cap is exceeded.
 pub(crate) fn apply_sort_merge_joins(
     plan: Arc<dyn ExecutionPlan>,

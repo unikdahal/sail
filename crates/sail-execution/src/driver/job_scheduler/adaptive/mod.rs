@@ -18,10 +18,12 @@ mod bounds;
 mod coalesce;
 mod domain;
 mod joins;
+mod skew;
 mod spec;
 mod validate;
 mod view;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,6 +45,9 @@ use crate::driver::job_scheduler::adaptive::domain::{AlignmentGroup, alignment_g
 use crate::driver::job_scheduler::adaptive::joins::{
     apply_join_rules, apply_sort_merge_joins, exact_statistics,
 };
+use crate::driver::job_scheduler::adaptive::skew::{
+    RULE_SKEW_SPLIT, skew_joins, split_skewed_buckets,
+};
 use crate::driver::job_scheduler::adaptive::validate::{ValidationContext, validate};
 pub(crate) use crate::driver::job_scheduler::adaptive::view::{InputView, StageRewrite, StageView};
 use crate::driver::job_scheduler::state::{
@@ -53,7 +58,7 @@ use crate::driver::job_scheduler::{AdaptiveOptions, JobScheduler, JobSchedulerOp
 use crate::id::JobId;
 use crate::job_graph::{
     AdaptiveInput, AdaptiveProperty, BucketLayout, BucketSlice, InputMode, OutputDistribution,
-    OutputMode, ShuffleOrigin, StageKind, TaskPlacement,
+    OutputMode, ShuffleOrigin, StageKind, SubRange, TaskPlacement,
 };
 use crate::plan::StageInputExec;
 
@@ -184,7 +189,7 @@ impl JobScheduler {
         options: &JobSchedulerOptions,
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<Option<AppliedRewrite>, String> {
-        let view = Self::stage_view(job, s, &options.adaptive)?;
+        let view = Self::stage_view(job, s, &options.adaptive, options.slot_cap)?;
         let Some(rewrite) = adapt(&view)? else {
             return Ok(None);
         };
@@ -200,6 +205,7 @@ impl JobScheduler {
         job: &mut JobDescriptor,
         s: usize,
         options: &AdaptiveOptions,
+        slot_cap: Option<usize>,
     ) -> Result<StageView, String> {
         // Fold the statistics of every producer first. The fold is cached per producer,
         // so all consumers of a shuffle share it.
@@ -258,12 +264,15 @@ impl JobScheduler {
                 hash_partitioned: matches!(producer.distribution, OutputDistribution::Hash { .. }),
                 buckets: producer.distribution.channels(),
                 statistics,
+                producers: producer.plan.output_partitioning().partition_count(),
+                committed: Self::committed_attempt_statistics(job, input.stage).map(Arc::new),
             });
         }
         Ok(StageView {
             plan: stage.plan.clone(),
             inputs,
             options: options.clone(),
+            slot_cap,
         })
     }
 
@@ -396,6 +405,11 @@ pub(crate) fn adapt(view: &StageView) -> Result<Option<StageRewrite>, String> {
     }
 
     let groups = alignment_groups(&plan)?;
+    let skew_joins = if view.options.skew_enabled {
+        skew_joins(&plan)
+    } else {
+        vec![]
+    };
     let mut inputs: Vec<Option<Arc<AdaptiveInput>>> = vec![None; view.inputs.len()];
     for group in &groups {
         let sizes = match group_sizes(view, group) {
@@ -406,17 +420,38 @@ pub(crate) fn adapt(view: &StageView) -> Result<Option<StageRewrite>, String> {
                 continue;
             }
         };
-        if !view.options.coalesce_enabled || sizes.buckets <= 1 {
-            continue;
-        }
-        let ranges = match coalesce_ranges(view, &sizes) {
-            Ok(ranges) => ranges,
-            Err(reason) => {
+        let identity = (0..sizes.buckets).map(|b| b..b + 1).collect::<Vec<_>>();
+        let ranges = if view.options.coalesce_enabled && sizes.buckets > 1 {
+            coalesce_ranges(view, &sizes).unwrap_or_else(|reason| {
                 notes.push(format!("inputs {:?} not coalesced: {reason}", group.inputs));
-                continue;
-            }
+                identity.clone()
+            })
+        } else {
+            identity.clone()
         };
-        if ranges.len() < sizes.buckets {
+        let coalesced = ranges.len() < sizes.buckets;
+
+        // A skew split needs the group to be exactly the inputs that one join pairs.
+        let skew = skew_joins.iter().find(|join| {
+            join.sides.iter().map(|(i, _)| *i).collect::<BTreeSet<_>>() == group.inputs
+        });
+        if let Some(join) = skew {
+            match split_skewed_buckets(view, join, &ranges, &mut notes) {
+                Ok(Some(specs)) => {
+                    for (&(i, _), spec) in join.sides.iter().zip(specs) {
+                        inputs[i] = Some(Arc::new(spec));
+                    }
+                    add_rule(&mut rules, RULE_SKEW_SPLIT);
+                    if coalesced {
+                        add_rule(&mut rules, RULE_COALESCE);
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(reason) => notes.push(format!("skew split not applicable: {reason}")),
+            }
+        }
+        if coalesced {
             let adaptive = Arc::new(AdaptiveInput {
                 spec: ranges
                     .iter()
@@ -481,15 +516,23 @@ fn partition_logical_sizes(
     let Some(spec) = spec else {
         return Some(statistics.logical_bytes.clone());
     };
+    let committed = view.inputs.get(input)?.committed.clone();
     spec.spec
         .iter()
         .map(|slices| {
             slices.iter().try_fold(0u64, |total, slice| {
-                let size = statistics
-                    .logical_bytes
-                    .get(slice.buckets.clone())?
-                    .iter()
-                    .fold(0u64, |a, b| a.saturating_add(*b));
+                let size = match &slice.part {
+                    None => statistics.logical_bytes[slice.buckets.clone()]
+                        .iter()
+                        .fold(0u64, |a, b| a.saturating_add(*b)),
+                    Some(SubRange::Producers(producers)) => committed
+                        .as_ref()?
+                        .get(producers.clone())?
+                        .iter()
+                        .fold(0u64, |a, s| {
+                            a.saturating_add(s.logical_bytes_of(slice.buckets.start))
+                        }),
+                };
                 Some(total.saturating_add(size))
             })
         })

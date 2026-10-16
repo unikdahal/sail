@@ -97,7 +97,7 @@ impl Actor for TaskRunnerActor {
             TaskRunnerMessage::FetchCelebornStream {
                 job_id,
                 stage,
-                channels,
+                read,
                 map_attempts,
                 schema,
                 result,
@@ -105,7 +105,7 @@ impl Actor for TaskRunnerActor {
                 ctx,
                 job_id,
                 stage,
-                channels,
+                read,
                 map_attempts,
                 schema,
                 result,

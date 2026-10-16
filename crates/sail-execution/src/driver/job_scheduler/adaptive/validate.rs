@@ -195,6 +195,7 @@ fn validate_groups(ctx: &ValidationContext) -> Result<(), String> {
         Ok(input.adaptive.as_deref().map(|spec| SpecInput {
             spec,
             buckets: producer.distribution.channels(),
+            producers: producer.plan.output_partitioning().partition_count(),
         }))
     };
     let mut grouped = HashSet::new();
