@@ -6,6 +6,8 @@ pub type CelebornResult<T> = Result<T, CelebornError>;
 pub enum CelebornError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("object store error: {0}")]
+    ObjectStore(#[source] Box<object_store::Error>),
     #[error("protobuf error: {0}")]
     Protobuf(#[from] prost::DecodeError),
     #[error("request timed out")]
@@ -22,4 +24,10 @@ pub enum CelebornError {
     Application(String),
     #[error("actor has stopped")]
     ActorStopped,
+}
+
+impl From<object_store::Error> for CelebornError {
+    fn from(error: object_store::Error) -> Self {
+        Self::ObjectStore(Box::new(error))
+    }
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::common::CompressionCodec;
+use crate::dfs::DfsReadOptions;
 use crate::endpoint::EndpointResolver;
 use crate::lifecycle::LifecycleManager;
 
@@ -10,6 +11,8 @@ pub struct ShuffleClientOptions {
     pub lifecycle_manager: Arc<dyn LifecycleManager>,
     pub endpoint_resolver: Option<Arc<dyn EndpointResolver>>,
     pub compression: CompressionCodec,
+    /// Object stores, credentials, and read sizing for DFS-backed partition files.
+    pub dfs_read_options: DfsReadOptions,
 }
 
 impl ShuffleClientOptions {
@@ -24,6 +27,13 @@ impl ShuffleClientOptions {
             lifecycle_manager,
             endpoint_resolver,
             compression,
+            dfs_read_options: DfsReadOptions::default(),
         }
+    }
+
+    /// Configure direct reads of partitions on HDFS or S3-compatible storage.
+    pub fn with_dfs_read_options(mut self, options: DfsReadOptions) -> Self {
+        self.dfs_read_options = options;
+        self
     }
 }

@@ -1,6 +1,7 @@
 //! Celeborn shuffle support.
 
 pub mod common;
+pub mod dfs;
 pub mod endpoint;
 pub mod error;
 pub mod lifecycle;

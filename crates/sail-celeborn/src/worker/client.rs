@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use prost::Message;
 
@@ -11,6 +12,7 @@ use crate::common::{
     BatchHeader, CompressionCodec, PartitionLocation, PartitionReadOptions, PartitionSplitMode,
     PushDataSize, UserIdentifier, WorkerIdentity,
 };
+use crate::dfs::DfsReadOptions;
 use crate::endpoint::EndpointResolver;
 use crate::error::{CelebornError, CelebornResult};
 use crate::protocol::StatusCode;
@@ -28,12 +30,12 @@ pub struct CommitMetrics {
     pub total_written: i64,
     pub file_count: i64,
     /// Committed files that this client cannot read, as `(location ID, storage type)`.
-    /// Workers serve files on distributed storage without chunks and expect readers to
-    /// read them from the storage directly, which this client does not support.
+    /// Local, memory, HDFS, OSS, and S3 storage are supported. Unknown storage types
+    /// fail the commit rather than allowing a partial read.
     pub unreadable_files: Vec<(String, &'static str)>,
 }
 
-/// Returns the committed files of a commit response that are on distributed storage.
+/// Returns committed files whose storage type is unknown to this client.
 fn unreadable_files(response: &PbCommitFilesResponse) -> Vec<(String, &'static str)> {
     let mut files = response
         .committed_primary_storage_infos
@@ -42,10 +44,8 @@ fn unreadable_files(response: &PbCommitFilesResponse) -> Vec<(String, &'static s
         .filter_map(|(id, info)| {
             // Celeborn's `StorageInfo.Type` codes.
             let storage = match info.r#type {
-                3 => "HDFS",
-                4 => "OSS",
-                5 => "S3",
-                _ => return None,
+                0..=5 => return None,
+                _ => "unknown",
             };
             Some((id.clone(), storage))
         })
@@ -61,6 +61,7 @@ pub struct WorkerClient {
     rpc: TransportConnection,
     push: TransportConnection,
     fetch: TransportConnection,
+    dfs_read_options: Arc<DfsReadOptions>,
 }
 
 /// Reuses transport connections for partition locations on the same Celeborn worker.
@@ -80,9 +81,9 @@ impl WorkerClientPool {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         match clients.entry(worker_identity) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                entry.get().with_location(options.location)
-            }
+            std::collections::hash_map::Entry::Occupied(entry) => entry
+                .get()
+                .with_location(options.location, options.dfs_read_options),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let client = WorkerClient::new(options);
                 entry.insert(client.clone());
@@ -98,6 +99,8 @@ pub struct WorkerClientOptions {
     pub location: PartitionLocation,
     pub endpoint_resolver: Option<Arc<dyn EndpointResolver>>,
     pub timeout: Duration,
+    /// Object stores, credentials, and bounded read size for DFS partition files.
+    pub dfs_read_options: DfsReadOptions,
 }
 
 impl WorkerClientOptions {
@@ -106,6 +109,7 @@ impl WorkerClientOptions {
             location,
             endpoint_resolver: None,
             timeout: Duration::from_secs(30),
+            dfs_read_options: DfsReadOptions::default(),
         }
     }
 
@@ -114,6 +118,12 @@ impl WorkerClientOptions {
         endpoint_resolver: Option<Arc<dyn EndpointResolver>>,
     ) -> Self {
         self.endpoint_resolver = endpoint_resolver;
+        self
+    }
+
+    /// Configure direct reads of partitions on HDFS or S3-compatible storage.
+    pub fn with_dfs_read_options(mut self, options: DfsReadOptions) -> Self {
+        self.dfs_read_options = options;
         self
     }
 }
@@ -140,15 +150,17 @@ impl WorkerClient {
             rpc: TransportConnection::new(rpc_host, rpc_port, options.timeout),
             push: TransportConnection::new(push_host, push_port, options.timeout),
             fetch: TransportConnection::new(fetch_host, fetch_port, options.timeout),
+            dfs_read_options: Arc::new(options.dfs_read_options),
         }
     }
 
-    fn with_location(&self, location: PartitionLocation) -> Self {
+    fn with_location(&self, location: PartitionLocation, dfs_read_options: DfsReadOptions) -> Self {
         Self {
             location,
             rpc: self.rpc.clone(),
             push: self.push.clone(),
             fetch: self.fetch.clone(),
+            dfs_read_options: Arc::new(dfs_read_options),
         }
     }
 
@@ -262,24 +274,71 @@ impl WorkerClient {
             initial_credit: 0,
             read_local_shuffle: false,
         };
-        let response = match self
-            .request_fetch(MessageType::OpenStream, request.encode_to_vec())
-            .await
-        {
-            Ok(response) => response,
+        let mut handler = match self.open_stream(request.clone()).await {
+            Ok(handler) => handler,
             Err(error) => return Box::pin(stream::once(async move { Err(error) })),
         };
-        if response.message_type != MessageType::StreamHandler {
+        let mut metadata_guard = None;
+        // Celeborn 0.6.x returns neither chunks nor a path for DFS in a normal
+        // OpenStream response. Request its direct-read metadata in that case.
+        // This also distinguishes DFS from an empty local or memory partition,
+        // without changing the partition-location API used by remote clients.
+        if handler.num_chunks == 0 && handler.full_path.is_empty() {
+            let original = WorkerStreamGuard::new(self.fetch.clone(), handler.stream_id);
+            handler = match self
+                .open_stream(PbOpenStream {
+                    read_local_shuffle: true,
+                    ..request
+                })
+                .await
+            {
+                Ok(handler) => handler,
+                Err(error) => return Box::pin(stream::once(async move { Err(error) })),
+            };
+            metadata_guard = Some(WorkerStreamGuard::new(
+                self.fetch.clone(),
+                handler.stream_id,
+            ));
+            original.close().await;
+        }
+        if handler.num_chunks < 0 {
             return Box::pin(stream::once(async {
                 Err(CelebornError::Protocol(
-                    "invalid open stream response".to_string(),
+                    "negative stream chunk count".to_string(),
                 ))
             }));
         }
-        let handler = match PbStreamHandler::decode(response.payload.as_slice()) {
-            Ok(handler) => handler,
-            Err(error) => return Box::pin(stream::once(async move { Err(error.into()) })),
-        };
+        if !handler.full_path.is_empty() && !handler.full_path.starts_with('/') {
+            let guard = metadata_guard
+                .unwrap_or_else(|| WorkerStreamGuard::new(self.fetch.clone(), handler.stream_id));
+            return match crate::dfs::read_partition(
+                handler.full_path,
+                map_range,
+                (*self.dfs_read_options).clone(),
+                handler.chunk_offsets,
+            )
+            .await
+            {
+                Ok(stream) => Box::pin(stream::try_unfold(
+                    (stream, guard),
+                    |(mut stream, guard)| async move {
+                        match stream.next().await {
+                            Some(Ok(batch)) => Ok(Some((batch, (stream, guard)))),
+                            Some(Err(error)) => Err(error),
+                            None => Ok(None),
+                        }
+                    },
+                )),
+                Err(error) => Box::pin(stream::once(async move { Err(error) })),
+            };
+        }
+        if !handler.full_path.is_empty() && handler.num_chunks > 0 {
+            return Box::pin(stream::once(async {
+                Err(CelebornError::Protocol(
+                    "invalid stream metadata".to_string(),
+                ))
+            }));
+        }
         let client = self.clone();
         Box::pin(stream::try_unfold(
             (
@@ -314,6 +373,18 @@ impl WorkerClient {
                 }
             },
         ))
+    }
+
+    async fn open_stream(&self, request: PbOpenStream) -> CelebornResult<PbStreamHandler> {
+        let response = self
+            .request_fetch(MessageType::OpenStream, request.encode_to_vec())
+            .await?;
+        if response.message_type != MessageType::StreamHandler {
+            return Err(CelebornError::Protocol(
+                "invalid open stream response".to_string(),
+            ));
+        }
+        Ok(PbStreamHandler::decode(response.payload.as_slice())?)
     }
 
     async fn request_fetch(
@@ -373,6 +444,46 @@ impl WorkerClient {
             .encode()?;
         let response = self.rpc.send_rpc(payload).await?;
         TransportMessage::decode_java(&response)
+    }
+}
+
+/// Direct DFS reads do not fetch worker chunks, but their OpenStream registrations
+/// still pin the original file while a concurrent range read sorts it.
+struct WorkerStreamGuard {
+    fetch: TransportConnection,
+    stream_id: Option<i64>,
+}
+
+impl WorkerStreamGuard {
+    fn new(fetch: TransportConnection, stream_id: i64) -> Self {
+        Self {
+            fetch,
+            stream_id: Some(stream_id),
+        }
+    }
+
+    async fn close(mut self) {
+        if let Some(stream_id) = self.stream_id
+            && let Err(error) = self.fetch.end_chunk_stream(stream_id).await
+        {
+            log::debug!("failed to close Celeborn stream {stream_id}: {error}");
+        }
+        self.stream_id = None;
+    }
+}
+
+impl Drop for WorkerStreamGuard {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.stream_id.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let fetch = self.fetch.clone();
+            runtime.spawn(async move {
+                if let Err(error) = fetch.end_chunk_stream(stream_id).await {
+                    log::debug!("failed to close Celeborn stream {stream_id}: {error}");
+                }
+            });
+        }
     }
 }
 
@@ -539,7 +650,7 @@ fn decompress_block(
     Ok(output)
 }
 
-fn take_batch(buffered: &mut BytesMut) -> CelebornResult<Option<(BatchHeader, Bytes)>> {
+pub(crate) fn take_batch(buffered: &mut BytesMut) -> CelebornResult<Option<(BatchHeader, Bytes)>> {
     if buffered.len() < BatchHeader::SIZE {
         return Ok(None);
     }
@@ -794,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn files_on_distributed_storage_are_unreadable() {
+    fn dfs_storage_is_readable_but_unknown_storage_fails_commit() {
         use crate::protocol::proto::{PbCommitFilesResponse, PbStorageInfo};
 
         let info = |r#type| PbStorageInfo {
@@ -806,6 +917,8 @@ mod tests {
                 ("0-0".to_string(), info(1)),
                 ("1-0".to_string(), info(3)),
                 ("2-0".to_string(), info(0)),
+                ("4-0".to_string(), info(4)),
+                ("5-0".to_string(), info(99)),
             ]
             .into(),
             committed_replica_storage_infos: [("3-0".to_string(), info(5))].into(),
@@ -813,7 +926,7 @@ mod tests {
         };
         assert_eq!(
             unreadable_files(&response),
-            vec![("1-0".to_string(), "HDFS"), ("3-0".to_string(), "S3")]
+            vec![("5-0".to_string(), "unknown")]
         );
     }
 }

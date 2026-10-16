@@ -404,7 +404,8 @@ impl ShuffleClientActor {
             .map(|location| {
                 self.worker_clients.client(
                     WorkerClientOptions::new(location)
-                        .with_endpoint_resolver(self.options.endpoint_resolver.clone()),
+                        .with_endpoint_resolver(self.options.endpoint_resolver.clone())
+                        .with_dfs_read_options(self.options.dfs_read_options.clone()),
                 )
             })
             .collect::<Vec<_>>();
