@@ -26,6 +26,7 @@ impl Actor for LifecycleManagerActor {
             pending_revives: Default::default(),
             shuffle_commits: Default::default(),
             shuffle_ids: Default::default(),
+            shuffle_keys: Default::default(),
             next_shuffle_id: 0,
             application_registration: ApplicationRegistration::Pending,
             application_metrics: Default::default(),

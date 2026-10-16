@@ -37,8 +37,7 @@ and the Rust tests of the changed crates on its own.
   reproduced end to end (206,144 rows instead of 200,000) and is covered by an E2E test.
 - Map-range reads (`OpenStream` with start and end map indices) for one partition across
   all its split locations, with a `PartitionReadOptions` API in the client and the Python
-  binding. Readers fail clearly on DFS-backed partitions, which the native client does not
-  read (see "Blockers").
+  binding.
 - A shuffle is committed once. The selected attempt of every mapper (the first attempt
   of each to end) is fixed when the last mapper ends and is never revised, since a worker
   that has committed stops storing pushes for the shuffle. Workers commit concurrently,
@@ -46,11 +45,19 @@ and the Rust tests of the changed crates on its own.
   idempotently. If it keeps failing, the shuffle is lost: every `mapper_end` and every
   reader of it fails, so the query fails instead of returning partial data (open
   question 3 of the design).
+- Workers serve committed files on HDFS, S3 or OSS as streams without chunks, which would
+  read as empty. The commit response names the storage of every committed file, so a
+  shuffle with files on distributed storage is lost at commit time and the query fails
+  (see "Blockers").
 - The lifecycle manager reports the commit (selected attempts and result) to an observer
   before answering any `mapper_end` that waits for it. `mapper_end` calls made during the
   commit wait for its outcome, so no producer task succeeds before the commit is known.
 - The driver records the committed attempts per stage from a backend-neutral
-  `ShuffleCommitted` message. Task definitions pass them to remote shuffle service readers, and reading a shuffle whose commit failed fails the consumer task.
+  `ShuffleCommitted` message and keeps the first report. Task definitions pass them to
+  remote shuffle service readers as the most common attempt plus the partitions with
+  another one, so their size does not grow with the number of producer partitions.
+  Reading a shuffle whose commit failed, or whose commit is not known, fails the consumer
+  task.
 - A producer's output stays readable until every consumer region has succeeded (or the
   region also reruns the producer), so a retried consumer region never reads cleaned-up
   data.
@@ -130,7 +137,7 @@ All results are from the final tree unless noted.
 |---|---|
 | `cargo clippy --all-targets -- -D warnings` (changed crates) | clean, every layer |
 | `cargo +nightly fmt --check`, `hatch fmt --check` | clean |
-| `sail-execution` unit and property tests | 220 passed (layer 1: 144, layer 2: 161, layer 3: 207) |
+| `sail-execution` unit and property tests | 224 passed (layer 1: 148, layer 2: 165, layer 3: 211) |
 | `sail-celeborn` / `sail-common` / `sail-system-store` tests | 12 / 12 / 9 passed |
 | Celeborn client integration tests, Docker (`pysail.tests.celeborn`) | 21 passed |
 | Spark Celeborn tests, Docker (`test_shuffle_celeborn`, `test_adaptive_execution`) | 10 passed |
@@ -179,7 +186,9 @@ static plan already builds from the smaller side.
   asks whether map-range reads are planned (open question 9). Skew splitting requires
   map-range reads from the shuffle service; the Celeborn worker already serves them for a
   partition sorted by map id, so the native client supports them, filtered by the committed
-  attempts.
+  attempts. The first map-range read of a partition file makes the worker sort it by map
+  id (as for Spark's skew splits on Celeborn), so a split costs one sort of the skewed
+  partition on the worker.
 - **Statistics encoding.** The design keeps per-channel rows and one-byte log sizes with
   about 10% error. Per-channel rows were unused and doubled the volume, and one byte
   saturates above about 36 GB, so tasks report exact totals and two-byte sizes within 1%,
@@ -212,9 +221,10 @@ static plan already builds from the smaller side.
 
 ## Blockers and limitations
 
-- **DFS-backed Celeborn partitions** are not read by the native client (the worker returns
-  a full path instead of a stream). Readers fail clearly instead of returning partial data.
-  Celeborn's default local-disk storage is unaffected.
+- **Celeborn partitions on distributed storage** (HDFS, S3, OSS) are not read by the
+  native client. A shuffle with such files is lost at commit time, so the query fails
+  instead of returning partial data. Celeborn's default local-disk and memory storage is
+  unaffected.
 - **A lost shuffle fails the query.** Recomputing the producer stage under a new shuffle
   ID, as Spark does after a fetch failure on Celeborn, is not implemented.
 - **Per-layer Python tests.** The Python suites ran on the final tree. For the lower layers

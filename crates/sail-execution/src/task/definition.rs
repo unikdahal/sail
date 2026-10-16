@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
@@ -218,9 +219,7 @@ impl From<TaskInputLocator> for r#gen::TaskInputLocator {
                             mapper_end: read.mappers.as_ref().map(|x| x.end as u64),
                         })
                         .collect(),
-                    map_attempts: map_attempts.map(|x| r#gen::TaskInputMapAttempts {
-                        attempts: x.to_vec(),
-                    }),
+                    map_attempts: map_attempts.map(|x| encode_map_attempts(&x)),
                 },
             ),
         };
@@ -284,7 +283,7 @@ impl TryFrom<r#gen::TaskInputLocator> for TaskInputLocator {
                         })
                     })
                     .collect::<ExecutionResult<Vec<_>>>()?,
-                map_attempts: map_attempts.map(|x| Arc::from(x.attempts)),
+                map_attempts: map_attempts.map(decode_map_attempts).transpose()?,
             }),
             None => Err(ExecutionError::InvalidArgument(
                 "cannot decode empty task input locator".to_string(),
@@ -647,6 +646,85 @@ impl TaskOutput {
             TaskOutputDistribution::RoundRobinRow { channels } => {
                 Ok(ShufflePartitioning::RoundRobinRow(*channels))
             }
+        }
+    }
+}
+
+fn encode_map_attempts(attempts: &[i32]) -> r#gen::TaskInputMapAttempts {
+    let mut counts = HashMap::<i32, usize>::new();
+    for &attempt in attempts {
+        *counts.entry(attempt).or_default() += 1;
+    }
+    // The most common attempt, the smallest one among ties.
+    let attempt = counts
+        .into_iter()
+        .max_by_key(|&(attempt, count)| (count, std::cmp::Reverse(attempt)))
+        .map(|(attempt, _)| attempt)
+        .unwrap_or_default();
+    let (other_partitions, other_attempts) = attempts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &a)| a != attempt)
+        .map(|(p, &a)| (p as u32, a))
+        .unzip();
+    r#gen::TaskInputMapAttempts {
+        partitions: attempts.len() as u32,
+        attempt,
+        other_partitions,
+        other_attempts,
+    }
+}
+
+fn decode_map_attempts(value: r#gen::TaskInputMapAttempts) -> ExecutionResult<Arc<[i32]>> {
+    let r#gen::TaskInputMapAttempts {
+        partitions,
+        attempt,
+        other_partitions,
+        other_attempts,
+    } = value;
+    if other_partitions.len() != other_attempts.len()
+        || !other_partitions.is_sorted_by(|a, b| a < b)
+        || other_partitions.last().is_some_and(|&p| p >= partitions)
+    {
+        return Err(ExecutionError::InvalidArgument(
+            "invalid committed map attempts".to_string(),
+        ));
+    }
+    let mut attempts = vec![attempt; partitions as usize];
+    for (p, a) in other_partitions.into_iter().zip(other_attempts) {
+        attempts[p as usize] = a;
+    }
+    Ok(Arc::from(attempts))
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{decode_map_attempts, encode_map_attempts};
+
+    #[test]
+    fn uniform_map_attempts_are_encoded_without_a_list() {
+        let encoded = encode_map_attempts(&[0; 1000]);
+        assert_eq!((encoded.partitions, encoded.attempt), (1000, 0));
+        assert!(encoded.other_partitions.is_empty());
+    }
+
+    #[test]
+    fn invalid_map_attempts_are_rejected() {
+        let mut encoded = encode_map_attempts(&[0, 1, 0, 2]);
+        encoded.other_partitions.swap(0, 1);
+        assert!(decode_map_attempts(encoded).is_err());
+        let mut encoded = encode_map_attempts(&[0, 0, 1]);
+        encoded.partitions = 2;
+        assert!(decode_map_attempts(encoded).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn map_attempts_round_trip(attempts in prop::collection::vec(0..4_i32, 0..200)) {
+            let decoded = decode_map_attempts(encode_map_attempts(&attempts)).ok();
+            prop_assert_eq!(decoded.as_deref(), Some(attempts.as_slice()));
         }
     }
 }

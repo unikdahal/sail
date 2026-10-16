@@ -70,8 +70,16 @@ message TaskInputChannelList {
   optional uint64 mapper_end = 3;
 }
 
+// The committed attempt of every producer partition. Almost every partition usually
+// has the same attempt, so only the partitions with another attempt are listed.
 message TaskInputMapAttempts {
-  repeated int32 attempts = 1;
+  // The number of producer partitions.
+  uint32 partitions = 1;
+  // The attempt of every partition that is not listed below.
+  int32 attempt = 2;
+  // Partitions with another attempt, in increasing order, and their attempts.
+  repeated uint32 other_partitions = 3;
+  repeated int32 other_attempts = 4;
 }
 
 message TaskInputRemoteKey {

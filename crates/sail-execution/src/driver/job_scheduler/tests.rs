@@ -215,3 +215,24 @@ fn shuffle_commit_is_recorded_once() {
         })
     );
 }
+
+#[test]
+fn unknown_shuffle_commit_fails_the_consumer_definition() {
+    let mut job = job(aggregate_graph());
+    succeed(&mut job, 0, producer_statistics);
+    job.stages[0].commit = None;
+    let input = job.graph.stages()[1].inputs[0].clone();
+    let key = TaskKey {
+        job_id: JobId::from(1),
+        stage: 1,
+        partition: 0,
+        attempt: 0,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_input_locator(&job, &key, &input, &NoAssignments)
+    }));
+    assert!(
+        result.is_err(),
+        "reading without the committed attempts must fail"
+    );
+}

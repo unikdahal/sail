@@ -23,10 +23,35 @@ use crate::protocol::transport::{TransportConnection, TransportMessage};
 const WORKER_ENDPOINT_NAME: &str = "WorkerEndpoint";
 
 /// Metrics reported by a worker after committing shuffle files.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CommitMetrics {
     pub total_written: i64,
     pub file_count: i64,
+    /// Committed files that this client cannot read, as `(location ID, storage type)`.
+    /// Workers serve files on distributed storage without chunks and expect readers to
+    /// read them from the storage directly, which this client does not support.
+    pub unreadable_files: Vec<(String, &'static str)>,
+}
+
+/// Returns the committed files of a commit response that are on distributed storage.
+fn unreadable_files(response: &PbCommitFilesResponse) -> Vec<(String, &'static str)> {
+    let mut files = response
+        .committed_primary_storage_infos
+        .iter()
+        .chain(&response.committed_replica_storage_infos)
+        .filter_map(|(id, info)| {
+            // Celeborn's `StorageInfo.Type` codes.
+            let storage = match info.r#type {
+                3 => "HDFS",
+                4 => "OSS",
+                5 => "S3",
+                _ => return None,
+            };
+            Some((id.clone(), storage))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 /// A small async client for a Celeborn worker endpoint.
@@ -212,6 +237,7 @@ impl WorkerClient {
         Ok(CommitMetrics {
             total_written: response.total_written,
             file_count: i64::from(response.file_count),
+            unreadable_files: unreadable_files(&response),
         })
     }
 
@@ -254,16 +280,6 @@ impl WorkerClient {
             Ok(handler) => handler,
             Err(error) => return Box::pin(stream::once(async move { Err(error.into()) })),
         };
-        if !handler.full_path.is_empty() {
-            // Files on distributed storage are not served through chunk fetches. Reading
-            // them as an empty stream would silently lose data.
-            let path = handler.full_path;
-            return Box::pin(stream::once(async move {
-                Err(CelebornError::Protocol(format!(
-                    "reading Celeborn partition files from distributed storage is not supported: {path}"
-                )))
-            }));
-        }
         let client = self.clone();
         Box::pin(stream::try_unfold(
             (
@@ -622,6 +638,7 @@ mod tests {
 
     use super::{
         BatchFilter, WorkerClientOptions, WorkerClientPool, compress, decompress, take_batch,
+        unreadable_files,
     };
     use crate::common::{BatchHeader, CompressionCodec, PartitionLocation, PartitionReadOptions};
 
@@ -774,5 +791,29 @@ mod tests {
         let decoded = decompress(encoded, CompressionCodec::Lz4).unwrap();
         assert_eq!(decoded, data);
         assert_eq!(decoded.as_ptr(), expected_data.as_ptr());
+    }
+
+    #[test]
+    fn files_on_distributed_storage_are_unreadable() {
+        use crate::protocol::proto::{PbCommitFilesResponse, PbStorageInfo};
+
+        let info = |r#type| PbStorageInfo {
+            r#type,
+            ..Default::default()
+        };
+        let response = PbCommitFilesResponse {
+            committed_primary_storage_infos: [
+                ("0-0".to_string(), info(1)),
+                ("1-0".to_string(), info(3)),
+                ("2-0".to_string(), info(0)),
+            ]
+            .into(),
+            committed_replica_storage_infos: [("3-0".to_string(), info(5))].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unreadable_files(&response),
+            vec![("1-0".to_string(), "HDFS"), ("3-0".to_string(), "S3")]
+        );
     }
 }

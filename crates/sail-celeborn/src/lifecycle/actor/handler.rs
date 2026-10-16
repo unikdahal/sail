@@ -8,9 +8,7 @@ use crate::common::{
 };
 use crate::error::{CelebornError, CelebornResult};
 use crate::lifecycle::actor::{LifecycleManagerActor, ShuffleCommitState, ShuffleKey};
-use crate::lifecycle::{
-    LifecycleManagerMessage, ReviveRequest, ShuffleCommitReport, resolve_shuffle_key,
-};
+use crate::lifecycle::{LifecycleManagerMessage, ReviveRequest, ShuffleCommitReport};
 use crate::protocol::StatusCode;
 use crate::worker::WorkerClientOptions;
 
@@ -72,6 +70,7 @@ impl LifecycleManagerActor {
                 Some(next) => {
                     self.next_shuffle_id = next;
                     self.shuffle_ids.insert(key, next);
+                    self.shuffle_keys.insert(next, key);
                     Ok(next)
                 }
                 None => Err(CelebornError::Application(
@@ -521,14 +520,25 @@ impl LifecycleManagerActor {
                     }
                 })
             });
-            let result = try_join_all(commits).await.map(|commits| {
+            let result = try_join_all(commits).await.and_then(|commits| {
                 let mut metrics = ApplicationMetrics::default();
+                let mut unreadable = vec![];
                 for commit in commits {
                     metrics.total_written =
                         metrics.total_written.saturating_add(commit.total_written);
                     metrics.file_count = metrics.file_count.saturating_add(commit.file_count);
+                    unreadable.extend(commit.unreadable_files);
                 }
-                metrics
+                // A commit is final, so a shuffle with files that cannot be read is lost.
+                // Reading them would return no data instead of failing.
+                match unreadable.first() {
+                    None => Ok(metrics),
+                    Some((id, storage)) => Err(CelebornError::Application(format!(
+                        "{} committed partition files are on distributed storage, which is \
+                         not supported (for example, location {id} on {storage})",
+                        unreadable.len()
+                    ))),
+                }
             });
             let _ = handle
                 .send(LifecycleManagerMessage::CommitComplete { shuffle_id, result })
@@ -570,7 +580,7 @@ impl LifecycleManagerActor {
             }
         };
         let report = self.options.commit_observer.as_ref().and_then(|observer| {
-            match resolve_shuffle_key(&self.shuffle_ids, shuffle_id) {
+            match self.shuffle_keys.get(&shuffle_id) {
                 Some(key) => Some((
                     observer.clone(),
                     ShuffleCommitReport {
@@ -637,7 +647,9 @@ impl LifecycleManagerActor {
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
         if result.is_ok() {
-            self.shuffle_ids.retain(|_, id| *id != shuffle_id);
+            if let Some(key) = self.shuffle_keys.remove(&shuffle_id) {
+                self.shuffle_ids.remove(&key);
+            }
             self.registered_shuffles.remove(&shuffle_id);
             self.reservations.remove(&shuffle_id);
             self.shuffle_commits.remove(&shuffle_id);

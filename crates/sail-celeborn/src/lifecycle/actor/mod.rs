@@ -79,6 +79,7 @@ pub struct LifecycleManagerActor {
     pending_revives: HashMap<(i32, i32), Vec<oneshot::Sender<CelebornResult<PartitionLocation>>>>,
     shuffle_commits: HashMap<i32, ShuffleCommitState>,
     shuffle_ids: HashMap<ShuffleKey, i32>,
+    shuffle_keys: HashMap<i32, ShuffleKey>,
     next_shuffle_id: i32,
     application_registration: ApplicationRegistration,
     application_metrics: ApplicationMetrics,

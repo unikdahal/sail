@@ -1245,7 +1245,14 @@ impl<'a> TaskInputBuilder<'a> {
                 self.key.job_id, self.input.stage
             ))),
             // A producer without partitions never commits a shuffle.
-            None => Ok(None),
+            None if self.job.stages[self.input.stage].tasks.is_empty() => Ok(None),
+            // The commit is reported before any producer task succeeds, so it is known
+            // whenever a consumer runs. Reading without it would not skip the output of
+            // attempts that the shuffle service did not commit.
+            None => Err(ExecutionError::InternalError(format!(
+                "job {} stage {} shuffle commit is not known",
+                self.key.job_id, self.input.stage
+            ))),
         }
     }
 
