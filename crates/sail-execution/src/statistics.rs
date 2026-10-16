@@ -331,6 +331,25 @@ impl ChannelSizes {
         }
     }
 
+    /// Returns the approximate size of a channel, or zero for a channel out of range.
+    pub fn get(&self, channel: usize) -> u64 {
+        match self {
+            Self::Dense(codes) => codes.get(channel).map_or(0, |&x| decode_size(x)),
+            Self::Sparse(sparse) => {
+                if !sparse.is_nonempty(channel) {
+                    return 0;
+                }
+                match sparse
+                    .huge
+                    .binary_search_by_key(&channel, |&(c, _)| c as usize)
+                {
+                    Ok(i) => decode_size(sparse.huge[i].1),
+                    Err(_) => sparse.average,
+                }
+            }
+        }
+    }
+
     /// Adds the approximate size of every channel to `totals`, which has one entry
     /// per channel.
     pub fn add_to(&self, totals: &mut [u64]) {
@@ -503,6 +522,14 @@ impl TaskOutputStatistics {
                 .channel_physical_bytes
                 .as_ref()
                 .map_or(0, |x| x.encoded_bytes())
+    }
+
+    pub fn physical_bytes_of(&self, channel: usize) -> Option<u64> {
+        self.channel_physical_bytes.as_ref().map(|x| x.get(channel))
+    }
+
+    pub fn logical_bytes_of(&self, channel: usize) -> u64 {
+        self.channel_logical_bytes.get(channel)
     }
 }
 
@@ -772,6 +799,7 @@ mod tests {
             let mut totals = vec![0; sizes.len()];
             encoded.add_to(&mut totals);
             for (c, &size) in sizes.iter().enumerate() {
+                prop_assert_eq!(totals[c], encoded.get(c));
                 prop_assert_eq!(totals[c] == 0, size == 0);
                 if matches!(encoded, ChannelSizes::Dense(_)) {
                     prop_assert!(within_one_percent(totals[c], size));
@@ -795,11 +823,9 @@ mod tests {
         let encoded = ChannelSizes::encode(&sizes);
         assert!(matches!(encoded, ChannelSizes::Sparse(_)));
         assert!(encoded.encoded_bytes() < 10_000 / 8 + 64);
-        let mut totals = vec![0; sizes.len()];
-        encoded.add_to(&mut totals);
-        assert!(within_one_percent(totals[42], 1 << 33));
-        assert_eq!(totals[1], 0);
-        assert!((100..=107).contains(&totals[3]));
+        assert!(within_one_percent(encoded.get(42), 1 << 33));
+        assert_eq!(encoded.get(1), 0);
+        assert!((100..=107).contains(&encoded.get(3)));
     }
 
     #[test]

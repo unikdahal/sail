@@ -249,26 +249,50 @@ impl fmt::Display for AdaptiveInput {
     }
 }
 
-/// A contiguous range of whole buckets.
+/// A contiguous range of buckets, or a part of one bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketSlice {
     pub buckets: Range<usize>,
+    /// A part of a single bucket, used by skew splits. Whole buckets have none.
+    pub part: Option<SubRange>,
 }
 
 impl BucketSlice {
     pub fn whole(buckets: Range<usize>) -> Self {
-        Self { buckets }
+        Self {
+            buckets,
+            part: None,
+        }
+    }
+
+    pub fn producers(bucket: usize, producers: Range<usize>) -> Self {
+        Self {
+            buckets: bucket..bucket + 1,
+            part: Some(SubRange::Producers(producers)),
+        }
     }
 }
 
 impl fmt::Display for BucketSlice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.buckets.len() == 1 {
-            write!(f, "{}", self.buckets.start)
+            write!(f, "{}", self.buckets.start)?;
         } else {
-            write!(f, "{}..{}", self.buckets.start, self.buckets.end)
+            write!(f, "{}..{}", self.buckets.start, self.buckets.end)?;
+        }
+        match &self.part {
+            None => Ok(()),
+            Some(SubRange::Producers(r)) => write!(f, "@producers({}..{})", r.start, r.end),
         }
     }
+}
+
+/// A part of a single bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubRange {
+    /// The output of a range of producer partitions (`Direct` layout), read with a
+    /// map-range read from the shuffle service.
+    Producers(Range<usize>),
 }
 
 /// The partitioning property an adaptive input actually provides.
@@ -284,6 +308,9 @@ pub enum AdaptiveProperty {
         from: usize,
         boundaries: Vec<usize>,
     },
+    /// No partitioning property is provided, e.g. after a skew split, where a bucket
+    /// is split across partitions or read by several partitions.
+    Unknown,
 }
 
 impl fmt::Display for AdaptiveProperty {
@@ -294,6 +321,7 @@ impl fmt::Display for AdaptiveProperty {
                 "CoalescedHash(from={from}, partitions={})",
                 boundaries.len().saturating_sub(1)
             ),
+            AdaptiveProperty::Unknown => write!(f, "Unknown"),
         }
     }
 }

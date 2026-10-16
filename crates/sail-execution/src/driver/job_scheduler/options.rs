@@ -16,6 +16,9 @@ pub struct AdaptiveOptions {
     pub coalesce_max_logical_size: u64,
     pub join_enabled: bool,
     pub join_max_build_partition_size: u64,
+    pub skew_enabled: bool,
+    pub skew_factor: f64,
+    pub skew_threshold: u64,
 }
 
 impl Default for AdaptiveOptions {
@@ -29,6 +32,9 @@ impl Default for AdaptiveOptions {
             coalesce_max_logical_size: 256 * 1024 * 1024,
             join_enabled: true,
             join_max_build_partition_size: 64 * 1024 * 1024,
+            skew_enabled: true,
+            skew_factor: 5.0,
+            skew_threshold: 256 * 1024 * 1024,
         }
     }
 }

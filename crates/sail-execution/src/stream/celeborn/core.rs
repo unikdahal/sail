@@ -18,6 +18,7 @@ use crate::stream::writer::{
     MultiChannelTaskStreamSink, ShuffleServiceOutput, TaskStreamChannelCommit,
     TaskStreamChannelSink, TaskStreamSink, TaskStreamWriteState,
 };
+use crate::task::definition::ShuffleServiceRead;
 
 /// The largest number of shuffle partitions that one task reads at a time.
 const MAX_CONCURRENT_PARTITION_READS: usize = 8;
@@ -128,12 +129,30 @@ impl CelebornStreamManager {
         &self,
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
         map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
+        let ShuffleServiceRead { channels, mappers } = read;
+        let map_range = mappers
+            .map(|range| {
+                Ok::<_, DataFusionError>(
+                    i32::try_from(range.start)
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?
+                        ..i32::try_from(range.end)
+                            .map_err(|error| DataFusionError::External(Box::new(error)))?,
+                )
+            })
+            .transpose()?;
+        if map_range.is_some() && map_attempts.is_none() {
+            // A partial read is planned only from committed statistics, so the commit
+            // must be known. Without it, a range could include output of failed attempts.
+            return Err(DataFusionError::Internal(
+                "a Celeborn map-range read requires the committed map attempts".to_string(),
+            ));
+        }
         let options = PartitionReadOptions {
-            map_range: None,
+            map_range,
             map_attempts,
         };
         let shuffle_id = self

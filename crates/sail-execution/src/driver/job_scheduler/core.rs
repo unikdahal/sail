@@ -25,7 +25,7 @@ use crate::driver::output::{JobOutputOutcome, build_job_output};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey};
 use crate::job_graph::{
-    InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, TaskPlacement,
+    InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, SubRange, TaskPlacement,
 };
 use crate::proto::{
     encode_remote_partitioning, encode_remote_physical_expr, encode_remote_physical_plan,
@@ -33,8 +33,8 @@ use crate::proto::{
 use crate::shuffle::ShuffleBackendKind;
 use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 use crate::task::definition::{
-    TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
-    TaskOutputLocator,
+    ShuffleServiceRead, TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput,
+    TaskOutputDistribution, TaskOutputLocator,
 };
 use crate::task::scheduling::{
     TaskAssignment, TaskAssignmentGetter, TaskOutputKind, TaskRegion, TaskSet, TaskSetEntry,
@@ -1170,32 +1170,48 @@ impl<'a> TaskInputBuilder<'a> {
         let input_channels = self.producer.distribution.channels();
         let output_partitions = self.consumer.plan.output_partitioning().partition_count();
         let map_attempts = self.committed_map_attempts()?;
-        let channels = if let Some(adaptive) = &self.input.adaptive {
-            // Partition `i` of this input's own domain reads the buckets of its spec entry.
+        let reads = if let Some(adaptive) = &self.input.adaptive {
+            // Partition `i` of this input's own domain reads the bucket slices of its
+            // spec entry: whole channels, or one channel restricted to a range of
+            // producer partitions for a skew split.
             adaptive
                 .spec
                 .iter()
                 .map(|slices| {
-                    let mut channels = vec![];
+                    let mut read = ShuffleServiceRead::channels(vec![]);
                     for slice in slices {
                         if slice.buckets.end > input_channels {
                             return Err(ExecutionError::InternalError(format!(
                                 "invalid shuffle service bucket slice {slice} for {input_channels} channels"
                             )));
                         }
-                        channels.extend(slice.buckets.clone());
+                        read.channels.extend(slice.buckets.clone());
+                        if let Some(SubRange::Producers(mappers)) = &slice.part {
+                            if slices.len() != 1 || slice.buckets.len() != 1 {
+                                return Err(ExecutionError::InternalError(format!(
+                                    "a partial bucket must be read alone: {slice}"
+                                )));
+                            }
+                            read.mappers = Some(mappers.clone());
+                        }
                     }
-                    Ok(channels)
+                    if read.mappers.is_some() && map_attempts.is_none() {
+                        return Err(ExecutionError::InternalError(
+                            "a partial bucket read requires the committed map attempts"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(read)
                 })
                 .collect::<ExecutionResult<Vec<_>>>()?
         } else {
             match self.input.mode {
                 InputMode::Shuffle => (0..output_partitions)
-                    .map(|partition| vec![partition])
+                    .map(|partition| ShuffleServiceRead::channels(vec![partition]))
                     .collect(),
                 InputMode::Broadcast => {
                     let channels = (0..input_channels).collect::<Vec<_>>();
-                    vec![channels; output_partitions]
+                    vec![ShuffleServiceRead::channels(channels); output_partitions]
                 }
                 mode => {
                     return Err(ExecutionError::InvalidArgument(format!(
@@ -1205,7 +1221,7 @@ impl<'a> TaskInputBuilder<'a> {
             }
         };
         Ok(TaskInputLocator::ShuffleService {
-            channels,
+            reads,
             map_attempts,
         })
     }
