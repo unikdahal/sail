@@ -40,7 +40,53 @@ message ReportTaskStatusRequest {
   optional string message = 7;
   // An optional JSON string that contains the cause of the task failure.
   optional string cause = 8;
+  // Committed output statistics, sent only with a SUCCEEDED status after the
+  // shuffle sink committed the output.
+  optional TaskOutputStatistics output_statistics = 9;
   uint64 sequence = 101;
+}
+
+// Committed shuffle output statistics of one task attempt.
+// Totals are exact, while per-channel sizes use a compact encoding.
+message TaskOutputStatistics {
+  // Rows accepted by the sink.
+  uint64 rows = 1;
+  // Uncompressed Arrow bytes the accepted batches reference.
+  uint64 logical_bytes = 2;
+  // Bytes the backend stores after its own compression.
+  // Absent when the backend cannot tell.
+  optional uint64 physical_bytes = 3;
+  ChannelSizes channel_logical_bytes = 4;
+  // Absent when the backend cannot tell.
+  optional ChannelSizes channel_physical_bytes = 5;
+}
+
+// Approximate per-channel sizes. A size is encoded as a 16-bit code: 0 for an
+// empty channel, otherwise 1 + ceil(log_1.01(size)), so that a decoded size is
+// within 1% of the true size.
+message ChannelSizes {
+  oneof kind {
+    DenseChannelSizes dense = 1;
+    SparseChannelSizes sparse = 2;
+  }
+}
+
+message DenseChannelSizes {
+  // One little-endian 16-bit code per channel.
+  bytes codes = 1;
+}
+
+// Sizes of many channels: which channels are empty, the channels much larger than
+// the average with their own codes, and one average size for the other channels.
+message SparseChannelSizes {
+  uint64 channels = 1;
+  // A bitmap of the nonempty channels, least significant bit first.
+  bytes nonempty = 2;
+  uint64 average = 3;
+  // The channels with their own codes, in ascending order.
+  repeated uint32 huge_channels = 4;
+  // One little-endian 16-bit code per entry of `huge_channels`.
+  bytes huge_codes = 5;
 }
 
 enum TaskStatus {

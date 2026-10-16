@@ -8,7 +8,7 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use indexmap::{IndexMap, IndexSet};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use sail_common::actor::ActorContext;
 use sail_common_datafusion::error::CommonErrorCause;
 use sail_python_udf::error::PyErrExtractor;
@@ -31,6 +31,7 @@ use crate::proto::{
     encode_remote_partitioning, encode_remote_physical_expr, encode_remote_physical_plan,
 };
 use crate::shuffle::ShuffleBackendKind;
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 use crate::task::definition::{
     TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
     TaskOutputLocator,
@@ -110,23 +111,65 @@ impl JobScheduler {
         state: TaskState,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        statistics: Option<TaskOutputStatistics>,
     ) {
         let event_reporter = self.event_reporter.clone();
         let session_id = self.options.session_id.clone();
-        let Some(attempt) = self
-            .jobs
-            .get_mut(&key.job_id)
-            .and_then(|job| job.stages.get_mut(key.stage))
-            .and_then(|stage| stage.tasks.get_mut(key.partition))
-            .and_then(|task| task.attempts.get_mut(key.attempt))
-        else {
+        let Some(job) = self.jobs.get_mut(&key.job_id) else {
             warn!("{} not found", TaskKeyDisplay(key));
             return;
         };
+        // Only blocking outputs have a committed form that later stages can rely on.
+        let channels = job
+            .graph
+            .stages()
+            .get(key.stage)
+            .filter(|stage| matches!(stage.mode, OutputMode::Blocking))
+            .map(|stage| stage.distribution.channels());
+        let Some((stage, attempt)) = job.stages.get_mut(key.stage).and_then(|stage| {
+            let attempt = stage
+                .tasks
+                .get_mut(key.partition)
+                .and_then(|task| task.attempts.get_mut(key.attempt))?;
+            Some((&mut stage.retained_statistics_bytes, attempt))
+        }) else {
+            warn!("{} not found", TaskKeyDisplay(key));
+            return;
+        };
+        let previous = attempt.state;
         attempt.state = attempt.state.consolidate(state);
         attempt.messages.extend(message);
         if let Some(cause) = cause {
             attempt.cause = Some(cause);
+        }
+        // Statistics are bound to the attempt that reported them, and are kept only
+        // when this report is the one that moved the attempt to the succeeded state.
+        if let Some(statistics) = statistics
+            && !previous.is_terminal()
+            && matches!(attempt.state, TaskState::Succeeded)
+        {
+            if channels.is_none() {
+                // Statistics of pipelined outputs are not used.
+            } else if Some(statistics.channels()) == channels {
+                // Statistics are retained in the form they are reported in.
+                let bytes = statistics.retained_bytes() as u64;
+                job.adaptive.statistics_payload_bytes =
+                    job.adaptive.statistics_payload_bytes.saturating_add(bytes);
+                *stage = stage.saturating_add(bytes);
+                job.adaptive.retained_statistics_bytes =
+                    job.adaptive.retained_statistics_bytes.saturating_add(bytes);
+                job.adaptive.peak_retained_statistics_bytes = job
+                    .adaptive
+                    .peak_retained_statistics_bytes
+                    .max(job.adaptive.retained_statistics_bytes);
+                attempt.statistics = Some(Arc::new(statistics));
+            } else {
+                warn!(
+                    "{} reported statistics for {} channels, expected {channels:?}",
+                    TaskKeyDisplay(key),
+                    statistics.channels()
+                );
+            }
         }
         event_reporter.report(SystemEvent::TaskUpdated {
             session_id,
@@ -197,6 +240,7 @@ impl JobScheduler {
             &event_reporter,
             &session_id,
         ));
+        Self::report_stage_statistics(job_id, job, &event_reporter, &session_id);
 
         if job
             .regions
@@ -234,8 +278,10 @@ impl JobScheduler {
                 status: job.state.status().to_string(),
                 updated_at: Utc::now(),
             });
+            Self::log_statistics_metrics(job_id, job, &self.options);
             return actions;
         }
+        Self::release_statistics(job);
 
         actions.extend(Self::schedule_task_regions(
             job_id,
@@ -448,6 +494,7 @@ impl JobScheduler {
                     messages: vec![],
                     cause: None,
                     job_output_fetched: false,
+                    statistics: None,
                 });
                 event_reporter.report(SystemEvent::TaskCreated {
                     session_id: session_id.to_string(),
@@ -705,7 +752,10 @@ impl JobScheduler {
             .iter()
             .map(|input| TaskInputBuilder::try_new(job, key, input, assignments)?.build())
             .collect::<ExecutionResult<Vec<_>>>()?;
-        let output = TaskOutputBuilder::new(job, key, stage, self.codec.as_ref()).build()?;
+        let collect_statistics = Self::collects_statistics(&self.options, job);
+        let output =
+            TaskOutputBuilder::new(job, key, stage, self.codec.as_ref(), collect_statistics)
+                .build()?;
         let definition = TaskDefinition {
             plan: Arc::from(plan),
             inputs,
@@ -767,6 +817,13 @@ impl JobScheduler {
         }
     }
 
+    /// Whether the blocking outputs of a job count their committed statistics.
+    /// Only adaptive execution reads them, and only on a remote shuffle service, so
+    /// execution without it does not pay for counting.
+    pub(super) fn collects_statistics(options: &JobSchedulerOptions, job: &JobDescriptor) -> bool {
+        options.adaptive.enabled && job.graph.shuffle_backend().is_remote_shuffle_service()
+    }
+
     /// Records the output that the remote shuffle service committed for a stage.
     /// A shuffle is committed once, successfully or not, and the commit never changes.
     pub fn record_shuffle_commit(
@@ -818,6 +875,157 @@ impl JobScheduler {
         };
         debug!("job {job_id} stage {stage} shuffle commit: {commit:?}");
         descriptor.commit = Some(commit);
+    }
+
+    /// Returns the attempt whose output the shuffle backend committed, for each
+    /// partition of a blocking stage, or `None` if the committed output is not known.
+    /// Statistics are collected only on a remote shuffle service, which reports the
+    /// committed attempt of each map task. It need not be the scheduler's latest
+    /// successful attempt (Celeborn keeps the first attempt that reached `mapper_end`).
+    pub(super) fn committed_attempts(job: &JobDescriptor, stage: usize) -> Option<&[usize]> {
+        if !matches!(job.graph.stages().get(stage)?.mode, OutputMode::Blocking)
+            || !job.graph.shuffle_backend().is_remote_shuffle_service()
+        {
+            return None;
+        }
+        job.stages[stage]
+            .commit
+            .as_ref()
+            .filter(|commit| commit.succeeded)
+            .map(|commit| commit.attempts.as_slice())
+    }
+
+    /// Returns the statistics of the committed attempt of each partition of a stage,
+    /// or `None` if the committed output is not known or any attempt lacks statistics.
+    pub(super) fn committed_attempt_statistics(
+        job: &JobDescriptor,
+        stage: usize,
+    ) -> Option<Vec<Arc<TaskOutputStatistics>>> {
+        Self::committed_attempts(job, stage)?
+            .iter()
+            .enumerate()
+            .map(|(p, &a)| {
+                job.stages[stage]
+                    .tasks
+                    .get(p)?
+                    .attempts
+                    .get(a)?
+                    .statistics
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Returns the statistics of the committed attempts of a stage folded per bucket,
+    /// or `None` if they are not all known. The fold is cached for the stage.
+    pub(super) fn committed_statistics(
+        job: &mut JobDescriptor,
+        stage: usize,
+    ) -> Option<Arc<ShuffleStatistics>> {
+        if let Some(statistics) = &job.stages.get(stage)?.shuffle_statistics {
+            return Some(statistics.clone());
+        }
+        let attempts = Self::committed_attempt_statistics(job, stage)?;
+        let channels = job.graph.stages()[stage].distribution.channels();
+        let statistics = ShuffleStatistics::fold(channels, attempts.iter().map(|x| x.as_ref()))
+            .inspect_err(|e| warn!("failed to fold statistics of stage {stage}: {e}"))
+            .ok()
+            .map(Arc::new)?;
+        let bytes = statistics.retained_bytes() as u64;
+        job.stages[stage].retained_statistics_bytes = job.stages[stage]
+            .retained_statistics_bytes
+            .saturating_add(bytes);
+        job.adaptive.retained_statistics_bytes =
+            job.adaptive.retained_statistics_bytes.saturating_add(bytes);
+        job.adaptive.peak_retained_statistics_bytes = job
+            .adaptive
+            .peak_retained_statistics_bytes
+            .max(job.adaptive.retained_statistics_bytes);
+        job.stages[stage].shuffle_statistics = Some(statistics.clone());
+        Some(statistics)
+    }
+
+    fn report_stage_statistics(
+        job_id: JobId,
+        job: &mut JobDescriptor,
+        event_reporter: &SystemEventReporter,
+        session_id: &str,
+    ) {
+        for s in 0..job.stages.len() {
+            if job.stages[s].statistics_reported {
+                continue;
+            }
+            let Some(attempts) = Self::committed_attempts(job, s) else {
+                continue;
+            };
+            let all_reported = attempts.iter().enumerate().all(|(p, &a)| {
+                let attempt = &job.stages[s].tasks[p].attempts[a];
+                attempt.statistics.is_some() || attempt.state.is_terminal()
+            });
+            if !all_reported {
+                continue;
+            }
+            job.stages[s].statistics_reported = true;
+            let Some(statistics) = Self::committed_statistics(job, s) else {
+                debug!("job {job_id} stage {s} has committed output without statistics");
+                continue;
+            };
+            let (max, median) = statistics.max_and_median_bucket_bytes();
+            debug!(
+                "job {job_id} stage {s} committed {} rows, {:?} physical bytes, {} logical bytes, max bucket {max} bytes, median bucket {median} bytes",
+                statistics.total_rows,
+                statistics.total_physical_bytes,
+                statistics.total_logical_bytes
+            );
+            event_reporter.report(SystemEvent::StageStatisticsReported {
+                session_id: session_id.to_string(),
+                job_id: u64::from(job_id),
+                stage: s as u64,
+                rows: statistics.total_rows,
+                physical_bytes: statistics.total_physical_bytes,
+                logical_bytes: statistics.total_logical_bytes,
+                max_partition_bytes: max,
+                median_partition_bytes: median,
+                reported_at: Utc::now(),
+            });
+        }
+    }
+
+    /// Releases the statistics of every stage whose statistics have been reported.
+    fn release_statistics(job: &mut JobDescriptor) {
+        if job.adaptive.retained_statistics_bytes == 0 {
+            return;
+        }
+        for s in 0..job.stages.len() {
+            if job.stages[s].retained_statistics_bytes == 0 {
+                continue;
+            }
+            let finished = job.stages[s].statistics_reported
+                || matches!(job.stages[s].state, StageState::Inactive);
+            if finished {
+                for task in &mut job.stages[s].tasks {
+                    for attempt in &mut task.attempts {
+                        attempt.statistics = None;
+                    }
+                }
+                job.stages[s].shuffle_statistics = None;
+                job.adaptive.retained_statistics_bytes = job
+                    .adaptive
+                    .retained_statistics_bytes
+                    .saturating_sub(job.stages[s].retained_statistics_bytes);
+                job.stages[s].retained_statistics_bytes = 0;
+            }
+        }
+    }
+
+    fn log_statistics_metrics(job_id: JobId, job: &JobDescriptor, options: &JobSchedulerOptions) {
+        if !Self::collects_statistics(options, job) {
+            return;
+        }
+        info!(
+            "job {job_id} statistics: {} bytes received, peak {} bytes retained",
+            job.adaptive.statistics_payload_bytes, job.adaptive.peak_retained_statistics_bytes
+        );
     }
 
     fn get_latest_task_attempt(
@@ -1121,6 +1329,7 @@ struct TaskOutputBuilder<'a> {
     key: &'a TaskKey,
     stage: &'a Stage,
     codec: &'a dyn PhysicalExtensionCodec,
+    collect_statistics: bool,
 }
 
 impl<'a> TaskOutputBuilder<'a> {
@@ -1129,12 +1338,14 @@ impl<'a> TaskOutputBuilder<'a> {
         key: &'a TaskKey,
         stage: &'a Stage,
         codec: &'a dyn PhysicalExtensionCodec,
+        collect_statistics: bool,
     ) -> Self {
         Self {
             job,
             key,
             stage,
             codec,
+            collect_statistics,
         }
     }
 
@@ -1179,7 +1390,9 @@ impl<'a> TaskOutputBuilder<'a> {
             OutputMode::Pipelined => TaskOutputLocator::Pipelined {
                 replicas: self.job.graph.replicas(self.key.stage),
             },
-            OutputMode::Blocking => TaskOutputLocator::Blocking,
+            OutputMode::Blocking => TaskOutputLocator::Blocking {
+                collect_statistics: self.collect_statistics,
+            },
         };
         Ok(TaskOutput {
             distribution,
@@ -1309,6 +1522,7 @@ mod tests {
             messages: vec![],
             cause: None,
             job_output_fetched: false,
+            statistics: None,
         };
         for stage in &mut job.stages {
             for task in &mut stage.tasks {

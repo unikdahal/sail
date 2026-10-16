@@ -8,6 +8,7 @@ use crate::driver::job_scheduler::topology::JobTopology;
 use crate::driver::output::{JobOutputManager, JobOutputOutcome};
 use crate::error::ExecutionResult;
 use crate::job_graph::JobGraph;
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 
 /// Tracks graph/topology and runtime state for a single job.
 pub struct JobDescriptor {
@@ -17,6 +18,18 @@ pub struct JobDescriptor {
     pub stages: Vec<StageDescriptor>,
     pub regions: Vec<TaskRegionDescriptor>,
     pub state: JobState,
+    pub adaptive: AdaptiveMetrics,
+}
+
+/// Overhead of adaptive query execution for one job.
+#[derive(Debug, Default)]
+pub struct AdaptiveMetrics {
+    /// Bytes of compact statistics received with task reports.
+    pub statistics_payload_bytes: u64,
+    /// The number of bytes currently retained for statistics.
+    pub retained_statistics_bytes: u64,
+    /// The largest number of bytes retained for statistics at any time.
+    pub peak_retained_statistics_bytes: u64,
 }
 
 pub enum JobState {
@@ -64,6 +77,9 @@ impl JobDescriptor {
                 tasks: vec![],
                 state: StageState::Active,
                 commit: None,
+                statistics_reported: false,
+                retained_statistics_bytes: 0,
+                shuffle_statistics: None,
             };
             for _ in 0..stage.plan.output_partitioning().partition_count() {
                 descriptor.tasks.push(TaskDescriptor { attempts: vec![] });
@@ -83,6 +99,7 @@ impl JobDescriptor {
             stages,
             regions,
             state,
+            adaptive: AdaptiveMetrics::default(),
         })
     }
 }
@@ -96,6 +113,14 @@ pub struct StageDescriptor {
     /// the backend itself. This is set only for backends whose committed attempt can
     /// differ from the scheduler's latest successful attempt (remote shuffle services).
     pub commit: Option<ShuffleCommit>,
+    /// Whether the committed output statistics of the stage have been reported.
+    pub statistics_reported: bool,
+    /// The number of bytes retained for the statistics of the stage's attempts.
+    pub retained_statistics_bytes: u64,
+    /// The statistics of the committed attempts folded per bucket, cached so that
+    /// they are folded once. Cleared when the commit changes or the statistics
+    /// are released.
+    pub shuffle_statistics: Option<Arc<ShuffleStatistics>>,
 }
 
 /// The output that a shuffle backend committed for a stage.
@@ -103,8 +128,8 @@ pub struct StageDescriptor {
 pub struct ShuffleCommit {
     /// The attempt whose output the backend serves, for each producer partition.
     pub attempts: Vec<usize>,
-    /// Whether the global commit succeeded. The output of a failed commit is lost,
-    /// and reading it fails.
+    /// Whether the global commit succeeded. The output of a failed commit is lost:
+    /// reading it fails, and it is never used for adaptive decisions.
     pub succeeded: bool,
 }
 
@@ -153,6 +178,9 @@ pub struct TaskAttemptDescriptor {
     /// This will always be false if the task does not belong to
     /// the final stages of the job.
     pub job_output_fetched: bool,
+    /// The committed output statistics reported with the succeeded status.
+    /// They are released once they have been reported.
+    pub statistics: Option<Arc<TaskOutputStatistics>>,
 }
 
 #[derive(Debug, Clone, Copy)]

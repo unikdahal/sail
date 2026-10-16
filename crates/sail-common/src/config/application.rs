@@ -226,8 +226,15 @@ pub struct ClusterConfig {
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout_secs: u64,
     pub task_max_attempts: usize,
+    pub adaptive: ClusterAdaptiveConfig,
     pub rpc_retry_strategy: RetryStrategy,
     pub shuffle_backend: ShuffleBackend,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1067,7 +1074,15 @@ impl ClusterConfigEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::CelebornCompressionCodec;
+    use super::{AppConfig, CelebornCompressionCodec};
+
+    #[test]
+    fn loads_adaptive_execution_defaults() -> Result<(), String> {
+        let config = AppConfig::load().map_err(|e| e.to_string())?;
+        let adaptive = &config.cluster.adaptive;
+        assert!(!adaptive.enabled);
+        Ok(())
+    }
 
     #[test]
     fn parses_celeborn_compression() {

@@ -59,6 +59,25 @@ pub enum SystemEvent {
         status: String,
         updated_at: DateTime<Utc>,
     },
+    StageStatisticsReported {
+        session_id: String,
+        job_id: u64,
+        stage: u64,
+        /// Committed rows across all output channels.
+        rows: u64,
+        /// Committed physical (backend-stored, compressed) bytes;
+        /// `None` when the backend cannot tell.
+        physical_bytes: Option<u64>,
+        /// Committed logical (uncompressed Arrow) bytes.
+        logical_bytes: u64,
+        /// Largest output-channel (bucket) size in physical bytes when known,
+        /// otherwise logical bytes.
+        max_partition_bytes: u64,
+        /// Median output-channel (bucket) size in physical bytes when known,
+        /// otherwise logical bytes.
+        median_partition_bytes: u64,
+        reported_at: DateTime<Utc>,
+    },
     TaskCreated {
         session_id: String,
         job_id: u64,

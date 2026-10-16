@@ -10,7 +10,7 @@ use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::stream::error::TaskStreamResult;
 use crate::stream::reader::TaskStreamSource;
-use crate::stream::writer::{TaskStreamChannelSink, TaskStreamWriteState};
+use crate::stream::writer::{TaskStreamChannelCommit, TaskStreamChannelSink, TaskStreamWriteState};
 
 /// A memory stream that can be read multiple times.
 /// It maintains multiple replicas of the stream internally.
@@ -139,7 +139,7 @@ impl TaskStreamChannelSink for MemoryStreamReplicaSender {
         })
     }
 
-    async fn commit(self: Box<Self>) -> Result<()> {
+    async fn commit(self: Box<Self>) -> Result<TaskStreamChannelCommit> {
         // Replicas can be consumed at different times or left unread entirely.
         // Flush them independently, dropping each sender as soon as it finishes
         // so that its consumer sees EOF without waiting for the other replicas.
@@ -155,7 +155,8 @@ impl TaskStreamChannelSink for MemoryStreamReplicaSender {
             },
         ))
         .await;
-        Ok(())
+        // In-memory streams have no stored size.
+        Ok(TaskStreamChannelCommit::default())
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {
