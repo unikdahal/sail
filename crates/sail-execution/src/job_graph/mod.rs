@@ -209,7 +209,7 @@ pub enum ShuffleOrigin {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BucketLayout {
     /// Bucket `b` is channel `b` of every producer partition,
-    /// e.g. a shuffle stored by an external shuffle service (Celeborn).
+    /// e.g. a shuffle stored by a remote shuffle service.
     Direct,
     /// Bucket `b` is channel 0 of storage merge partition `b`.
     Merged,
@@ -291,7 +291,7 @@ impl fmt::Display for BucketSlice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubRange {
     /// The output of a range of producer partitions (`Direct` layout), read with a
-    /// Celeborn map-range read.
+    /// map-range read from the shuffle service.
     Producers(Range<usize>),
 }
 

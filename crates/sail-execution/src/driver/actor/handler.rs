@@ -6,14 +6,14 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use log::{debug, error, info, warn};
-use sail_celeborn::lifecycle::{LifecycleManagerActor, LocalLifecycleManager, ShuffleCommitReport};
+use sail_celeborn::lifecycle::{LifecycleManagerActor, LocalLifecycleManager};
 use sail_common::actor::{ActorAction, ActorContext, ActorHandle};
 use sail_common_datafusion::error::CommonErrorCause;
 use sail_python_udf::error::PyErrExtractor;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::driver::actor::DriverActor;
+use crate::driver::actor::{CommittedShuffle, DriverActor};
 use crate::driver::job_scheduler::{JobAction, TaskState};
 use crate::driver::output::{JobOutputItem, JobOutputOutcome};
 use crate::driver::worker_scaler::{WorkerLaunchRequest, WorkerRetryRequest};
@@ -29,22 +29,17 @@ use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter, TaskStreamAs
 use crate::task_runner::TaskRunnerMessage;
 
 impl DriverActor {
-    pub(super) fn handle_celeborn_shuffle_committed(
+    pub(super) fn handle_shuffle_committed(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        report: ShuffleCommitReport,
+        commit: CommittedShuffle,
     ) -> ActorAction {
-        let ShuffleCommitReport {
+        let CommittedShuffle {
             job_id,
             stage,
-            shuffle_id: _,
             map_attempts,
             result,
-        } = report;
-        let job_id = JobId::from(job_id);
-        let Ok(stage) = usize::try_from(stage) else {
-            return ActorAction::Continue;
-        };
+        } = commit;
         self.job_scheduler
             .record_shuffle_commit(job_id, stage, map_attempts, result);
         self.refresh_job(ctx, job_id);

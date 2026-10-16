@@ -24,8 +24,8 @@ use crate::driver::job_scheduler::state::{
     JobDescriptor, ShuffleCommit, TaskAttemptDescriptor, TaskState,
 };
 use crate::driver::job_scheduler::test_utils::{
-    MIB, aggregate_graph, celeborn, commit, final_aggregate, job, key, producer_statistics,
-    reporter, schema, succeed,
+    MIB, aggregate_graph, commit, final_aggregate, job, key, producer_statistics,
+    remote_shuffle_service, reporter, schema, succeed,
 };
 use crate::id::TaskKey;
 use crate::job_graph::{JobGraph, JobGraphOptions};
@@ -651,7 +651,7 @@ fn validator_rejects_partial_coverage_and_unequal_join_inputs() {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler-level tests over a Celeborn job graph.
+// Scheduler-level tests over a remote shuffle service job graph.
 // ---------------------------------------------------------------------------
 
 fn adapt_job(job: &mut JobDescriptor, options: &JobSchedulerOptions) -> bool {
@@ -671,11 +671,11 @@ fn adapt_job(job: &mut JobDescriptor, options: &JobSchedulerOptions) -> bool {
 }
 
 fn adaptive_options() -> JobSchedulerOptions {
-    JobSchedulerOptions::new_for_test(celeborn(), options(), None)
+    JobSchedulerOptions::new_for_test(remote_shuffle_service(), options(), None)
 }
 
 #[test]
-fn celeborn_stage_is_coalesced_after_the_shuffle_commits() {
+fn stage_is_coalesced_after_the_shuffle_commits() {
     let graph = aggregate_graph();
     assert_eq!(graph.stages().len(), 3);
     assert_eq!(graph.stages()[1].inputs[0].layout, BucketLayout::Direct);
@@ -687,7 +687,7 @@ fn celeborn_stage_is_coalesced_after_the_shuffle_commits() {
     assert!(!job.stages[1].adaptive.is_frozen());
 
     succeed(&mut job, 0, producer_statistics);
-    // The producer succeeded, but Celeborn has not reported the committed attempts:
+    // The producer succeeded, but the shuffle service has not reported the committed attempts:
     // the consumer runs as planned rather than using statistics of unknown attempts.
     let mut uncommitted = self::job(aggregate_graph());
     succeed(&mut uncommitted, 0, producer_statistics);
@@ -715,7 +715,7 @@ fn celeborn_stage_is_coalesced_after_the_shuffle_commits() {
             .unwrap()
     );
 
-    // Task definitions resolve the spec into Celeborn channels at launch.
+    // Task definitions resolve the spec into shuffle service channels at launch.
     struct NoAssignments;
     impl TaskAssignmentGetter for NoAssignments {
         fn get(&self, _: &TaskKey) -> Option<&TaskAssignment> {
@@ -746,10 +746,10 @@ fn celeborn_stage_is_coalesced_after_the_shuffle_commits() {
 }
 
 #[test]
-fn celeborn_statistics_come_from_the_committed_attempt() {
+fn statistics_come_from_the_committed_attempt() {
     let mut job = job(aggregate_graph());
     let options = adaptive_options();
-    // Attempt 0 of partition 0 reached `mapper_end` and is served by Celeborn, but its
+    // Attempt 0 of partition 0 reached `mapper_end` and is served by the shuffle service, but its
     // worker was lost before reporting success. Attempt 1 succeeded with statistics.
     for task in &mut job.stages[0].tasks {
         task.attempts.push(TaskAttemptDescriptor {
@@ -771,7 +771,7 @@ fn celeborn_statistics_come_from_the_committed_attempt() {
 }
 
 #[test]
-fn failed_celeborn_commit_is_not_adapted() {
+fn failed_shuffle_commit_is_not_adapted() {
     let mut job = job(aggregate_graph());
     let options = adaptive_options();
     succeed(&mut job, 0, producer_statistics);
@@ -788,7 +788,7 @@ fn slot_cap_failure_keeps_the_static_plan() {
     let mut job = job(aggregate_graph());
     // The static plan already needs 8 slots for its widest region, so any validated
     // rewrite would be rejected under a cap of 0 slots.
-    let options = JobSchedulerOptions::new_for_test(celeborn(), options(), Some(0));
+    let options = JobSchedulerOptions::new_for_test(remote_shuffle_service(), options(), Some(0));
     succeed(&mut job, 0, producer_statistics);
     job.stages[0].commit = Some(ShuffleCommit {
         attempts: vec![0; 4],
@@ -804,7 +804,11 @@ fn slot_cap_failure_keeps_the_static_plan() {
 #[test]
 fn adaptive_execution_disabled_leaves_the_graph_unchanged() {
     let mut job = job(aggregate_graph());
-    let options = JobSchedulerOptions::new_for_test(celeborn(), AdaptiveOptions::default(), None);
+    let options = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
     succeed(&mut job, 0, producer_statistics);
     job.stages[0].commit = Some(ShuffleCommit {
         attempts: vec![0; 4],
@@ -1082,7 +1086,7 @@ fn uniform_inputs_are_not_split() {
 }
 
 /// `SELECT * FROM l JOIN r ON l.k = r.k` with both sides hash-shuffled into 4 buckets:
-///   stages 0 and 1: scan and hash shuffle (blocking under Celeborn)
+///   stages 0 and 1: scan and hash shuffle (blocking on a remote shuffle service)
 ///   stage 2: partitioned hash join (final stage)
 fn join_graph(join_type: JoinType) -> JobGraph {
     let side = || {
@@ -1093,7 +1097,7 @@ fn join_graph(join_type: JoinType) -> JobGraph {
     JobGraph::try_new(
         hash_join(side(), side(), PartitionMode::Partitioned, join_type),
         JobGraphOptions {
-            shuffle_backend: celeborn(),
+            shuffle_backend: remote_shuffle_service(),
         },
     )
     .unwrap()
@@ -1103,11 +1107,11 @@ fn skew_options() -> JobSchedulerOptions {
     let mut adaptive = options();
     adaptive.skew_threshold = 64 * MIB;
     adaptive.join_enabled = false;
-    JobSchedulerOptions::new_for_test(celeborn(), adaptive, None)
+    JobSchedulerOptions::new_for_test(remote_shuffle_service(), adaptive, None)
 }
 
 #[test]
-fn celeborn_join_stage_is_split_and_reads_mapper_ranges() {
+fn join_stage_is_split_and_reads_mapper_ranges() {
     let mut job = job(join_graph(JoinType::Inner));
     assert_eq!(job.graph.stages().len(), 3);
     // Every producer writes 50 MiB to bucket 1 of the left side and 1 MiB elsewhere.
@@ -1190,7 +1194,7 @@ fn rule_failure_keeps_the_static_plan_and_freezes_the_decision() {
     let graph = JobGraph::try_new(
         plan,
         JobGraphOptions {
-            shuffle_backend: celeborn(),
+            shuffle_backend: remote_shuffle_service(),
         },
     )
     .unwrap();

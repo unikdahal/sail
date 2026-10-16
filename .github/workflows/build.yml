@@ -46,7 +46,8 @@ jobs:
               - "crates/sail-execution/**"
               - "python/pysail/testing/containers/celeborn.py"
               - "python/pysail/tests/celeborn/**"
-              - "python/pysail/tests/spark/execution/test_shuffle_celeborn*.py"
+              - "python/pysail/tests/spark/execution/test_shuffle_celeborn.py"
+              - "python/pysail/tests/spark/execution/test_adaptive_execution.py"
 
       - uses: ./.github/actions/commit-baseline
         id: baseline

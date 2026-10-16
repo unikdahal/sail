@@ -1,9 +1,11 @@
-# Adaptive query execution on Celeborn: progress
+# Adaptive query execution on remote shuffle services: progress
 
-This document tracks the implementation of adaptive query execution (AQE) for the
-Celeborn shuffle backend, following the "Sail AQE — High-Level Design". It lists what
-is implemented, how it was validated, the decisions that differ from the design, and
-what remains. The Flight shuffle path, Flight durability and AQE for the storage backend
+This document tracks the implementation of adaptive query execution (AQE) for remote
+shuffle service (RSS) backends, following the "Sail AQE — High-Level Design". It lists
+what is implemented, how it was validated, the decisions that differ from the design, and
+what remains. The scheduler, statistics and adaptive rules depend only on the remote
+shuffle service contract (committed map attempts, map-range reads, committed statistics);
+Celeborn is the first service that implements it. The Flight shuffle path, Flight durability and AQE for the storage backend
 are out of scope.
 
 - Base: `6f0de46` (`fix: memory leak in SQL parsers (#2789)`)
@@ -13,10 +15,10 @@ are out of scope.
 
 | Layer | Branch | Content |
 |---|---|---|
-| 1 | `aqe/1-celeborn-committed-reads` | Celeborn client correctness and committed reads |
+| 1 | `aqe/1-shuffle-service-committed-reads` | Remote shuffle service committed reads (Celeborn client) |
 | 2 | `aqe/2-committed-statistics` | Committed shuffle statistics |
 | 3 | `aqe/3-adaptive-planning` | Adaptive re-planning, coalescing and join decisions |
-| 4 | `aqe/4-skew-splits` | Skew splits with Celeborn map-range reads |
+| 4 | `aqe/4-skew-splits` | Skew splits with map-range reads |
 | 5 | `aqe/5-ci-and-benchmark` | CI, benchmark and this document |
 
 Every layer builds, passes `cargo clippy --all-targets -D warnings`, nightly `rustfmt`
@@ -24,7 +26,7 @@ and the Rust tests of the changed crates on its own.
 
 ## Implemented
 
-### Layer 1: Celeborn client correctness and committed reads
+### Layer 1: remote shuffle service committed reads
 
 - Batch headers use Celeborn's little-endian layout (`mapId`, `attemptId`, `batchId`,
   `length`). The worker sorts a partition file by map id with that layout, so map-range
@@ -41,8 +43,8 @@ and the Rust tests of the changed crates on its own.
   and the result) to an observer before acknowledging the last mapper. After a failed
   `commit_files`, the mapper that triggered it is retried with a new commit instead of
   being acknowledged with unverified data (open question 3 of the design).
-- The driver records the committed attempts per stage. Task definitions pass them to
-  Celeborn readers, and reading a shuffle whose commit failed fails the consumer task.
+- The driver records the committed attempts per stage from a backend-neutral
+  `ShuffleCommitted` message. Task definitions pass them to remote shuffle service readers, and reading a shuffle whose commit failed fails the consumer task.
 - A producer's output stays readable until every consumer region has succeeded (or the
   region also reruns the producer), so a retried consumer region never reads cleaned-up
   data.
@@ -54,15 +56,15 @@ and the Rust tests of the changed crates on its own.
 ### Layer 2: committed shuffle statistics
 
 - Shuffle sinks count rows and logical (uncompressed Arrow) bytes per channel, and the
-  Celeborn sink counts the compressed bytes it pushes. Counts are published only after the
+  remote shuffle service sink counts the compressed bytes it pushes. Counts are published only after the
   output is committed, and only when the task definition asks for them: the driver sets
-  `collect_statistics` only when adaptive execution is enabled on Celeborn, so execution
+  `collect_statistics` only when adaptive execution is enabled on a remote shuffle service, so execution
   without it is unchanged (design invariant 10).
 - Tasks report exact totals and per-channel sizes as `ChannelSizes`: a 16-bit code
   `1 + ceil(log_1.01(size))` per channel (within 1%, every `u64` representable), or above
   2,000 channels a sparse form (nonempty bitmap, accurate codes for channels above twice
   the average, one average for the rest) when it is smaller. Empty stays exactly zero.
-- The driver keeps the reported form, binds statistics to the attempt Celeborn committed,
+- The driver keeps the reported form, binds statistics to the attempt the shuffle service committed,
   folds them per bucket once per producer stage and caches the fold, and releases them
   once every consumer has made its decision. Received and peak retained bytes are logged
   per job.
@@ -97,7 +99,7 @@ and the Rust tests of the changed crates on its own.
 
 - A skewed bucket of a join input (larger than both `cluster.adaptive.skew.factor` times
   the median and `cluster.adaptive.skew.threshold`) is split by producer partition with
-  Spark's `splitSizeListByTargetSize`. Each slice is read with a Celeborn map-range read of
+  Spark's `splitSizeListByTargetSize`. Each slice is read with a map-range read of
   the committed attempts, and paired with the whole bucket of the other input, or with each
   slice of the other input when both sides are split.
 - Only the sides a join type allows are split (full outer joins never), only through
@@ -108,11 +110,11 @@ and the Rust tests of the changed crates on its own.
 
 ### Layer 5: CI and benchmark
 
-- The Build workflow runs the Celeborn integration tests (Docker fixtures) when the
-  Celeborn client, the execution crate or the Celeborn tests change, or on request
+- The Build workflow runs the remote shuffle service integration tests (Celeborn Docker
+  fixtures) when the Celeborn client, the execution crate or those tests change, or on request
   (`[celeborn tests]` in the commit message or the `run celeborn tests` label).
 - A manually triggered workflow benchmarks AQE off and on against a native Celeborn
-  cluster and posts the table to the job summary.
+  cluster (the reference remote shuffle service) and posts the table to the job summary.
 
 ## Validation
 
@@ -125,7 +127,7 @@ All results are from the final tree unless noted.
 | `sail-execution` unit and property tests | 219 passed (layer 1: 143, layer 2: 159, layer 3: 205) |
 | `sail-celeborn` / `sail-common` / `sail-system-store` tests | 12 / 12 / 9 passed |
 | Celeborn client integration tests, Docker (`pysail.tests.celeborn`) | 18 passed |
-| Spark Celeborn tests, Docker (`test_shuffle_celeborn`, `test_shuffle_celeborn_adaptive`) | 10 passed |
+| Spark Celeborn tests, Docker (`test_shuffle_celeborn`, `test_adaptive_execution`) | 10 passed |
 | Same suites against a native Celeborn 0.6.3 cluster | passed |
 
 Property tests cover the size codes (1% bound, emptiness, totals, proto round trip), the
@@ -141,7 +143,7 @@ Celeborn did not commit are never used.
 
 ### Benchmark
 
-`scripts/celeborn/benchmark_aqe.py`, release build, native Celeborn 0.6.3 with two workers,
+`scripts/adaptive/benchmark.py`, release build, native Celeborn 0.6.3 with two workers,
 local-cluster mode on a 4-core machine, parallelism 200, coalesce target and skew threshold
 4 MiB, median of three runs. Results are identical with AQE off and on for every workload.
 
@@ -163,16 +165,17 @@ static plan already builds from the smaller side.
 
 ## Decisions and deviations from the design
 
-- **Skew splits on Celeborn.** The design leaves them out for Celeborn and asks whether
-  map-range reads are planned (open question 9). The worker already serves map-range reads
-  of a partition sorted by map id, so the native client supports them, filtered by the
-  committed attempts.
+- **Skew splits on a remote shuffle service.** The design leaves them out for Celeborn and
+  asks whether map-range reads are planned (open question 9). Skew splitting requires
+  map-range reads from the shuffle service; the Celeborn worker already serves them for a
+  partition sorted by map id, so the native client supports them, filtered by the committed
+  attempts.
 - **Statistics encoding.** The design keeps per-channel rows and one-byte log sizes with
   about 10% error. Per-channel rows were unused and doubled the volume, and one byte
   saturates above about 36 GB, so tasks report exact totals and two-byte sizes within 1%,
   with a sparse form for many channels. The driver keeps that form instead of re-encoding.
 - **Statistics only with AQE.** The design collects statistics for observability before
-  any rule ships. They are collected only when AQE is enabled on Celeborn, so execution
+  any rule ships. They are collected only when AQE is enabled on a remote shuffle service, so execution
   without AQE is unchanged.
 - **Sound sizes.** The design's build guard sums the logical bytes of every input below the
   build side. That is not a bound through a nested join or a widening projection, so the
@@ -183,6 +186,10 @@ static plan already builds from the smaller side.
   globally smallest range, which can give different (still valid) ranges in ties.
 - **Re-commit after a failed `commit_files`** is implemented (open question 3).
 - **The table** is `system.execution.stages` (the design refers to `cluster.stages`).
+- **Generic remote shuffle service naming.** Code outside the Celeborn client and its
+  stream adapter is named for remote shuffle services (`is_remote_shuffle_service`,
+  `ShuffleCommitted`, `ShuffleServiceOutput`), so another service can implement the same
+  contract without touching the scheduler or the adaptive rules.
 - **Topology rebuilds.** A rewrite rebuilds the job topology, at most once per stage per
   job. `refresh_job` already does O(tasks) work on every scheduler event, so this does not
   change the scheduler's complexity, and batching rewrites would weaken the per-stage
@@ -214,7 +221,7 @@ static plan already builds from the smaller side.
 # Celeborn in Docker (the default for the test fixtures)
 hatch run pytest -m integration --pyargs pysail.tests.celeborn \
   pysail.tests.spark.execution.test_shuffle_celeborn \
-  pysail.tests.spark.execution.test_shuffle_celeborn_adaptive
+  pysail.tests.spark.execution.test_adaptive_execution
 
 # Or a native Celeborn cluster without Docker
 scripts/celeborn/local-cluster.sh start
@@ -222,5 +229,5 @@ eval "$(scripts/celeborn/local-cluster.sh env)"
 hatch run pytest -m integration --pyargs pysail.tests.celeborn
 
 # Benchmark (with a release build of pysail installed)
-python scripts/celeborn/benchmark_aqe.py --master 127.0.0.1:12097 --output results.json
+python scripts/adaptive/benchmark.py --master 127.0.0.1:12097 --output results.json
 ```

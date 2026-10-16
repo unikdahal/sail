@@ -54,7 +54,7 @@ pub(crate) fn final_aggregate(input: Arc<dyn ExecutionPlan>) -> Arc<dyn Executio
     )
 }
 
-pub(crate) fn celeborn() -> ShuffleBackendKind {
+pub(crate) fn remote_shuffle_service() -> ShuffleBackendKind {
     ShuffleBackendKind::Celeborn {
         master_endpoints: vec!["localhost:1".to_string()],
         compression: sail_celeborn::common::CompressionCodec::Lz4,
@@ -70,7 +70,7 @@ pub(crate) fn reporter() -> SystemEventReporter {
 }
 
 /// `SELECT k FROM t GROUP BY k ORDER BY k` shaped as a job graph:
-///   stage 0: scan, hash shuffle on `k` into 8 buckets (blocking under Celeborn)
+///   stage 0: scan, hash shuffle on `k` into 8 buckets (blocking on a remote shuffle service)
 ///   stage 1: final aggregate and sort (pipelined)
 ///   stage 2: sort-preserving merge of stage 1 (merge input)
 pub(crate) fn aggregate_graph() -> JobGraph {
@@ -88,7 +88,7 @@ pub(crate) fn aggregate_graph() -> JobGraph {
     JobGraph::try_new(
         merge,
         JobGraphOptions {
-            shuffle_backend: celeborn(),
+            shuffle_backend: remote_shuffle_service(),
         },
     )
     .unwrap()

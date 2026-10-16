@@ -1,4 +1,4 @@
-//! Tests of the job scheduler over Celeborn job graphs that are not about adaptive
+//! Tests of the job scheduler over remote shuffle service job graphs that are not about adaptive
 //! rewrites: committed output, retention and statistics.
 #![expect(clippy::unwrap_used)]
 
@@ -16,8 +16,8 @@ use crate::driver::job_scheduler::state::{
     ShuffleCommit, StageState, TaskAttemptDescriptor, TaskState,
 };
 use crate::driver::job_scheduler::test_utils::{
-    MIB, NoAssignments, aggregate_graph, celeborn, commit, job, producer_statistics, reporter,
-    schema, succeed,
+    MIB, NoAssignments, aggregate_graph, commit, job, producer_statistics, remote_shuffle_service,
+    reporter, schema, succeed,
 };
 use crate::driver::job_scheduler::{AdaptiveOptions, JobAction, JobScheduler, JobSchedulerOptions};
 use crate::id::{JobId, TaskKey};
@@ -29,7 +29,11 @@ use crate::task::definition::TaskInputLocator;
 #[test]
 fn output_is_retained_until_consumer_regions_succeed() {
     let mut job = job(aggregate_graph());
-    let options = JobSchedulerOptions::new_for_test(celeborn(), AdaptiveOptions::default(), None);
+    let options = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
     succeed(&mut job, 0, producer_statistics);
     // Stage 1 succeeds, but stage 2 in the same region is still running, so a failure
     // of stage 2 would rerun stage 1, which reads stage 0 again.
@@ -59,10 +63,10 @@ fn output_is_retained_until_consumer_regions_succeed() {
 }
 
 #[test]
-fn statistics_are_collected_only_for_adaptive_execution_on_celeborn() {
+fn statistics_are_collected_only_for_adaptive_execution_on_a_remote_shuffle_service() {
     let job = job(aggregate_graph());
     let enabled = JobSchedulerOptions::new_for_test(
-        celeborn(),
+        remote_shuffle_service(),
         AdaptiveOptions {
             enabled: true,
             ..AdaptiveOptions::default()
@@ -70,7 +74,11 @@ fn statistics_are_collected_only_for_adaptive_execution_on_celeborn() {
         None,
     );
     assert!(JobScheduler::collects_statistics(&enabled, &job));
-    let disabled = JobSchedulerOptions::new_for_test(celeborn(), AdaptiveOptions::default(), None);
+    let disabled = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
     assert!(!JobScheduler::collects_statistics(&disabled, &job));
 }
 
@@ -162,7 +170,7 @@ fn committed_map_attempts_are_passed_to_readers() {
 }
 
 #[test]
-fn failed_celeborn_commit_fails_the_consumer_definition() {
+fn failed_shuffle_commit_fails_the_consumer_definition() {
     let mut job = job(aggregate_graph());
     succeed(&mut job, 0, producer_statistics);
     job.stages[0].commit = Some(ShuffleCommit {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
-use sail_celeborn::lifecycle::{LifecycleManagerActor, ShuffleCommitReport};
+use sail_celeborn::lifecycle::LifecycleManagerActor;
 use sail_common::actor::ActorHandle;
 use sail_common::telemetry::{SpanAssociation, SpanAttribute};
 use sail_common_datafusion::error::CommonErrorCause;
@@ -93,14 +93,25 @@ pub enum DriverMessage {
     CelebornGetLifecycleManager {
         result: oneshot::Sender<Option<ActorHandle<LifecycleManagerActor>>>,
     },
-    /// The Celeborn lifecycle manager committed (or failed to commit) the shuffle
+    /// The remote shuffle service committed (or failed to commit) the shuffle
     /// written by a stage.
-    CelebornShuffleCommitted {
-        report: ShuffleCommitReport,
+    ShuffleCommitted {
+        commit: CommittedShuffle,
     },
     Shutdown {
         result: Option<oneshot::Sender<()>>,
     },
+}
+
+/// The output that a remote shuffle service committed for a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedShuffle {
+    pub job_id: JobId,
+    pub stage: usize,
+    /// The committed attempt of each map task.
+    pub map_attempts: Vec<i32>,
+    /// The result of the global commit.
+    pub result: Result<(), String>,
 }
 
 /// The observed task status that drives the task state transition.
@@ -164,7 +175,7 @@ impl SpanAssociation for DriverMessage {
             DriverMessage::FetchDriverStream { .. } => "FetchDriverStream",
             DriverMessage::FetchWorkerStream { .. } => "FetchWorkerStream",
             DriverMessage::CelebornGetLifecycleManager { .. } => "CelebornGetLifecycleManager",
-            DriverMessage::CelebornShuffleCommitted { .. } => "CelebornShuffleCommitted",
+            DriverMessage::ShuffleCommitted { .. } => "ShuffleCommitted",
             DriverMessage::Shutdown { .. } => "Shutdown",
         };
         name.into()
@@ -296,9 +307,9 @@ impl SpanAssociation for DriverMessage {
                 p.push((SpanAttribute::EXECUTION_CHANNEL, channel.to_string()));
             }
             DriverMessage::CelebornGetLifecycleManager { result: _ } => {}
-            DriverMessage::CelebornShuffleCommitted { report } => {
-                p.push((SpanAttribute::EXECUTION_JOB_ID, report.job_id.to_string()));
-                p.push((SpanAttribute::EXECUTION_STAGE, report.stage.to_string()));
+            DriverMessage::ShuffleCommitted { commit } => {
+                p.push((SpanAttribute::EXECUTION_JOB_ID, commit.job_id.to_string()));
+                p.push((SpanAttribute::EXECUTION_STAGE, commit.stage.to_string()));
             }
             DriverMessage::Shutdown { .. } => {}
         }

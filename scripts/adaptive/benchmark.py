@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Benchmark adaptive query execution on the Celeborn shuffle backend.
+"""Benchmark adaptive query execution on a remote shuffle service (currently Celeborn).
 
 The script starts a Sail server in local-cluster mode with adaptive execution off,
 then another with it on, runs the same workloads on both, checks that the results
 are identical, and reports wall time together with what the scheduler did, as
 recorded in the `system.execution` tables.
 
-    python scripts/celeborn/benchmark_aqe.py --master 127.0.0.1:12097 --output results.json
+    python scripts/adaptive/benchmark.py --master 127.0.0.1:12097 --output results.json
 
 The Celeborn workers must advertise addresses reachable from this process, as the
 local cluster of `scripts/celeborn/local-cluster.sh` does.

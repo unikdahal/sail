@@ -117,7 +117,7 @@ pub struct StageDescriptor {
     pub state: StageState,
     /// The output that the shuffle backend committed for this stage, as reported by
     /// the backend itself. This is set only for backends whose committed attempt can
-    /// differ from the scheduler's latest successful attempt (Celeborn).
+    /// differ from the scheduler's latest successful attempt (remote shuffle services).
     pub commit: Option<ShuffleCommit>,
     /// The adaptive decision for the stage, made once before any of its tasks run.
     pub adaptive: AdaptiveDecision,

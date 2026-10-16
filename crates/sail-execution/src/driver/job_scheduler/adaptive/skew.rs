@@ -1,7 +1,7 @@
-//! Skew splitting for joins over Celeborn shuffles.
+//! Skew splitting for joins over remote shuffle service inputs.
 //!
 //! A skewed bucket of a join input is split by producer partition: each slice is read
-//! with a Celeborn map-range read, and is paired with the whole bucket of the other
+//! with a map-range read from the shuffle service, and is paired with the whole bucket of the other
 //! input (or with each slice of the other input when both sides are split). This
 //! follows Spark's `OptimizeSkewedJoin`:
 //!

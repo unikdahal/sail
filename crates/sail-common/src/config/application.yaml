@@ -259,8 +259,9 @@
   default: "false"
   description: |
     The master switch for adaptive query execution in cluster mode.
-    Adaptive re-planning applies only at blocking shuffle boundaries, which today means
-    the `celeborn` shuffle backend; it has no effect on the `flight` and `storage` backends.
+    Adaptive re-planning applies only at the blocking shuffle boundaries of a remote shuffle
+    service backend (currently `celeborn`); it has no effect on the `flight` and `storage`
+    backends.
     When disabled, job graphs and task definitions are identical to non-adaptive execution.
   experimental: true
 
@@ -326,8 +327,8 @@
   default: "true"
   description: |
     Whether to split skewed join partitions when adaptive query execution is enabled.
-    A skewed partition is split by producer partition and read with Celeborn
-    map-range reads.
+    A skewed partition is split by producer partition and read with map-range reads from
+    the remote shuffle service.
   experimental: true
 
 - key: cluster.adaptive.skew.factor

@@ -15,24 +15,13 @@ use crate::statistics::ChannelCounts;
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{
-    MultiChannelTaskStreamSink, TaskStreamChannelCommit, TaskStreamChannelSink, TaskStreamSink,
-    TaskStreamWriteState,
+    MultiChannelTaskStreamSink, ShuffleServiceOutput, TaskStreamChannelCommit,
+    TaskStreamChannelSink, TaskStreamSink, TaskStreamWriteState,
 };
 use crate::task::definition::ShuffleServiceRead;
 
-/// The largest number of Celeborn partitions that one task reads at a time.
+/// The largest number of shuffle partitions that one task reads at a time.
 const MAX_CONCURRENT_PARTITION_READS: usize = 8;
-
-/// The shape of one map task's output to a Celeborn shuffle.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CelebornOutput {
-    /// The number of map tasks of the producer stage.
-    pub mappers: usize,
-    /// The number of reduce channels.
-    pub channels: usize,
-    /// Whether the sinks count the output for committed statistics.
-    pub collect_statistics: bool,
-}
 
 #[derive(Clone)]
 pub(crate) struct CelebornStreamManager {
@@ -79,10 +68,10 @@ impl CelebornStreamManager {
     pub(crate) async fn create_stream(
         &self,
         key: TaskKey,
-        output: CelebornOutput,
+        output: ShuffleServiceOutput,
         schema: SchemaRef,
     ) -> Result<Box<dyn TaskStreamSink>> {
-        let CelebornOutput {
+        let ShuffleServiceOutput {
             mappers,
             channels,
             collect_statistics,

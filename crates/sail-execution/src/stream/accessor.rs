@@ -10,11 +10,11 @@ use tokio::sync::oneshot;
 
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
-use crate::stream::celeborn::CelebornOutput;
 use crate::stream::merge::merged_stream;
 use crate::stream::reader::{TaskStreamReader, TaskStreamSource};
 use crate::stream::writer::{
-    MultiChannelTaskStreamSink, TaskStreamChannelSink, TaskStreamSink, TaskStreamWriter,
+    MultiChannelTaskStreamSink, ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink,
+    TaskStreamWriter,
 };
 use crate::task::definition::{
     ShuffleServiceRead, TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator,
@@ -82,7 +82,7 @@ impl TaskStreamFactory {
                 self.handle.clone(),
                 self.context.clone(),
                 key,
-                CelebornOutput {
+                ShuffleServiceOutput {
                     mappers: self.mappers,
                     channels: output.channels(),
                     collect_statistics,
@@ -164,7 +164,7 @@ impl TaskStreamAccessor {
     async fn create_celeborn_stream(
         &self,
         key: TaskKey,
-        output: CelebornOutput,
+        output: ShuffleServiceOutput,
         schema: SchemaRef,
     ) -> Result<Box<dyn TaskStreamSink>> {
         let (result, rx) = oneshot::channel();
@@ -428,7 +428,7 @@ impl TaskStreamWriter for MultiChannelTaskStreamWriter {
 pub(crate) struct CelebornTaskStreamWriter {
     streams: TaskStreamAccessor,
     key: TaskKey,
-    output: CelebornOutput,
+    output: ShuffleServiceOutput,
     schema: SchemaRef,
 }
 
@@ -437,7 +437,7 @@ impl CelebornTaskStreamWriter {
         handle: ActorHandle<TaskRunnerActor>,
         context: Arc<TaskContext>,
         key: TaskKey,
-        output: CelebornOutput,
+        output: ShuffleServiceOutput,
         schema: SchemaRef,
     ) -> Self {
         Self {

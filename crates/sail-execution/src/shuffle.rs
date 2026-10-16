@@ -38,6 +38,15 @@ pub struct ShuffleEndpointOverride {
     pub external: String,
 }
 
+impl ShuffleBackendKind {
+    /// Whether the backend is a remote shuffle service: it stores the blocking output of
+    /// every map task, serves each shuffle partition to its readers, and reports which
+    /// attempt of each map task it committed.
+    pub fn is_remote_shuffle_service(&self) -> bool {
+        matches!(self, ShuffleBackendKind::Celeborn { .. })
+    }
+}
+
 impl From<&sail_common::config::ShuffleBackend> for ShuffleBackendKind {
     fn from(value: &sail_common::config::ShuffleBackend) -> Self {
         match value {

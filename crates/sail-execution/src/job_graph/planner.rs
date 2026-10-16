@@ -983,20 +983,20 @@ fn create_shuffle_input(
     origin: ShuffleOrigin,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
     let input = StageInput::new(stage, mode).with_origin(origin);
-    match graph.options.shuffle_backend {
-        ShuffleBackendKind::Storage { .. } => {}
-        ShuffleBackendKind::Celeborn { .. } => {
-            // Under Celeborn, the shuffle stage is blocking and each consumer partition
-            // reads one Celeborn partition (channel) written by every producer.
-            let layout = match mode {
-                InputMode::Shuffle => BucketLayout::Direct,
-                _ => BucketLayout::Opaque,
-            };
-            return Ok(stage_input_exec_with(input.with_layout(layout), properties));
-        }
-        ShuffleBackendKind::Flight { .. } => {
-            return Ok(stage_input_exec_with(input, properties));
-        }
+    if !matches!(
+        graph.options.shuffle_backend,
+        ShuffleBackendKind::Storage { .. }
+    ) {
+        // A remote shuffle service stores the output of every producer, and each
+        // consumer partition reads one shuffle partition (channel) of all of them.
+        let layout = if graph.options.shuffle_backend.is_remote_shuffle_service()
+            && matches!(mode, InputMode::Shuffle)
+        {
+            BucketLayout::Direct
+        } else {
+            BucketLayout::Opaque
+        };
+        return Ok(stage_input_exec_with(input.with_layout(layout), properties));
     }
 
     let merge = stage_input_exec_with(input, properties.clone());

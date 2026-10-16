@@ -101,8 +101,7 @@ impl ClusterJobRunner {
         components: DriverComponents,
     ) -> Self {
         let shuffle_backend = options.shuffle_backend.clone();
-        let adaptive = options.adaptive.enabled
-            && matches!(shuffle_backend, ShuffleBackendKind::Celeborn { .. });
+        let adaptive = options.adaptive.enabled && shuffle_backend.is_remote_shuffle_service();
         let driver = DriverHandle::new(system.spawn::<DriverActor>((options, components)));
         Self {
             driver,

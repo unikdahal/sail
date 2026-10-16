@@ -833,17 +833,13 @@ impl JobScheduler {
     }
 
     /// Whether the blocking outputs of a job count their committed statistics.
-    /// Only adaptive execution reads them, and only for Celeborn, so execution
-    /// without it does not pay for counting.
+    /// Only adaptive execution reads them, and only on a remote shuffle service, so
+    /// execution without it does not pay for counting.
     pub(super) fn collects_statistics(options: &JobSchedulerOptions, job: &JobDescriptor) -> bool {
-        options.adaptive.enabled
-            && matches!(
-                job.graph.shuffle_backend(),
-                ShuffleBackendKind::Celeborn { .. }
-            )
+        options.adaptive.enabled && job.graph.shuffle_backend().is_remote_shuffle_service()
     }
 
-    /// Records the output that the Celeborn lifecycle manager committed for a stage.
+    /// Records the output that the remote shuffle service committed for a stage.
     pub fn record_shuffle_commit(
         &mut self,
         job_id: JobId,
@@ -894,15 +890,12 @@ impl JobScheduler {
 
     /// Returns the attempt whose output the shuffle backend committed, for each
     /// partition of a blocking stage, or `None` if the committed output is not known.
-    /// Statistics are collected only for Celeborn, whose lifecycle manager reports
-    /// the committed attempts: the first attempt of each mapper that reached
-    /// `mapper_end`, which need not be the scheduler's latest successful attempt.
+    /// Statistics are collected only on a remote shuffle service, which reports the
+    /// committed attempt of each map task. It need not be the scheduler's latest
+    /// successful attempt (Celeborn keeps the first attempt that reached `mapper_end`).
     pub(super) fn committed_attempts(job: &JobDescriptor, stage: usize) -> Option<&[usize]> {
         if !matches!(job.graph.stages().get(stage)?.mode, OutputMode::Blocking)
-            || !matches!(
-                job.graph.shuffle_backend(),
-                ShuffleBackendKind::Celeborn { .. }
-            )
+            || !job.graph.shuffle_backend().is_remote_shuffle_service()
         {
             return None;
         }
@@ -1185,7 +1178,7 @@ impl<'a> TaskInputBuilder<'a> {
                     for slice in slices {
                         if slice.buckets.end > input_channels {
                             return Err(ExecutionError::InternalError(format!(
-                                "invalid Celeborn bucket slice {slice} for {input_channels} channels"
+                                "invalid shuffle service bucket slice {slice} for {input_channels} channels"
                             )));
                         }
                         read.channels.extend(slice.buckets.clone());
@@ -1229,7 +1222,7 @@ impl<'a> TaskInputBuilder<'a> {
         })
     }
 
-    /// Returns the attempt that Celeborn committed for each producer partition, so
+    /// Returns the attempt that the shuffle service committed for each producer partition, so
     /// that readers skip output of other attempts (e.g. partial data of a failed
     /// attempt). Reading a shuffle whose global commit failed is an error, since its
     /// files are not verified.
@@ -1244,7 +1237,7 @@ impl<'a> TaskInputBuilder<'a> {
                 .collect::<ExecutionResult<Vec<_>>>()
                 .map(|x| Some(Arc::from(x))),
             Some(_) => Err(ExecutionError::InternalError(format!(
-                "job {} stage {} Celeborn shuffle commit failed",
+                "job {} stage {} shuffle commit failed",
                 self.key.job_id, self.input.stage
             ))),
             // A producer without partitions never commits a shuffle.

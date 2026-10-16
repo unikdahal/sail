@@ -1,4 +1,4 @@
-name: Celeborn Adaptive Execution Benchmark
+name: Adaptive Execution Benchmark
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: celeborn-benchmark
+          cache-key: adaptive-benchmark
           install-testing-tools: false
 
       - name: Build Python Package
@@ -53,7 +53,7 @@ jobs:
 
       - name: Run Benchmark
         run: |
-          python scripts/celeborn/benchmark_aqe.py \
+          python scripts/adaptive/benchmark.py \
             --master 127.0.0.1:12097 \
             --scale "${{ inputs.scale }}" \
             --parallelism "${{ inputs.parallelism }}" \
@@ -69,7 +69,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: celeborn-benchmark
+          name: adaptive-benchmark
           path: |
             benchmark.json
             benchmark.txt

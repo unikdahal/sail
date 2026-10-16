@@ -14,9 +14,8 @@ use crate::driver::{DriverMessage, TaskStatus};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::statistics::TaskOutputStatistics;
-use crate::stream::celeborn::CelebornOutput;
 use crate::stream::reader::TaskStreamSource;
-use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
+use crate::stream::writer::{ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
 use crate::task_runner::monitor::TaskMonitor;
 use crate::task_runner::preparation::TaskPreparation;
@@ -228,7 +227,7 @@ impl TaskRunnerActor {
         &mut self,
         ctx: &mut ActorContext<Self>,
         key: TaskKey,
-        output: CelebornOutput,
+        output: ShuffleServiceOutput,
         schema: Arc<Schema>,
         result: oneshot::Sender<ExecutionResult<Box<dyn TaskStreamSink>>>,
     ) -> ActorAction {

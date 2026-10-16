@@ -6,6 +6,17 @@ use futures::future::try_join_all;
 
 use crate::statistics::{ChannelCounter, ChannelCounts};
 
+/// The shape of one map task's output to a shuffle service.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShuffleServiceOutput {
+    /// The number of map tasks of the producer stage.
+    pub mappers: usize,
+    /// The number of reduce channels.
+    pub channels: usize,
+    /// Whether the sinks count the output for committed statistics.
+    pub collect_statistics: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStreamWriteState {
     Active,

@@ -358,6 +358,13 @@ pub enum ShuffleBackend {
     Celeborn(CelebornShuffleBackend),
 }
 
+impl ShuffleBackend {
+    /// Whether the backend is a remote shuffle service.
+    pub fn is_remote_shuffle_service(&self) -> bool {
+        matches!(self, ShuffleBackend::Celeborn(_))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlightShuffleBackend {

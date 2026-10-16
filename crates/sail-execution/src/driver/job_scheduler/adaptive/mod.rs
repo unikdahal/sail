@@ -61,7 +61,6 @@ use crate::job_graph::{
     OutputMode, ShuffleOrigin, StageKind, SubRange, TaskPlacement,
 };
 use crate::plan::StageInputExec;
-use crate::shuffle::ShuffleBackendKind;
 
 pub(crate) const RULE_COALESCE: &str = "coalesce";
 
@@ -88,13 +87,10 @@ impl JobScheduler {
     ) -> bool {
         let started = Instant::now();
         let mut replanned = false;
-        // Only blocking shuffle backends have materialized outputs whose committed
+        // Only a remote shuffle service has materialized outputs whose committed
         // sizes are known before the consumer starts. Storage merge stages share a
         // region with the next shuffle's merge stage, so they are not adapted yet.
-        let supported = matches!(
-            job.graph.shuffle_backend(),
-            ShuffleBackendKind::Celeborn { .. }
-        );
+        let supported = job.graph.shuffle_backend().is_remote_shuffle_service();
         for s in 0..job.stages.len() {
             if job.stages[s].adaptive.is_frozen() {
                 continue;
@@ -150,8 +146,8 @@ impl JobScheduler {
     }
 
     /// A stage is ready when none of its regions has an attempt and all their
-    /// dependencies have succeeded. Under Celeborn a stage between blocking shuffles
-    /// is sliced into one region per partition, and these regions become ready
+    /// dependencies have succeeded. On a remote shuffle service, a stage between
+    /// blocking shuffles is sliced into one region per partition, and these regions become ready
     /// together, so one decision covers all of them.
     fn stage_readiness(job: &JobDescriptor, stage: usize) -> Readiness {
         let tasks = &job.stages[stage].tasks;

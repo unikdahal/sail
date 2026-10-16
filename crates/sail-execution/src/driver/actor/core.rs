@@ -10,11 +10,13 @@ use sail_celeborn::master::MasterClientOptions;
 use sail_celeborn::shuffle::{ShuffleClient, ShuffleClientActor, ShuffleClientOptions};
 use sail_common::actor::{Actor, ActorAction, ActorContext, ActorHandle};
 
+use crate::driver::actor::CommittedShuffle;
 use crate::driver::job_scheduler::{JobScheduler, JobSchedulerOptions};
 use crate::driver::task_assigner::{TaskAssigner, TaskAssignerOptions};
 use crate::driver::worker_pool::{WorkerPool, WorkerPoolOptions};
 use crate::driver::worker_scaler::{WorkerScaler, WorkerScalerOptions};
 use crate::driver::{DriverActor, DriverComponents, DriverMessage, DriverOptions};
+use crate::id::JobId;
 use crate::shuffle::{ShuffleBackendKind, celeborn_application_id};
 use crate::stream::celeborn::CelebornStreamManager;
 use crate::stream::local::LocalStreamManager;
@@ -24,7 +26,7 @@ use crate::task_runner::{
     TaskRunnerPlacement,
 };
 
-/// Forwards Celeborn shuffle commit reports to the driver actor.
+/// Forwards the commit reports of the Celeborn lifecycle manager to the driver actor.
 struct DriverShuffleCommitObserver {
     driver: ActorHandle<DriverActor>,
 }
@@ -32,9 +34,25 @@ struct DriverShuffleCommitObserver {
 #[tonic::async_trait]
 impl ShuffleCommitObserver for DriverShuffleCommitObserver {
     async fn shuffle_committed(&self, report: ShuffleCommitReport) {
+        let ShuffleCommitReport {
+            job_id,
+            stage,
+            shuffle_id: _,
+            map_attempts,
+            result,
+        } = report;
+        let Ok(stage) = usize::try_from(stage) else {
+            return;
+        };
+        let commit = CommittedShuffle {
+            job_id: JobId::from(job_id),
+            stage,
+            map_attempts,
+            result,
+        };
         let _ = self
             .driver
-            .send(DriverMessage::CelebornShuffleCommitted { report })
+            .send(DriverMessage::ShuffleCommitted { commit })
             .await;
     }
 }
@@ -111,7 +129,7 @@ impl Actor for DriverActor {
                 };
                 let options =
                     options.with_partition_split(*partition_split_threshold, *partition_split_mode);
-                // The scheduler needs to know which attempt of each mapper Celeborn committed.
+                // The scheduler needs to know which attempt of each map task was committed.
                 let options = options.with_commit_observer(Arc::new(DriverShuffleCommitObserver {
                     driver: ctx.handle().clone(),
                 }));
@@ -211,8 +229,8 @@ impl Actor for DriverActor {
             DriverMessage::CelebornGetLifecycleManager { result } => {
                 self.handle_celeborn_get_lifecycle_manager(result)
             }
-            DriverMessage::CelebornShuffleCommitted { report } => {
-                self.handle_celeborn_shuffle_committed(ctx, report)
+            DriverMessage::ShuffleCommitted { commit } => {
+                self.handle_shuffle_committed(ctx, commit)
             }
             DriverMessage::Shutdown { result } => self.handle_shutdown(ctx, result),
         }

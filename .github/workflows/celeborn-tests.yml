@@ -35,4 +35,4 @@ jobs:
           hatch run pytest -m integration -v --pyargs \
             pysail.tests.celeborn \
             pysail.tests.spark.execution.test_shuffle_celeborn \
-            pysail.tests.spark.execution.test_shuffle_celeborn_adaptive
+            pysail.tests.spark.execution.test_adaptive_execution
