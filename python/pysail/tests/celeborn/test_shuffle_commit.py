@@ -77,7 +77,6 @@ def commit_remote(
             celeborn_workers, celeborn_rpc_proxies
         ),
         "SAIL_CLUSTER__TASK_MAX_ATTEMPTS": "3",
-        "SAIL_CLUSTER__ADAPTIVE__ENABLED": "true",
         "RUST_LOG": "warn,sail_execution::driver::job_scheduler::core=debug",
     }
     address = tmp_path / "server-address"
