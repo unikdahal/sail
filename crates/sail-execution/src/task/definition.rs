@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
@@ -36,8 +37,31 @@ pub enum TaskInputLocator {
         keys: Vec<Vec<TaskInputKey>>,
     },
     ShuffleService {
-        channels: Vec<Vec<usize>>,
+        /// For each partition of the stage input, the shuffle partitions (channels)
+        /// to read.
+        reads: Vec<ShuffleServiceRead>,
+        /// The committed attempt of each producer partition, so that output of other
+        /// attempts is never read. `None` if the commit is not known.
+        map_attempts: Option<Arc<[i32]>>,
     },
+}
+
+/// The shuffle service data read by one partition of a stage input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleServiceRead {
+    pub channels: Vec<usize>,
+    /// Read only the output of producer partitions in this range. This is set only
+    /// for a single channel split by an adaptive skew rewrite.
+    pub mappers: Option<std::ops::Range<usize>>,
+}
+
+impl ShuffleServiceRead {
+    pub fn channels(channels: Vec<usize>) -> Self {
+        Self {
+            channels,
+            mappers: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,8 +109,14 @@ pub enum TaskOutputDistribution {
 
 #[derive(Debug, Clone)]
 pub enum TaskOutputLocator {
-    Pipelined { replicas: usize },
-    Blocking,
+    Pipelined {
+        replicas: usize,
+    },
+    Blocking {
+        /// Whether the sinks count the output and the task reports its committed
+        /// statistics.
+        collect_statistics: bool,
+    },
 }
 
 impl From<TaskDefinition> for r#gen::TaskDefinition {
@@ -176,18 +206,22 @@ impl From<TaskInputLocator> for r#gen::TaskInputLocator {
                     keys: keys.into_iter().map(|x| x.into()).collect(),
                 })
             }
-            TaskInputLocator::ShuffleService { channels } => {
-                r#gen::task_input_locator::Kind::ShuffleService(
-                    r#gen::TaskInputShuffleServiceLocator {
-                        channels: channels
-                            .into_iter()
-                            .map(|channels| r#gen::TaskInputChannelList {
-                                channels: channels.into_iter().map(|x| x as u64).collect(),
-                            })
-                            .collect(),
-                    },
-                )
-            }
+            TaskInputLocator::ShuffleService {
+                reads,
+                map_attempts,
+            } => r#gen::task_input_locator::Kind::ShuffleService(
+                r#gen::TaskInputShuffleServiceLocator {
+                    channels: reads
+                        .into_iter()
+                        .map(|read| r#gen::TaskInputChannelList {
+                            channels: read.channels.into_iter().map(|x| x as u64).collect(),
+                            mapper_start: read.mappers.as_ref().map(|x| x.start as u64),
+                            mapper_end: read.mappers.as_ref().map(|x| x.end as u64),
+                        })
+                        .collect(),
+                    map_attempts: map_attempts.map(|x| encode_map_attempts(&x)),
+                },
+            ),
         };
         r#gen::TaskInputLocator { kind: Some(kind) }
     }
@@ -226,12 +260,30 @@ impl TryFrom<r#gen::TaskInputLocator> for TaskInputLocator {
                 Ok(TaskInputLocator::Storage { keys })
             }
             Some(r#gen::task_input_locator::Kind::ShuffleService(
-                r#gen::TaskInputShuffleServiceLocator { channels },
+                r#gen::TaskInputShuffleServiceLocator {
+                    channels,
+                    map_attempts,
+                },
             )) => Ok(TaskInputLocator::ShuffleService {
-                channels: channels
+                reads: channels
                     .into_iter()
-                    .map(|x| x.channels.into_iter().map(|x| x as usize).collect())
-                    .collect(),
+                    .map(|x| {
+                        let mappers = match (x.mapper_start, x.mapper_end) {
+                            (Some(start), Some(end)) => Some(start as usize..end as usize),
+                            (None, None) => None,
+                            _ => {
+                                return Err(ExecutionError::InvalidArgument(
+                                    "incomplete shuffle service mapper range".to_string(),
+                                ));
+                            }
+                        };
+                        Ok(ShuffleServiceRead {
+                            channels: x.channels.into_iter().map(|x| x as usize).collect(),
+                            mappers,
+                        })
+                    })
+                    .collect::<ExecutionResult<Vec<_>>>()?,
+                map_attempts: map_attempts.map(decode_map_attempts).transpose()?,
             }),
             None => Err(ExecutionError::InvalidArgument(
                 "cannot decode empty task input locator".to_string(),
@@ -508,8 +560,10 @@ impl From<TaskOutputLocator> for r#gen::TaskOutputLocator {
                     replicas: replicas as u64,
                 })
             }
-            TaskOutputLocator::Blocking => {
-                r#gen::task_output_locator::Kind::Blocking(r#gen::TaskOutputBlockingLocator {})
+            TaskOutputLocator::Blocking { collect_statistics } => {
+                r#gen::task_output_locator::Kind::Blocking(r#gen::TaskOutputBlockingLocator {
+                    collect_statistics,
+                })
             }
         };
         r#gen::TaskOutputLocator { kind: Some(kind) }
@@ -526,7 +580,9 @@ impl TryFrom<r#gen::TaskOutputLocator> for TaskOutputLocator {
             )) => Ok(TaskOutputLocator::Pipelined {
                 replicas: replicas as usize,
             }),
-            Some(r#gen::task_output_locator::Kind::Blocking(_)) => Ok(TaskOutputLocator::Blocking),
+            Some(r#gen::task_output_locator::Kind::Blocking(
+                r#gen::TaskOutputBlockingLocator { collect_statistics },
+            )) => Ok(TaskOutputLocator::Blocking { collect_statistics }),
             None => Err(ExecutionError::InvalidArgument(
                 "cannot decode empty task output locator".to_string(),
             )),
@@ -590,6 +646,85 @@ impl TaskOutput {
             TaskOutputDistribution::RoundRobinRow { channels } => {
                 Ok(ShufflePartitioning::RoundRobinRow(*channels))
             }
+        }
+    }
+}
+
+fn encode_map_attempts(attempts: &[i32]) -> r#gen::TaskInputMapAttempts {
+    let mut counts = HashMap::<i32, usize>::new();
+    for &attempt in attempts {
+        *counts.entry(attempt).or_default() += 1;
+    }
+    // The most common attempt, the smallest one among ties.
+    let attempt = counts
+        .into_iter()
+        .max_by_key(|&(attempt, count)| (count, std::cmp::Reverse(attempt)))
+        .map(|(attempt, _)| attempt)
+        .unwrap_or_default();
+    let (other_partitions, other_attempts) = attempts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &a)| a != attempt)
+        .map(|(p, &a)| (p as u32, a))
+        .unzip();
+    r#gen::TaskInputMapAttempts {
+        partitions: attempts.len() as u32,
+        attempt,
+        other_partitions,
+        other_attempts,
+    }
+}
+
+fn decode_map_attempts(value: r#gen::TaskInputMapAttempts) -> ExecutionResult<Arc<[i32]>> {
+    let r#gen::TaskInputMapAttempts {
+        partitions,
+        attempt,
+        other_partitions,
+        other_attempts,
+    } = value;
+    if other_partitions.len() != other_attempts.len()
+        || !other_partitions.is_sorted_by(|a, b| a < b)
+        || other_partitions.last().is_some_and(|&p| p >= partitions)
+    {
+        return Err(ExecutionError::InvalidArgument(
+            "invalid committed map attempts".to_string(),
+        ));
+    }
+    let mut attempts = vec![attempt; partitions as usize];
+    for (p, a) in other_partitions.into_iter().zip(other_attempts) {
+        attempts[p as usize] = a;
+    }
+    Ok(Arc::from(attempts))
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{decode_map_attempts, encode_map_attempts};
+
+    #[test]
+    fn uniform_map_attempts_are_encoded_without_a_list() {
+        let encoded = encode_map_attempts(&[0; 1000]);
+        assert_eq!((encoded.partitions, encoded.attempt), (1000, 0));
+        assert!(encoded.other_partitions.is_empty());
+    }
+
+    #[test]
+    fn invalid_map_attempts_are_rejected() {
+        let mut encoded = encode_map_attempts(&[0, 1, 0, 2]);
+        encoded.other_partitions.swap(0, 1);
+        assert!(decode_map_attempts(encoded).is_err());
+        let mut encoded = encode_map_attempts(&[0, 0, 1]);
+        encoded.partitions = 2;
+        assert!(decode_map_attempts(encoded).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn map_attempts_round_trip(attempts in prop::collection::vec(0..4_i32, 0..200)) {
+            let decoded = decode_map_attempts(encode_map_attempts(&attempts)).ok();
+            prop_assert_eq!(decoded.as_deref(), Some(attempts.as_slice()));
         }
     }
 }

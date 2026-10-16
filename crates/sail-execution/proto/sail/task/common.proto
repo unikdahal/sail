@@ -56,11 +56,30 @@ message TaskInputStorageLocator {
 }
 
 message TaskInputShuffleServiceLocator {
+  // One entry per partition of the stage input.
   repeated TaskInputChannelList channels = 1;
+  // The committed attempt of each producer partition, if known.
+  optional TaskInputMapAttempts map_attempts = 2;
 }
 
 message TaskInputChannelList {
   repeated uint64 channels = 1;
+  // Read only the output of producer partitions in `[mapper_start, mapper_end)`.
+  // This is set only for a single channel split by an adaptive skew rewrite.
+  optional uint64 mapper_start = 2;
+  optional uint64 mapper_end = 3;
+}
+
+// The committed attempt of every producer partition. Almost every partition usually
+// has the same attempt, so only the partitions with another attempt are listed.
+message TaskInputMapAttempts {
+  // The number of producer partitions.
+  uint32 partitions = 1;
+  // The attempt of every partition that is not listed below.
+  int32 attempt = 2;
+  // Partitions with another attempt, in increasing order, and their attempts.
+  repeated uint32 other_partitions = 3;
+  repeated int32 other_attempts = 4;
 }
 
 message TaskInputRemoteKey {
@@ -117,4 +136,7 @@ message TaskOutputPipelinedLocator {
 }
 
 message TaskOutputBlockingLocator {
+  // Whether the sinks count the output and the task reports its committed
+  // statistics, which the driver requests only for adaptive execution.
+  bool collect_statistics = 1;
 }

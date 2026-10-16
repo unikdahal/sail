@@ -8,7 +8,7 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use indexmap::{IndexMap, IndexSet};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use sail_common::actor::ActorContext;
 use sail_common_datafusion::error::CommonErrorCause;
 use sail_python_udf::error::PyErrExtractor;
@@ -17,23 +17,24 @@ use sail_telemetry::events::SystemEventReporter;
 
 use crate::driver::DriverActor;
 use crate::driver::job_scheduler::state::{
-    JobDescriptor, StageState, TaskAttemptDescriptor, TaskRegionState, TaskState,
+    JobDescriptor, ShuffleCommit, StageState, TaskAttemptDescriptor, TaskRegionState, TaskState,
 };
-use crate::driver::job_scheduler::topology::TaskRegionTopology;
+use crate::driver::job_scheduler::topology::{TaskRegionTopology, TaskTopology};
 use crate::driver::job_scheduler::{JobAction, JobScheduler, JobSchedulerOptions, JobState};
 use crate::driver::output::{JobOutputOutcome, build_job_output};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey};
 use crate::job_graph::{
-    InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, TaskPlacement,
+    InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, SubRange, TaskPlacement,
 };
 use crate::proto::{
     encode_remote_partitioning, encode_remote_physical_expr, encode_remote_physical_plan,
 };
 use crate::shuffle::ShuffleBackendKind;
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 use crate::task::definition::{
-    TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
-    TaskOutputLocator,
+    ShuffleServiceRead, TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput,
+    TaskOutputDistribution, TaskOutputLocator,
 };
 use crate::task::scheduling::{
     TaskAssignment, TaskAssignmentGetter, TaskOutputKind, TaskRegion, TaskSet, TaskSetEntry,
@@ -110,23 +111,65 @@ impl JobScheduler {
         state: TaskState,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        statistics: Option<TaskOutputStatistics>,
     ) {
         let event_reporter = self.event_reporter.clone();
         let session_id = self.options.session_id.clone();
-        let Some(attempt) = self
-            .jobs
-            .get_mut(&key.job_id)
-            .and_then(|job| job.stages.get_mut(key.stage))
-            .and_then(|stage| stage.tasks.get_mut(key.partition))
-            .and_then(|task| task.attempts.get_mut(key.attempt))
-        else {
+        let Some(job) = self.jobs.get_mut(&key.job_id) else {
             warn!("{} not found", TaskKeyDisplay(key));
             return;
         };
+        // Only blocking outputs have a committed form that later stages can rely on.
+        let channels = job
+            .graph
+            .stages()
+            .get(key.stage)
+            .filter(|stage| matches!(stage.mode, OutputMode::Blocking))
+            .map(|stage| stage.distribution.channels());
+        let Some((stage, attempt)) = job.stages.get_mut(key.stage).and_then(|stage| {
+            let attempt = stage
+                .tasks
+                .get_mut(key.partition)
+                .and_then(|task| task.attempts.get_mut(key.attempt))?;
+            Some((&mut stage.retained_statistics_bytes, attempt))
+        }) else {
+            warn!("{} not found", TaskKeyDisplay(key));
+            return;
+        };
+        let previous = attempt.state;
         attempt.state = attempt.state.consolidate(state);
         attempt.messages.extend(message);
         if let Some(cause) = cause {
             attempt.cause = Some(cause);
+        }
+        // Statistics are bound to the attempt that reported them, and are kept only
+        // when this report is the one that moved the attempt to the succeeded state.
+        if let Some(statistics) = statistics
+            && !previous.is_terminal()
+            && matches!(attempt.state, TaskState::Succeeded)
+        {
+            if channels.is_none() {
+                // Statistics of pipelined outputs are not used.
+            } else if Some(statistics.channels()) == channels {
+                // Statistics are retained in the form they are reported in.
+                let bytes = statistics.retained_bytes() as u64;
+                job.adaptive.statistics_payload_bytes =
+                    job.adaptive.statistics_payload_bytes.saturating_add(bytes);
+                *stage = stage.saturating_add(bytes);
+                job.adaptive.retained_statistics_bytes =
+                    job.adaptive.retained_statistics_bytes.saturating_add(bytes);
+                job.adaptive.peak_retained_statistics_bytes = job
+                    .adaptive
+                    .peak_retained_statistics_bytes
+                    .max(job.adaptive.retained_statistics_bytes);
+                attempt.statistics = Some(Arc::new(statistics));
+            } else {
+                warn!(
+                    "{} reported statistics for {} channels, expected {channels:?}",
+                    TaskKeyDisplay(key),
+                    statistics.channels()
+                );
+            }
         }
         event_reporter.report(SystemEvent::TaskUpdated {
             session_id,
@@ -188,14 +231,16 @@ impl JobScheduler {
             &session_id,
         ));
         actions.extend(Self::extend_job_output(job_id, job));
+
+        Self::update_task_regions(job, &self.options);
+
         actions.extend(Self::clean_up_job_by_stage(
             job_id,
             job,
             &event_reporter,
             &session_id,
         ));
-
-        Self::update_task_regions(job, &self.options);
+        Self::report_stage_statistics(job_id, job, &event_reporter, &session_id);
 
         if job
             .regions
@@ -233,8 +278,25 @@ impl JobScheduler {
                 status: job.state.status().to_string(),
                 updated_at: Utc::now(),
             });
+            Self::log_adaptive_metrics(job_id, job, &self.options);
             return actions;
         }
+
+        if self.options.adaptive.enabled
+            && Self::adapt_ready_stages(
+                job_id,
+                job,
+                &self.options,
+                self.codec.as_ref(),
+                &event_reporter,
+                &session_id,
+            )
+        {
+            // A re-planned stage changes the topology, so region states are recomputed
+            // from the task attempts before scheduling.
+            Self::update_task_regions(job, &self.options);
+        }
+        Self::release_statistics(job, &self.options);
 
         actions.extend(Self::schedule_task_regions(
             job_id,
@@ -246,7 +308,7 @@ impl JobScheduler {
         actions
     }
 
-    fn update_task_regions(job: &mut JobDescriptor, options: &JobSchedulerOptions) {
+    pub(super) fn update_task_regions(job: &mut JobDescriptor, options: &JobSchedulerOptions) {
         for (r, region) in job.topology.regions.iter().enumerate() {
             let failed = region.tasks.iter().any(|t| {
                 let attempts = &job.stages[t.stage].tasks[t.partition].attempts;
@@ -329,7 +391,7 @@ impl JobScheduler {
         actions
     }
 
-    fn clean_up_job_by_stage(
+    pub(super) fn clean_up_job_by_stage(
         job_id: JobId,
         job: &mut JobDescriptor,
         event_reporter: &SystemEventReporter,
@@ -341,20 +403,53 @@ impl JobScheduler {
             if matches!(job.stages[s].state, StageState::Inactive) {
                 continue;
             }
-            let all_consumers_succeeded = stage.consumers.iter().all(|&c| {
+            // The output must stay readable while any consumer task can still be retried.
+            // A failed task reschedules its whole region, including consumer tasks that
+            // have succeeded. A retried region that also holds producer tasks recreates
+            // the output, so only the consumer tasks must have succeeded. Otherwise the
+            // output is released only once the consumer region has succeeded, since
+            // succeeded regions never run again.
+            // The producer regions are computed only once every consumer task has
+            // succeeded, since this runs on every task status update.
+            let producer_regions = std::cell::OnceCell::new();
+            let producer_regions = || {
+                producer_regions.get_or_init(|| {
+                    (0..job.stages[s].tasks.len())
+                        .filter_map(|p| {
+                            job.topology
+                                .task_regions
+                                .get(&TaskTopology {
+                                    stage: s,
+                                    partition: p,
+                                })
+                                .copied()
+                        })
+                        .collect::<IndexSet<_>>()
+                })
+            };
+            let all_consumer_regions_succeeded = stage.consumers.iter().all(|&c| {
                 let partitions = job.graph.stages()[c]
                     .plan
                     .output_partitioning()
                     .partition_count();
                 (0..partitions).all(|p| {
-                    job.stages[c].tasks[p]
+                    let task_succeeded = job.stages[c].tasks[p]
                         .attempts
                         .last()
-                        .is_some_and(|a| matches!(a.state, TaskState::Succeeded))
+                        .is_some_and(|a| matches!(a.state, TaskState::Succeeded));
+                    let region = job.topology.task_regions.get(&TaskTopology {
+                        stage: c,
+                        partition: p,
+                    });
+                    task_succeeded
+                        && region.is_some_and(|r| {
+                            matches!(job.regions[*r].state, TaskRegionState::Succeeded)
+                                || producer_regions().contains(r)
+                        })
                 })
             });
 
-            if all_consumers_succeeded && !stage.consumers.is_empty() {
+            if all_consumer_regions_succeeded && !stage.consumers.is_empty() {
                 job.stages[s].state = StageState::Inactive;
                 event_reporter.report(SystemEvent::StageUpdated {
                     session_id: session_id.to_string(),
@@ -414,6 +509,7 @@ impl JobScheduler {
                     messages: vec![],
                     cause: None,
                     job_output_fetched: false,
+                    statistics: None,
                 });
                 event_reporter.report(SystemEvent::TaskCreated {
                     session_id: session_id.to_string(),
@@ -671,7 +767,10 @@ impl JobScheduler {
             .iter()
             .map(|input| TaskInputBuilder::try_new(job, key, input, assignments)?.build())
             .collect::<ExecutionResult<Vec<_>>>()?;
-        let output = TaskOutputBuilder::new(job, key, stage, self.codec.as_ref()).build()?;
+        let collect_statistics = Self::collects_statistics(&self.options, job);
+        let output =
+            TaskOutputBuilder::new(job, key, stage, self.codec.as_ref(), collect_statistics)
+                .build()?;
         let definition = TaskDefinition {
             plan: Arc::from(plan),
             inputs,
@@ -731,6 +830,226 @@ impl JobScheduler {
                 }
             }
         }
+    }
+
+    /// Whether the blocking outputs of a job count their committed statistics.
+    /// Only adaptive execution reads them, and only on a remote shuffle service, so
+    /// execution without it does not pay for counting.
+    pub(super) fn collects_statistics(options: &JobSchedulerOptions, job: &JobDescriptor) -> bool {
+        options.adaptive.enabled && job.graph.shuffle_backend().is_remote_shuffle_service()
+    }
+
+    /// Records the output that the remote shuffle service committed for a stage.
+    /// A shuffle is committed once, successfully or not, and the commit never changes.
+    pub fn record_shuffle_commit(
+        &mut self,
+        job_id: JobId,
+        stage: usize,
+        map_attempts: Vec<i32>,
+        result: Result<(), String>,
+    ) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            warn!("job {job_id} not found for shuffle commit of stage {stage}");
+            return;
+        };
+        let Some(descriptor) = job.stages.get_mut(stage) else {
+            warn!("job {job_id} stage {stage} not found for shuffle commit");
+            return;
+        };
+        if let Some(commit) = &descriptor.commit {
+            warn!("job {job_id} stage {stage} shuffle is already committed: {commit:?}");
+            return;
+        }
+        let attempts = map_attempts
+            .iter()
+            .enumerate()
+            .map(|(p, &a)| {
+                let a = usize::try_from(a).ok()?;
+                // The selected attempt must be one that the scheduler created.
+                (a < descriptor.tasks.get(p)?.attempts.len()).then_some(a)
+            })
+            .collect::<Option<Vec<_>>>();
+        let commit = match (attempts, &result) {
+            (Some(attempts), Ok(())) if attempts.len() == descriptor.tasks.len() => ShuffleCommit {
+                attempts,
+                succeeded: true,
+            },
+            (attempts, _) => {
+                if let Err(error) = &result {
+                    warn!("job {job_id} stage {stage} shuffle commit failed: {error}");
+                } else {
+                    warn!(
+                        "job {job_id} stage {stage} shuffle commit has unexpected attempts: {map_attempts:?}"
+                    );
+                }
+                ShuffleCommit {
+                    attempts: attempts.unwrap_or_default(),
+                    succeeded: false,
+                }
+            }
+        };
+        debug!("job {job_id} stage {stage} shuffle commit: {commit:?}");
+        descriptor.commit = Some(commit);
+    }
+
+    /// Returns the attempt whose output the shuffle backend committed, for each
+    /// partition of a blocking stage, or `None` if the committed output is not known.
+    /// Statistics are collected only on a remote shuffle service, which reports the
+    /// committed attempt of each map task. It need not be the scheduler's latest
+    /// successful attempt (Celeborn keeps the first attempt that reached `mapper_end`).
+    pub(super) fn committed_attempts(job: &JobDescriptor, stage: usize) -> Option<&[usize]> {
+        if !matches!(job.graph.stages().get(stage)?.mode, OutputMode::Blocking)
+            || !job.graph.shuffle_backend().is_remote_shuffle_service()
+        {
+            return None;
+        }
+        job.stages[stage]
+            .commit
+            .as_ref()
+            .filter(|commit| commit.succeeded)
+            .map(|commit| commit.attempts.as_slice())
+    }
+
+    /// Returns the statistics of the committed attempt of each partition of a stage,
+    /// or `None` if the committed output is not known or any attempt lacks statistics.
+    pub(super) fn committed_attempt_statistics(
+        job: &JobDescriptor,
+        stage: usize,
+    ) -> Option<Vec<Arc<TaskOutputStatistics>>> {
+        Self::committed_attempts(job, stage)?
+            .iter()
+            .enumerate()
+            .map(|(p, &a)| {
+                job.stages[stage]
+                    .tasks
+                    .get(p)?
+                    .attempts
+                    .get(a)?
+                    .statistics
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Returns the statistics of the committed attempts of a stage folded per bucket,
+    /// or `None` if they are not all known. The fold is cached for the stage.
+    pub(super) fn committed_statistics(
+        job: &mut JobDescriptor,
+        stage: usize,
+    ) -> Option<Arc<ShuffleStatistics>> {
+        if let Some(statistics) = &job.stages.get(stage)?.shuffle_statistics {
+            return Some(statistics.clone());
+        }
+        let attempts = Self::committed_attempt_statistics(job, stage)?;
+        let channels = job.graph.stages()[stage].distribution.channels();
+        let statistics = ShuffleStatistics::fold(channels, attempts.iter().map(|x| x.as_ref()))
+            .inspect_err(|e| warn!("failed to fold statistics of stage {stage}: {e}"))
+            .ok()
+            .map(Arc::new)?;
+        let bytes = statistics.retained_bytes() as u64;
+        job.stages[stage].retained_statistics_bytes = job.stages[stage]
+            .retained_statistics_bytes
+            .saturating_add(bytes);
+        job.adaptive.retained_statistics_bytes =
+            job.adaptive.retained_statistics_bytes.saturating_add(bytes);
+        job.adaptive.peak_retained_statistics_bytes = job
+            .adaptive
+            .peak_retained_statistics_bytes
+            .max(job.adaptive.retained_statistics_bytes);
+        job.stages[stage].shuffle_statistics = Some(statistics.clone());
+        Some(statistics)
+    }
+
+    fn report_stage_statistics(
+        job_id: JobId,
+        job: &mut JobDescriptor,
+        event_reporter: &SystemEventReporter,
+        session_id: &str,
+    ) {
+        for s in 0..job.stages.len() {
+            if job.stages[s].statistics_reported {
+                continue;
+            }
+            let Some(attempts) = Self::committed_attempts(job, s) else {
+                continue;
+            };
+            let all_reported = attempts.iter().enumerate().all(|(p, &a)| {
+                let attempt = &job.stages[s].tasks[p].attempts[a];
+                attempt.statistics.is_some() || attempt.state.is_terminal()
+            });
+            if !all_reported {
+                continue;
+            }
+            job.stages[s].statistics_reported = true;
+            let Some(statistics) = Self::committed_statistics(job, s) else {
+                debug!("job {job_id} stage {s} has committed output without statistics");
+                continue;
+            };
+            let (max, median) = statistics.max_and_median_bucket_bytes();
+            debug!(
+                "job {job_id} stage {s} committed {} rows, {:?} physical bytes, {} logical bytes, max bucket {max} bytes, median bucket {median} bytes",
+                statistics.total_rows,
+                statistics.total_physical_bytes,
+                statistics.total_logical_bytes
+            );
+            event_reporter.report(SystemEvent::StageStatisticsReported {
+                session_id: session_id.to_string(),
+                job_id: u64::from(job_id),
+                stage: s as u64,
+                rows: statistics.total_rows,
+                physical_bytes: statistics.total_physical_bytes,
+                logical_bytes: statistics.total_logical_bytes,
+                max_partition_bytes: max,
+                median_partition_bytes: median,
+                reported_at: Utc::now(),
+            });
+        }
+    }
+
+    /// Releases the statistics of every stage whose statistics are no longer needed:
+    /// they have been reported, and every consumer has made its adaptive decision.
+    fn release_statistics(job: &mut JobDescriptor, options: &JobSchedulerOptions) {
+        if job.adaptive.retained_statistics_bytes == 0 {
+            return;
+        }
+        for s in 0..job.stages.len() {
+            if job.stages[s].retained_statistics_bytes == 0 {
+                continue;
+            }
+            let consumers_frozen = !options.adaptive.enabled
+                || job.topology.stages[s]
+                    .consumers
+                    .iter()
+                    .all(|&c| job.stages[c].adaptive.is_frozen());
+            let finished = job.stages[s].statistics_reported
+                || matches!(job.stages[s].state, StageState::Inactive);
+            if consumers_frozen && finished {
+                for task in &mut job.stages[s].tasks {
+                    for attempt in &mut task.attempts {
+                        attempt.statistics = None;
+                    }
+                }
+                job.stages[s].shuffle_statistics = None;
+                job.adaptive.retained_statistics_bytes = job
+                    .adaptive
+                    .retained_statistics_bytes
+                    .saturating_sub(job.stages[s].retained_statistics_bytes);
+                job.stages[s].retained_statistics_bytes = 0;
+            }
+        }
+    }
+
+    fn log_adaptive_metrics(job_id: JobId, job: &JobDescriptor, options: &JobSchedulerOptions) {
+        if !options.adaptive.enabled {
+            return;
+        }
+        info!(
+            "job {job_id} adaptive execution: {} stage(s) re-planned in {:?}, {} bytes of statistics received, peak {} bytes of statistics retained",
+            job.adaptive.replanned_stages,
+            job.adaptive.replanning_time,
+            job.adaptive.statistics_payload_bytes,
+            job.adaptive.peak_retained_statistics_bytes
+        );
     }
 
     fn get_latest_task_attempt(
@@ -850,21 +1169,91 @@ impl<'a> TaskInputBuilder<'a> {
     fn build_shuffle_service_locator(&self) -> ExecutionResult<TaskInputLocator> {
         let input_channels = self.producer.distribution.channels();
         let output_partitions = self.consumer.plan.output_partitioning().partition_count();
-        let channels = match self.input.mode {
-            InputMode::Shuffle => (0..output_partitions)
-                .map(|partition| vec![partition])
-                .collect(),
-            InputMode::Broadcast => {
-                let channels = (0..input_channels).collect::<Vec<_>>();
-                vec![channels; output_partitions]
-            }
-            mode => {
-                return Err(ExecutionError::InvalidArgument(format!(
-                    "Celeborn shuffle service does not support {mode} input"
-                )));
+        let map_attempts = self.committed_map_attempts()?;
+        let reads = if let Some(adaptive) = &self.input.adaptive {
+            // Partition `i` of this input's own domain reads the bucket slices of its
+            // spec entry: whole channels, or one channel restricted to a range of
+            // producer partitions for a skew split.
+            adaptive
+                .spec
+                .iter()
+                .map(|slices| {
+                    let mut read = ShuffleServiceRead::channels(vec![]);
+                    for slice in slices {
+                        if slice.buckets.end > input_channels {
+                            return Err(ExecutionError::InternalError(format!(
+                                "invalid shuffle service bucket slice {slice} for {input_channels} channels"
+                            )));
+                        }
+                        read.channels.extend(slice.buckets.clone());
+                        if let Some(SubRange::Producers(mappers)) = &slice.part {
+                            if slices.len() != 1 || slice.buckets.len() != 1 {
+                                return Err(ExecutionError::InternalError(format!(
+                                    "a partial bucket must be read alone: {slice}"
+                                )));
+                            }
+                            read.mappers = Some(mappers.clone());
+                        }
+                    }
+                    if read.mappers.is_some() && map_attempts.is_none() {
+                        return Err(ExecutionError::InternalError(
+                            "a partial bucket read requires the committed map attempts"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(read)
+                })
+                .collect::<ExecutionResult<Vec<_>>>()?
+        } else {
+            match self.input.mode {
+                InputMode::Shuffle => (0..output_partitions)
+                    .map(|partition| ShuffleServiceRead::channels(vec![partition]))
+                    .collect(),
+                InputMode::Broadcast => {
+                    let channels = (0..input_channels).collect::<Vec<_>>();
+                    vec![ShuffleServiceRead::channels(channels); output_partitions]
+                }
+                mode => {
+                    return Err(ExecutionError::InvalidArgument(format!(
+                        "Celeborn shuffle service does not support {mode} input"
+                    )));
+                }
             }
         };
-        Ok(TaskInputLocator::ShuffleService { channels })
+        Ok(TaskInputLocator::ShuffleService {
+            reads,
+            map_attempts,
+        })
+    }
+
+    /// Returns the attempt that the shuffle service committed for each producer partition, so
+    /// that readers skip output of other attempts (e.g. partial data of a failed
+    /// attempt). Reading a shuffle whose global commit failed is an error, since its
+    /// files are not verified.
+    fn committed_map_attempts(&self) -> ExecutionResult<Option<Arc<[i32]>>> {
+        match &self.job.stages[self.input.stage].commit {
+            Some(commit) if commit.succeeded => commit
+                .attempts
+                .iter()
+                .map(|&a| {
+                    i32::try_from(a).map_err(|e| ExecutionError::InternalError(e.to_string()))
+                })
+                .collect::<ExecutionResult<Vec<_>>>()
+                .map(|x| Some(Arc::from(x))),
+            Some(_) => Err(ExecutionError::InternalError(format!(
+                "job {} stage {} shuffle commit failed",
+                self.key.job_id, self.input.stage
+            ))),
+            // A producer without partitions never commits a shuffle.
+            None if self.job.stages[self.input.stage].tasks.is_empty() => Ok(None),
+            // The commit is reported before any producer task succeeds, so it is known
+            // whenever a consumer runs. Reading without it would not skip the output of
+            // attempts that the shuffle service did not commit.
+            None => Err(ExecutionError::InternalError(format!(
+                "job {} stage {} shuffle commit is not known",
+                self.key.job_id, self.input.stage
+            ))),
+        }
     }
 
     fn assignment(&self, key: &TaskInputKey) -> Option<&TaskAssignment> {
@@ -1000,6 +1389,7 @@ struct TaskOutputBuilder<'a> {
     key: &'a TaskKey,
     stage: &'a Stage,
     codec: &'a dyn PhysicalExtensionCodec,
+    collect_statistics: bool,
 }
 
 impl<'a> TaskOutputBuilder<'a> {
@@ -1008,12 +1398,14 @@ impl<'a> TaskOutputBuilder<'a> {
         key: &'a TaskKey,
         stage: &'a Stage,
         codec: &'a dyn PhysicalExtensionCodec,
+        collect_statistics: bool,
     ) -> Self {
         Self {
             job,
             key,
             stage,
             codec,
+            collect_statistics,
         }
     }
 
@@ -1058,7 +1450,9 @@ impl<'a> TaskOutputBuilder<'a> {
             OutputMode::Pipelined => TaskOutputLocator::Pipelined {
                 replicas: self.job.graph.replicas(self.key.stage),
             },
-            OutputMode::Blocking => TaskOutputLocator::Blocking,
+            OutputMode::Blocking => TaskOutputLocator::Blocking {
+                collect_statistics: self.collect_statistics,
+            },
         };
         Ok(TaskOutput {
             distribution,
@@ -1104,6 +1498,31 @@ impl StageGroup {
         let bucket =
             (self.partition_offsets[&entry.key.stage] + entry.key.partition) % self.buckets.len();
         self.buckets[bucket].push(entry);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::sync::Arc;
+
+    use super::{JobDescriptor, TaskInputBuilder};
+    use crate::id::TaskKey;
+    use crate::job_graph::StageInput;
+    use crate::task::definition::TaskInputLocator;
+    use crate::task::scheduling::TaskAssignmentGetter;
+
+    /// Builds the input locator of a task, as the scheduler does at launch.
+    pub(crate) fn build_input_locator(
+        job: &JobDescriptor,
+        key: &TaskKey,
+        input: &StageInput,
+        assignments: &dyn TaskAssignmentGetter,
+    ) -> Arc<TaskInputLocator> {
+        #[expect(clippy::unwrap_used)]
+        TaskInputBuilder::try_new(job, key, input, assignments)
+            .and_then(|builder| builder.build())
+            .unwrap()
+            .locator
     }
 }
 
@@ -1163,6 +1582,7 @@ mod tests {
             messages: vec![],
             cause: None,
             job_output_fetched: false,
+            statistics: None,
         };
         for stage in &mut job.stages {
             for task in &mut stage.tasks {
@@ -1187,10 +1607,7 @@ mod tests {
         }
         // Exercise the routing builder with a forward edge of the same partition shape.
         // Partitions 2 and 3 have attempts, but their regions have no assignments yet.
-        let edge = StageInput {
-            stage: 0,
-            mode: InputMode::Forward,
-        };
+        let edge = StageInput::new(0, InputMode::Forward);
         let consumer = key(1, 0, 0);
         let original = TaskInputBuilder::try_new(&job, &consumer, &edge, &assignments)?.build()?;
         let TaskInputLocator::Worker { keys } = original.locator.as_ref() else {

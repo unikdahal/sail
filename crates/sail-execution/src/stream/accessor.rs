@@ -13,9 +13,12 @@ use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::merge::merged_stream;
 use crate::stream::reader::{TaskStreamReader, TaskStreamSource};
 use crate::stream::writer::{
-    MultiChannelTaskStreamSink, TaskStreamChannelSink, TaskStreamSink, TaskStreamWriter,
+    MultiChannelTaskStreamSink, ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink,
+    TaskStreamWriter,
 };
-use crate::task::definition::{TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator};
+use crate::task::definition::{
+    ShuffleServiceRead, TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator,
+};
 use crate::task_runner::{TaskRunnerActor, TaskRunnerMessage};
 
 pub struct TaskStreamFactory {
@@ -72,14 +75,19 @@ impl TaskStreamFactory {
         output: TaskOutput,
         schema: SchemaRef,
     ) -> Arc<dyn TaskStreamWriter> {
-        if self.celeborn && matches!(output.locator, TaskOutputLocator::Blocking) {
+        if self.celeborn
+            && let TaskOutputLocator::Blocking { collect_statistics } = output.locator
+        {
             Arc::new(CelebornTaskStreamWriter::new(
                 self.handle.clone(),
                 self.context.clone(),
                 key,
-                output.channels(),
+                ShuffleServiceOutput {
+                    mappers: self.mappers,
+                    channels: output.channels(),
+                    collect_statistics,
+                },
                 schema,
-                self.mappers,
             ))
         } else {
             Arc::new(MultiChannelTaskStreamWriter::new(
@@ -156,16 +164,14 @@ impl TaskStreamAccessor {
     async fn create_celeborn_stream(
         &self,
         key: TaskKey,
-        mappers: usize,
-        channels: usize,
+        output: ShuffleServiceOutput,
         schema: SchemaRef,
     ) -> Result<Box<dyn TaskStreamSink>> {
         let (result, rx) = oneshot::channel();
         self.receive(
             TaskRunnerMessage::CreateCelebornStream {
                 key,
-                mappers,
-                channels,
+                output,
                 schema,
                 result,
             },
@@ -232,7 +238,8 @@ impl TaskStreamAccessor {
         &self,
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
         let (result, rx) = oneshot::channel();
@@ -240,7 +247,8 @@ impl TaskStreamAccessor {
             TaskRunnerMessage::FetchCelebornStream {
                 job_id,
                 stage,
-                channels,
+                read,
+                map_attempts,
                 schema,
                 result,
             },
@@ -321,8 +329,11 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                 }))
                 .await?
             }
-            TaskInputLocator::ShuffleService { channels } => {
-                let channels = channels.get(partition).ok_or_else(|| {
+            TaskInputLocator::ShuffleService {
+                reads,
+                map_attempts,
+            } => {
+                let read = reads.get(partition).ok_or_else(|| {
                     DataFusionError::Execution(format!("input partition {partition} not found"))
                 })?;
                 vec![
@@ -330,7 +341,8 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                         .fetch_celeborn_stream(
                             self.key.job_id,
                             self.input.stage,
-                            channels.clone(),
+                            read.clone(),
+                            map_attempts.clone(),
                             self.schema.clone(),
                         )
                         .await?,
@@ -392,7 +404,7 @@ impl TaskStreamWriter for MultiChannelTaskStreamWriter {
                 }))
                 .await?
             }
-            TaskOutputLocator::Blocking => {
+            TaskOutputLocator::Blocking { .. } => {
                 try_join_all((0..channels).map(|channel| {
                     self.streams.create_storage_stream(
                         self.key.task_stream_key(channel),
@@ -402,18 +414,22 @@ impl TaskStreamWriter for MultiChannelTaskStreamWriter {
                 .await?
             }
         };
-        Ok(Box::new(MultiChannelTaskStreamSink {
-            sinks: sinks.into_iter().map(Some).collect(),
-        }))
+        // Pipelined outputs have no committed form, so they are never counted.
+        let count = matches!(
+            self.output.locator,
+            TaskOutputLocator::Blocking {
+                collect_statistics: true
+            }
+        );
+        Ok(Box::new(MultiChannelTaskStreamSink::new(sinks, count)))
     }
 }
 
 pub(crate) struct CelebornTaskStreamWriter {
     streams: TaskStreamAccessor,
     key: TaskKey,
-    channels: usize,
+    output: ShuffleServiceOutput,
     schema: SchemaRef,
-    mappers: usize,
 }
 
 impl CelebornTaskStreamWriter {
@@ -421,16 +437,14 @@ impl CelebornTaskStreamWriter {
         handle: ActorHandle<TaskRunnerActor>,
         context: Arc<TaskContext>,
         key: TaskKey,
-        channels: usize,
+        output: ShuffleServiceOutput,
         schema: SchemaRef,
-        mappers: usize,
     ) -> Self {
         Self {
             streams: TaskStreamAccessor::new(handle, context),
             key,
-            channels,
+            output,
             schema,
-            mappers,
         }
     }
 }
@@ -451,12 +465,7 @@ impl TaskStreamWriter for CelebornTaskStreamWriter {
             )));
         }
         self.streams
-            .create_celeborn_stream(
-                self.key.clone(),
-                self.mappers,
-                self.channels,
-                self.schema.clone(),
-            )
+            .create_celeborn_stream(self.key.clone(), self.output, self.schema.clone())
             .await
     }
 }

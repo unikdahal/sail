@@ -3,7 +3,7 @@ mod handler;
 mod message;
 mod options;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub use message::LifecycleManagerMessage;
 pub use options::LifecycleManagerOptions;
@@ -36,7 +36,33 @@ impl ApplicationRegistration {
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
+/// The global commit of a shuffle.
+///
+/// The commit request (the selected attempt of every mapper) is fixed once every
+/// mapper has ended and is never revised. A worker that has committed a shuffle
+/// stops storing pushes for it, so selecting another attempt afterwards would select
+/// output that no worker stored. A failed worker commit is retried with the same
+/// request, which workers answer idempotently, and if it still fails the shuffle is
+/// lost.
+enum ShuffleCommitState {
+    /// Mappers are ending. Holds the first attempt of each mapper to end, or -1.
+    Collecting {
+        attempts: Vec<i32>,
+    },
+    /// Every mapper has ended and the workers are committing the selected attempts.
+    /// `mapper_end` calls made meanwhile wait for the outcome.
+    Committing {
+        attempts: Vec<i32>,
+        waiters: Vec<oneshot::Sender<CelebornResult<()>>>,
+    },
+    Committed,
+    /// The commit failed. The shuffle's output cannot be read.
+    Lost {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct ShuffleKey {
     job_id: u64,
     stage: u64,
@@ -51,10 +77,9 @@ pub struct LifecycleManagerActor {
     reservations: HashMap<i32, SlotReservation>,
     pending_slot_requests: HashMap<i32, Vec<oneshot::Sender<CelebornResult<SlotReservation>>>>,
     pending_revives: HashMap<(i32, i32), Vec<oneshot::Sender<CelebornResult<PartitionLocation>>>>,
-    mapper_attempts: HashMap<i32, Vec<i32>>,
-    committing_shuffles: HashSet<i32>,
-    committed_shuffles: HashSet<i32>,
+    shuffle_commits: HashMap<i32, ShuffleCommitState>,
     shuffle_ids: HashMap<ShuffleKey, i32>,
+    shuffle_keys: HashMap<i32, ShuffleKey>,
     next_shuffle_id: i32,
     application_registration: ApplicationRegistration,
     application_metrics: ApplicationMetrics,

@@ -5,6 +5,7 @@ use sail_common::runtime::RuntimeHandle;
 use sail_common::utils::retry::RetryStrategy;
 use sail_telemetry::events::SystemEventReporter;
 
+use crate::driver::job_scheduler::AdaptiveOptions;
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::DriverId;
 use crate::shuffle::ShuffleBackendKind;
@@ -31,6 +32,7 @@ pub struct DriverOptions {
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout: Duration,
     pub task_max_attempts: usize,
+    pub adaptive: AdaptiveOptions,
     pub shuffle_backend: ShuffleBackendKind,
     pub rpc_retry_strategy: RetryStrategy,
     pub runtime: RuntimeHandle,
@@ -81,6 +83,22 @@ impl DriverOptions {
                 config.cluster.task_stream_creation_timeout_secs,
             ),
             task_max_attempts: config.cluster.task_max_attempts,
+            adaptive: {
+                let adaptive = &config.cluster.adaptive;
+                AdaptiveOptions {
+                    enabled: adaptive.enabled,
+                    coalesce_enabled: adaptive.coalesce.enabled,
+                    coalesce_target_size: adaptive.coalesce.target_size,
+                    coalesce_min_partition_size: adaptive.coalesce.min_partition_size,
+                    coalesce_min_partitions: adaptive.coalesce.min_partitions,
+                    coalesce_max_logical_size: adaptive.coalesce.max_logical_size,
+                    join_enabled: adaptive.join.enabled,
+                    join_max_build_partition_size: adaptive.join.max_build_partition_size,
+                    skew_enabled: adaptive.skew.enabled,
+                    skew_factor: adaptive.skew.factor,
+                    skew_threshold: adaptive.skew.threshold,
+                }
+            },
             shuffle_backend: (&config.cluster.shuffle_backend).into(),
             runtime,
         })

@@ -5,7 +5,7 @@ mod options;
 
 use std::collections::HashMap;
 
-pub(crate) use message::{DriverMessage, TaskStatus};
+pub(crate) use message::{CommittedShuffle, DriverMessage, TaskStatus};
 pub use options::{DriverComponents, DriverOptions};
 use sail_celeborn::lifecycle::LocalLifecycleManager;
 use sail_common::actor::ActorHandle;

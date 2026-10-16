@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use log::debug;
+use log::{debug, warn};
 use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
 use prost::Message;
 use tokio::sync::oneshot;
@@ -15,6 +15,7 @@ use crate::driver::r#gen::{
 use crate::driver::{DriverMessage, DriverRegistryAccessor, r#gen};
 use crate::error::ExecutionError;
 use crate::id::{DriverId, TaskKey, WorkerId};
+use crate::statistics::TaskOutputStatistics;
 
 pub struct DriverServer {
     registry: Arc<dyn DriverRegistryAccessor>,
@@ -127,6 +128,7 @@ impl DriverService for DriverServer {
             status,
             message,
             cause,
+            output_statistics,
             sequence,
         } = request;
         let status = r#gen::TaskStatus::try_from(status).map_err(ExecutionError::from)?;
@@ -134,6 +136,13 @@ impl DriverService for DriverServer {
             .map(|x| serde_json::from_str(&x))
             .transpose()
             .map_err(ExecutionError::from)?;
+        // Malformed statistics are dropped rather than failing the report, because
+        // statistics are advisory and the task status must still reach the driver.
+        let statistics = output_statistics.and_then(|x| {
+            TaskOutputStatistics::try_from(x)
+                .inspect_err(|e| warn!("ignoring invalid task output statistics: {e}"))
+                .ok()
+        });
         let message = DriverMessage::UpdateTask {
             key: TaskKey {
                 job_id: job_id.into(),
@@ -144,6 +153,7 @@ impl DriverService for DriverServer {
             status: status.into(),
             message,
             cause,
+            statistics,
             sequence: Some(sequence),
         };
         self.registry

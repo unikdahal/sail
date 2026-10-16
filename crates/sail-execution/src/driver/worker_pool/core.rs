@@ -352,6 +352,7 @@ impl WorkerPool {
                         status: TaskStatus::Failed,
                         message: Some(format!("failed to dispatch task batch: {error}")),
                         cause: Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
+                        statistics: None,
                         sequence: None,
                     });
                 }
@@ -371,6 +372,7 @@ impl WorkerPool {
                             status: TaskStatus::Failed,
                             message: Some(format!("failed to run task batch: {error}")),
                             cause: Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
+                            statistics: None,
                             sequence: None,
                         })
                         .await;

@@ -10,9 +10,10 @@ use tokio::sync::oneshot;
 use crate::driver::TaskStatus;
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
-use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
-use crate::task::definition::TaskDefinition;
+use crate::stream::writer::{ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink};
+use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
 use crate::worker::WorkerLocation;
 
 pub enum TaskRunnerMessage {
@@ -33,6 +34,8 @@ pub enum TaskRunnerMessage {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        /// Committed output statistics, sent only with a succeeded status.
+        statistics: Option<TaskOutputStatistics>,
     },
     ProbePendingLocalStream {
         key: TaskStreamKey,
@@ -51,8 +54,7 @@ pub enum TaskRunnerMessage {
     },
     CreateCelebornStream {
         key: TaskKey,
-        mappers: usize,
-        channels: usize,
+        output: ShuffleServiceOutput,
         schema: SchemaRef,
         result: oneshot::Sender<ExecutionResult<Box<dyn TaskStreamSink>>>,
     },
@@ -80,7 +82,8 @@ pub enum TaskRunnerMessage {
     FetchCelebornStream {
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
     },
@@ -162,6 +165,7 @@ impl SpanAssociation for TaskRunnerMessage {
                 status,
                 message,
                 cause,
+                statistics: _,
             } => {
                 properties.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
                 properties.push((SpanAttribute::EXECUTION_STAGE, stage.to_string()));

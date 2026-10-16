@@ -51,7 +51,8 @@ impl Actor for TaskRunnerActor {
                 status,
                 message,
                 cause,
-            } => self.handle_report_task_status(ctx, key, status, message, cause),
+                statistics,
+            } => self.handle_report_task_status(ctx, key, status, message, cause, statistics),
             TaskRunnerMessage::ProbePendingLocalStream { key } => {
                 self.handle_probe_pending_local_stream(key)
             }
@@ -69,11 +70,10 @@ impl Actor for TaskRunnerActor {
             } => self.handle_create_storage_stream(key, schema, context, result),
             TaskRunnerMessage::CreateCelebornStream {
                 key,
-                mappers,
-                channels,
+                output,
                 schema,
                 result,
-            } => self.handle_create_celeborn_stream(ctx, key, mappers, channels, schema, result),
+            } => self.handle_create_celeborn_stream(ctx, key, output, schema, result),
             TaskRunnerMessage::FetchDriverStream {
                 key,
                 schema,
@@ -97,10 +97,19 @@ impl Actor for TaskRunnerActor {
             TaskRunnerMessage::FetchCelebornStream {
                 job_id,
                 stage,
-                channels,
+                read,
+                map_attempts,
                 schema,
                 result,
-            } => self.handle_fetch_celeborn_stream(ctx, job_id, stage, channels, schema, result),
+            } => self.handle_fetch_celeborn_stream(
+                ctx,
+                job_id,
+                stage,
+                read,
+                map_attempts,
+                schema,
+                result,
+            ),
             TaskRunnerMessage::CleanUpLocalStreams { job_id, stage } => {
                 self.handle_clean_up_local_streams(job_id, stage)
             }

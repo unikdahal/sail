@@ -13,9 +13,10 @@ use tokio::sync::oneshot;
 use crate::driver::{DriverMessage, TaskStatus};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
+use crate::statistics::TaskOutputStatistics;
 use crate::stream::reader::TaskStreamSource;
-use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
-use crate::task::definition::TaskDefinition;
+use crate::stream::writer::{ShuffleServiceOutput, TaskStreamChannelSink, TaskStreamSink};
+use crate::task::definition::{ShuffleServiceRead, TaskDefinition};
 use crate::task_runner::monitor::TaskMonitor;
 use crate::task_runner::preparation::TaskPreparation;
 use crate::task_runner::{TaskRunnerActor, TaskRunnerPlacement};
@@ -105,6 +106,7 @@ impl TaskRunnerActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        statistics: Option<TaskOutputStatistics>,
     ) -> ActorAction {
         if !matches!(status, TaskStatus::Running) {
             self.signals.remove(&key);
@@ -119,6 +121,7 @@ impl TaskRunnerActor {
                             status,
                             message,
                             cause,
+                            statistics,
                             sequence: None,
                         })
                         .await;
@@ -149,9 +152,12 @@ impl TaskRunnerActor {
                             let key = key.clone();
                             let message = message.clone();
                             let cause = cause.clone();
+                            let statistics = statistics.clone();
                             async move {
                                 driver
-                                    .report_task_status(key, status, message, cause, seq)
+                                    .report_task_status(
+                                        key, status, message, cause, statistics, seq,
+                                    )
                                     .await
                             }
                         })
@@ -221,8 +227,7 @@ impl TaskRunnerActor {
         &mut self,
         ctx: &mut ActorContext<Self>,
         key: TaskKey,
-        mappers: usize,
-        channels: usize,
+        output: ShuffleServiceOutput,
         schema: Arc<Schema>,
         result: oneshot::Sender<ExecutionResult<Box<dyn TaskStreamSink>>>,
     ) -> ActorAction {
@@ -235,7 +240,7 @@ impl TaskRunnerActor {
         if let Some(streams) = self.extensions.celeborn_streams.clone() {
             ctx.spawn(async move {
                 let output = streams
-                    .create_stream(key, mappers, channels, schema)
+                    .create_stream(key, output, schema)
                     .await
                     .map_err(ExecutionError::from);
                 let _ = result.send(output);
@@ -366,7 +371,8 @@ impl TaskRunnerActor {
         ctx: &mut ActorContext<Self>,
         job_id: JobId,
         stage: usize,
-        channels: Vec<usize>,
+        read: ShuffleServiceRead,
+        map_attempts: Option<Arc<[i32]>>,
         schema: Arc<Schema>,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
     ) -> ActorAction {
@@ -379,7 +385,11 @@ impl TaskRunnerActor {
         let streams = self.extensions.celeborn_streams.clone();
         ctx.spawn(async move {
             let output = match streams {
-                Some(streams) => streams.fetch_stream(job_id, stage, channels, schema).await,
+                Some(streams) => {
+                    streams
+                        .fetch_stream(job_id, stage, read, map_attempts, schema)
+                        .await
+                }
                 None => Err(DataFusionError::Internal(
                     "Celeborn stream requested without a Celeborn shuffle backend".to_string(),
                 )),

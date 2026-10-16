@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::common::BatchHeader;
 use crate::error::{CelebornError, CelebornResult};
 use crate::protocol::StatusCode;
 use crate::protocol::proto::MessageType;
@@ -206,10 +207,14 @@ impl TransportFrame<'_> {
             .map_err(|_| CelebornError::Protocol("transport header is too large".to_string()))?;
         let body_length = i32::try_from(self.body.len())
             .map_err(|_| CelebornError::Protocol("transport body is too large".to_string()))?;
-        writer.write_i32(header_length).await?;
-        writer.write_u8(self.frame_type.into()).await?;
-        writer.write_i32(body_length).await?;
-        writer.write_all(&self.header).await?;
+        // The fixed fields and the header are written at once, so that a frame is not
+        // split into many small TCP segments.
+        let mut prefix = Vec::with_capacity(9 + self.header.len());
+        prefix.extend_from_slice(&header_length.to_be_bytes());
+        prefix.push(self.frame_type.into());
+        prefix.extend_from_slice(&body_length.to_be_bytes());
+        prefix.extend_from_slice(&self.header);
+        writer.write_all(&prefix).await?;
         self.body.write(writer).await?;
         writer.flush().await?;
         Ok(())
@@ -281,11 +286,16 @@ impl TransportConnection {
         header.push(0);
         write_bytes(&mut header, shuffle_key)?;
         write_bytes(&mut header, partition_unique_id)?;
-        let mut prefix = Vec::with_capacity(16);
-        prefix.extend_from_slice(&map_id.to_be_bytes());
-        prefix.extend_from_slice(&attempt_id.to_be_bytes());
-        prefix.extend_from_slice(&batch_id.to_be_bytes());
-        prefix.extend_from_slice(&data_length.to_be_bytes());
+        // The batch header uses the byte order of Celeborn's Java client
+        // (`Platform.putInt`, little-endian), which the worker reads to sort partition
+        // files by map ID for map-range reads.
+        let prefix = BatchHeader {
+            map_id,
+            attempt_id,
+            batch_id,
+            length: data_length,
+        }
+        .encode();
 
         let response = self
             .request(TransportFrame {
@@ -378,7 +388,11 @@ impl TransportConnection {
         let mut stream = self.stream.lock().await;
         let result = tokio::time::timeout(self.timeout, async {
             if stream.is_none() {
-                *stream = Some(TcpStream::connect((&*self.host, self.port)).await?);
+                let connection = TcpStream::connect((&*self.host, self.port)).await?;
+                // Every request waits for its response, so Nagle's algorithm would hold
+                // back the last segment of each request until a delayed acknowledgement.
+                connection.set_nodelay(true)?;
+                *stream = Some(connection);
             }
             let stream = stream.as_mut().ok_or_else(|| {
                 CelebornError::Protocol("connection was not initialized".to_string())

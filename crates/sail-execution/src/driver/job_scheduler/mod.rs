@@ -1,6 +1,11 @@
+mod adaptive;
 mod core;
 mod options;
 mod state;
+#[cfg(test)]
+mod test_utils;
+#[cfg(test)]
+mod tests;
 mod topology;
 
 use std::sync::Arc;
@@ -9,7 +14,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::TaskContext;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use indexmap::IndexMap;
-pub use options::JobSchedulerOptions;
+pub use options::{AdaptiveOptions, JobSchedulerOptions};
 use sail_common_datafusion::error::CommonErrorCause;
 use sail_telemetry::events::SystemEventReporter;
 pub use state::{JobState, TaskState};

@@ -3,9 +3,10 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Result, internal_err};
+use datafusion::common::{Result, Statistics, internal_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 
 /// A placeholder execution plan for stage inputs.
@@ -13,15 +14,27 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 pub struct StageInputExec<I> {
     input: I,
     properties: Arc<PlanProperties>,
+    /// Statistics of the committed input, known only on the driver once the
+    /// producer has committed its output. They are not sent to workers.
+    statistics: Option<Arc<Statistics>>,
 }
 
 impl<I> StageInputExec<I> {
     pub fn new(input: I, properties: Arc<PlanProperties>) -> Self {
-        Self { input, properties }
+        Self {
+            input,
+            properties,
+            statistics: None,
+        }
     }
 
     pub fn input(&self) -> &I {
         &self.input
+    }
+
+    pub fn with_statistics(mut self, statistics: Arc<Statistics>) -> Self {
+        self.statistics = Some(statistics);
+        self
     }
 }
 
@@ -53,6 +66,17 @@ where
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        match (&self.statistics, args.partition()) {
+            (Some(statistics), None) => Ok(Arc::clone(statistics)),
+            _ => Ok(Arc::new(Statistics::new_unknown(&self.schema()))),
+        }
     }
 
     fn apply_expressions(

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlanProperties;
@@ -8,6 +9,7 @@ use crate::driver::job_scheduler::topology::JobTopology;
 use crate::driver::output::{JobOutputManager, JobOutputOutcome};
 use crate::error::ExecutionResult;
 use crate::job_graph::JobGraph;
+use crate::statistics::{ShuffleStatistics, TaskOutputStatistics};
 
 /// Tracks graph/topology and runtime state for a single job.
 pub struct JobDescriptor {
@@ -17,6 +19,22 @@ pub struct JobDescriptor {
     pub stages: Vec<StageDescriptor>,
     pub regions: Vec<TaskRegionDescriptor>,
     pub state: JobState,
+    pub adaptive: AdaptiveMetrics,
+}
+
+/// Overhead of adaptive query execution for one job.
+#[derive(Debug, Default)]
+pub struct AdaptiveMetrics {
+    /// Time spent re-planning stages.
+    pub replanning_time: Duration,
+    /// The number of stages whose plans were rewritten.
+    pub replanned_stages: usize,
+    /// Bytes of compact statistics received with task reports.
+    pub statistics_payload_bytes: u64,
+    /// The number of bytes currently retained for statistics.
+    pub retained_statistics_bytes: u64,
+    /// The largest number of bytes retained for statistics at any time.
+    pub peak_retained_statistics_bytes: u64,
 }
 
 pub enum JobState {
@@ -63,6 +81,11 @@ impl JobDescriptor {
             let mut descriptor = StageDescriptor {
                 tasks: vec![],
                 state: StageState::Active,
+                commit: None,
+                adaptive: AdaptiveDecision::Pending,
+                statistics_reported: false,
+                retained_statistics_bytes: 0,
+                shuffle_statistics: None,
             };
             for _ in 0..stage.plan.output_partitioning().partition_count() {
                 descriptor.tasks.push(TaskDescriptor { attempts: vec![] });
@@ -82,6 +105,7 @@ impl JobDescriptor {
             stages,
             regions,
             state,
+            adaptive: AdaptiveMetrics::default(),
         })
     }
 }
@@ -91,6 +115,50 @@ pub struct StageDescriptor {
     /// A list of tasks for each partition of the stage.
     pub tasks: Vec<TaskDescriptor>,
     pub state: StageState,
+    /// The output that the shuffle backend committed for this stage, as reported by
+    /// the backend itself. This is set only for backends whose committed attempt can
+    /// differ from the scheduler's latest successful attempt (remote shuffle services).
+    pub commit: Option<ShuffleCommit>,
+    /// The adaptive decision for the stage, made once before any of its tasks run.
+    pub adaptive: AdaptiveDecision,
+    /// Whether the committed output statistics of the stage have been reported.
+    pub statistics_reported: bool,
+    /// The number of bytes retained for the statistics of the stage's attempts.
+    pub retained_statistics_bytes: u64,
+    /// The statistics of the committed attempts folded per bucket, cached so that
+    /// every consumer shares one fold. Cleared when the commit changes or the
+    /// statistics are released.
+    pub shuffle_statistics: Option<Arc<ShuffleStatistics>>,
+}
+
+/// The output that a shuffle backend committed for a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleCommit {
+    /// The attempt whose output the backend serves, for each producer partition.
+    pub attempts: Vec<usize>,
+    /// Whether the global commit succeeded. The output of a failed commit is lost:
+    /// reading it fails, and it is never used for adaptive decisions.
+    pub succeeded: bool,
+}
+
+/// The adaptive decision for a stage.
+/// A decision is made before any region of the stage has an attempt,
+/// and it never changes afterwards, so that retries reuse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveDecision {
+    /// No decision has been made yet.
+    Pending,
+    /// The stage runs as planned, either because it was not eligible or because
+    /// no rule applied.
+    Static,
+    /// The stage was re-planned.
+    Replanned,
+}
+
+impl AdaptiveDecision {
+    pub fn is_frozen(&self) -> bool {
+        !matches!(self, AdaptiveDecision::Pending)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,6 +206,10 @@ pub struct TaskAttemptDescriptor {
     /// This will always be false if the task does not belong to
     /// the final stages of the job.
     pub job_output_fetched: bool,
+    /// The committed output statistics reported with the succeeded status.
+    /// They are released once every consumer of the stage has made its
+    /// adaptive decision.
+    pub statistics: Option<Arc<TaskOutputStatistics>>,
 }
 
 #[derive(Debug, Clone, Copy)]

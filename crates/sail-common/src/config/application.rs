@@ -226,8 +226,43 @@ pub struct ClusterConfig {
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout_secs: u64,
     pub task_max_attempts: usize,
+    pub adaptive: ClusterAdaptiveConfig,
     pub rpc_retry_strategy: RetryStrategy,
     pub shuffle_backend: ShuffleBackend,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveConfig {
+    pub enabled: bool,
+    pub coalesce: ClusterAdaptiveCoalesceConfig,
+    pub join: ClusterAdaptiveJoinConfig,
+    pub skew: ClusterAdaptiveSkewConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveSkewConfig {
+    pub enabled: bool,
+    pub factor: f64,
+    pub threshold: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveCoalesceConfig {
+    pub enabled: bool,
+    pub target_size: u64,
+    pub min_partition_size: u64,
+    pub min_partitions: usize,
+    pub max_logical_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdaptiveJoinConfig {
+    pub enabled: bool,
+    pub max_build_partition_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +356,13 @@ pub enum ShuffleBackend {
     Flight(FlightShuffleBackend),
     Storage(StorageShuffleBackend),
     Celeborn(CelebornShuffleBackend),
+}
+
+impl ShuffleBackend {
+    /// Whether the backend is a remote shuffle service.
+    pub fn is_remote_shuffle_service(&self) -> bool {
+        matches!(self, ShuffleBackend::Celeborn(_))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1067,7 +1109,25 @@ impl ClusterConfigEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::CelebornCompressionCodec;
+    use super::{AppConfig, CelebornCompressionCodec};
+
+    #[test]
+    fn loads_adaptive_execution_defaults() -> Result<(), String> {
+        let config = AppConfig::load().map_err(|e| e.to_string())?;
+        let adaptive = &config.cluster.adaptive;
+        assert!(!adaptive.enabled);
+        assert!(adaptive.coalesce.enabled);
+        assert_eq!(adaptive.coalesce.target_size, 64 * 1024 * 1024);
+        assert_eq!(adaptive.coalesce.min_partition_size, 1024 * 1024);
+        assert_eq!(adaptive.coalesce.min_partitions, 1);
+        assert_eq!(adaptive.coalesce.max_logical_size, 256 * 1024 * 1024);
+        assert!(adaptive.join.enabled);
+        assert_eq!(adaptive.join.max_build_partition_size, 64 * 1024 * 1024);
+        assert!(adaptive.skew.enabled);
+        assert!((adaptive.skew.factor - 5.0).abs() < f64::EPSILON);
+        assert_eq!(adaptive.skew.threshold, 256 * 1024 * 1024);
+        Ok(())
+    }
 
     #[test]
     fn parses_celeborn_compression() {

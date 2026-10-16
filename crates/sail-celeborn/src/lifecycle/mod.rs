@@ -18,6 +18,29 @@ pub struct ReviveRequest {
     pub cause: i32,
 }
 
+/// The outcome of a shuffle's global commit.
+#[derive(Debug, Clone)]
+pub struct ShuffleCommitReport {
+    pub job_id: u64,
+    pub stage: u64,
+    pub shuffle_id: i32,
+    /// The attempt selected for each map ID, indexed by map ID.
+    pub map_attempts: Vec<i32>,
+    /// `Ok(())` when every worker committed its files, or the reason the shuffle is
+    /// lost.
+    pub result: Result<(), String>,
+}
+
+/// Receives shuffle commit reports from the lifecycle manager.
+#[tonic::async_trait]
+pub trait ShuffleCommitObserver: Send + Sync + 'static {
+    /// Called once per shuffle, when its global commit has succeeded or failed for
+    /// good. No `mapper_end` call that waits for the commit is answered before this
+    /// returns, so implementations must not block indefinitely: they should only hand
+    /// the report over, and drop it if the receiver is gone.
+    async fn shuffle_committed(&self, report: ShuffleCommitReport);
+}
+
 /// Operations supported by a shuffle lifecycle manager.
 #[tonic::async_trait]
 pub trait LifecycleManager: Send + Sync + 'static {

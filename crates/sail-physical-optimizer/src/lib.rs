@@ -45,6 +45,11 @@ mod select_semi_join_build_side;
 pub struct PhysicalOptimizerOptions {
     pub enable_join_reorder: bool,
     pub join_reorder: JoinReorderOptions,
+    /// Keep user-requested hash repartitions as `ExplicitRepartitionExec` so that the
+    /// distributed planner can tell them apart from engine-inserted shuffles.
+    /// Only valid when the plan is executed by the cluster job graph, which splits
+    /// stages at these nodes.
+    pub preserve_explicit_hash_repartition: bool,
 }
 
 pub fn get_physical_optimizers(
@@ -85,7 +90,9 @@ pub fn get_physical_optimizers(
     rules.push(Arc::new(EnsureCooperative::new()));
     rules.push(Arc::new(PostFilterPushdown));
     rules.push(Arc::new(RewriteInputFileMetadataFallback::new()));
-    rules.push(Arc::new(RewriteExplicitRepartition::new()));
+    rules.push(Arc::new(RewriteExplicitRepartition::new_with_options(
+        options.preserve_explicit_hash_repartition,
+    )));
     rules.push(Arc::new(RewriteCollectLeftHashJoin::new()));
     rules.push(Arc::new(EnforceBarrierPartitioning::new()));
     rules.push(Arc::new(SanityCheckPlan::new()));
