@@ -44,13 +44,9 @@ pub enum LifecycleManagerMessage {
         num_mappers: i32,
         result: oneshot::Sender<CelebornResult<()>>,
     },
-    MapperEndComplete {
+    CommitComplete {
         shuffle_id: i32,
-        /// The mapper whose `mapper_end` triggered the commit.
-        map_id: usize,
-        map_attempts: Vec<i32>,
         result: CelebornResult<ApplicationMetrics>,
-        reply: oneshot::Sender<CelebornResult<()>>,
     },
     UnregisterShuffle {
         shuffle_id: i32,
@@ -87,7 +83,7 @@ impl SpanAssociation for LifecycleManagerMessage {
             Self::Revive { .. } => "Revive",
             Self::ReviveComplete { .. } => "ReviveComplete",
             Self::MapperEnd { .. } => "MapperEnd",
-            Self::MapperEndComplete { .. } => "MapperEndComplete",
+            Self::CommitComplete { .. } => "CommitComplete",
             Self::UnregisterShuffle { .. } => "UnregisterShuffle",
             Self::UnregisterShuffleComplete { .. } => "UnregisterShuffleComplete",
             Self::ReportMetrics { .. } => "ReportMetrics",

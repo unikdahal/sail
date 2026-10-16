@@ -189,3 +189,29 @@ fn failed_shuffle_commit_fails_the_consumer_definition() {
     }));
     assert!(result.is_err(), "reading an uncommitted shuffle must fail");
 }
+
+#[test]
+fn shuffle_commit_is_recorded_once() {
+    let options = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
+    let mut scheduler = JobScheduler::new(options, reporter());
+    let job_id = JobId::from(1);
+    let mut descriptor = job(aggregate_graph());
+    succeed(&mut descriptor, 0, producer_statistics);
+    scheduler.jobs.insert(job_id, descriptor);
+
+    scheduler.record_shuffle_commit(job_id, 0, vec![0; 4], Err("worker failed".to_string()));
+    // A shuffle service never revises a commit. A later report must not turn a lost
+    // shuffle into a readable one.
+    scheduler.record_shuffle_commit(job_id, 0, vec![0; 4], Ok(()));
+    assert_eq!(
+        scheduler.jobs[&job_id].stages[0].commit,
+        Some(ShuffleCommit {
+            attempts: vec![0; 4],
+            succeeded: false,
+        })
+    );
+}

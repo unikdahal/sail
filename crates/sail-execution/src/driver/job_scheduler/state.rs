@@ -136,8 +136,8 @@ pub struct StageDescriptor {
 pub struct ShuffleCommit {
     /// The attempt whose output the backend serves, for each producer partition.
     pub attempts: Vec<usize>,
-    /// Whether the global commit succeeded. Readers of a failed commit see
-    /// unverified data, so such output is never used for adaptive decisions.
+    /// Whether the global commit succeeded. The output of a failed commit is lost:
+    /// reading it fails, and it is never used for adaptive decisions.
     pub succeeded: bool,
 }
 

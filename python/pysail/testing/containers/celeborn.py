@@ -26,6 +26,7 @@ _MASTER_PORT = 12097
 _MASTER_HTTP_PORT = 12098
 _CONFIG_PATH = Path(__file__).with_name("celeborn-defaults.conf")
 _WORKER_NAMES = ("celeborn-worker-1", "celeborn-worker-2")
+_NATIVE_TRANSPORT_MARKER = 0xFF
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,99 @@ class CelebornFrame:
     message_type: int
     metadata: bytes
     body: bytes
+
+
+def _rpc_request_message_offset(frame: CelebornFrame) -> int:
+    if frame.message_type != CelebornMessageType.RPC_REQUEST:
+        msg = "expected a Celeborn RPC request"
+        raise ValueError(msg)
+    offset = 1  # sender protocol version
+    sender_host_length = struct.unpack_from(">H", frame.body, offset)[0]
+    offset += 2 + sender_host_length + 4
+    offset += 1  # receiver protocol version
+    receiver_host_length = struct.unpack_from(">H", frame.body, offset)[0]
+    offset += 2 + receiver_host_length + 4
+    endpoint_length = struct.unpack_from(">H", frame.body, offset)[0]
+    offset += 2 + endpoint_length
+    if frame.body[offset] != _NATIVE_TRANSPORT_MARKER:
+        msg = "expected a native Celeborn control message"
+        raise ValueError(msg)
+    return offset + 1
+
+
+def celeborn_rpc_message(frame: CelebornFrame) -> tuple[int, bytes]:
+    """Read the control-message type and protobuf payload of a native client RPC.
+
+    Requests use the native RPC envelope. Celeborn 0.6.x worker responses use a
+    Java-serialized ``TransportMessage``; only its integer type and byte-array
+    payload are read here, following the same V1 layout as the native client.
+    """
+    if frame.message_type == CelebornMessageType.RPC_REQUEST:
+        offset = _rpc_request_message_offset(frame)
+        message_type, length = struct.unpack_from(">ii", frame.body, offset)
+        payload = frame.body[offset + 8 :]
+        if len(payload) != length:
+            msg = "invalid Celeborn control-message payload length"
+            raise ValueError(msg)
+        return message_type, payload
+    if frame.message_type != CelebornMessageType.RPC_RESPONSE:
+        msg = "expected a Celeborn RPC request or response"
+        raise ValueError(msg)
+
+    offset = 0
+
+    def read(length: int) -> bytes:
+        nonlocal offset
+        end = offset + length
+        if length < 0 or end > len(frame.body):
+            msg = "truncated Java-serialized Celeborn response"
+            raise ValueError(msg)
+        result = frame.body[offset:end]
+        offset = end
+        return result
+
+    def read_utf() -> bytes:
+        return read(struct.unpack(">H", read(2))[0])
+
+    if read(6) != b"\xac\xed\x00\x05\x73\x72":
+        msg = "expected a Java-serialized Celeborn TransportMessage"
+        raise ValueError(msg)
+    if read_utf() != b"org.apache.celeborn.common.network.protocol.TransportMessage":
+        msg = "unexpected Java-serialized Celeborn response class"
+        raise ValueError(msg)
+    read(9)  # serialVersionUID and class flags
+    for _ in range(struct.unpack(">H", read(2))[0]):
+        field_type = read(1)
+        read_utf()  # field name
+        if field_type in (b"L", b"["):
+            descriptor_type = read(1)
+            if descriptor_type == b"\x74":  # TC_STRING
+                read_utf()
+            elif descriptor_type == b"\x71":  # TC_REFERENCE
+                read(4)
+            else:
+                msg = "unsupported Java response field descriptor"
+                raise ValueError(msg)
+    if read(2) != b"\x78\x70":  # TC_ENDBLOCKDATA, TC_NULL superclass
+        msg = "unsupported Java response class hierarchy"
+        raise ValueError(msg)
+    message_type = struct.unpack(">i", read(4))[0]
+    if read(2) != b"\x75\x72" or read_utf() != b"[B":
+        msg = "expected a Java byte-array response payload"
+        raise ValueError(msg)
+    read(9)  # array serialVersionUID and flags
+    if read(4) != b"\x00\x00\x78\x70":  # no fields, end block, null superclass
+        msg = "unsupported Java byte-array class hierarchy"
+        raise ValueError(msg)
+    return message_type, read(struct.unpack(">i", read(4))[0])
+
+
+def celeborn_with_rpc_payload(frame: CelebornFrame, payload: bytes) -> CelebornFrame:
+    """Replace a native RPC request payload and update both encoded lengths."""
+    offset = _rpc_request_message_offset(frame)
+    body = frame.body[: offset + 4] + struct.pack(">i", len(payload)) + payload
+    metadata = frame.metadata[:8] + struct.pack(">i", len(body))
+    return CelebornFrame(frame.message_type, metadata, body)
 
 
 class CelebornFrameDecoder(FrameDecoder[CelebornFrame]):
@@ -393,4 +487,47 @@ def celeborn_push_endpoint_resolver(
             for name in celeborn_workers
         }
         | {(name, 12002): (worker.host, worker.fetch_port) for name, worker in celeborn_workers.items()}
+    )
+
+
+@pytest.fixture
+def celeborn_rpc_proxies(
+    celeborn_workers: dict[str, WorkerService],
+    celeborn_frame_codec: CelebornCodec,
+) -> Generator[dict[str, EndpointProxy], None, None]:
+    """Forward worker control RPCs through proxies for precise commit faults."""
+    proxies = {
+        name: EndpointProxy(
+            name=f"{name}:rpc",
+            target_host=worker.host,
+            target_port=worker.rpc_port,
+            codec=celeborn_frame_codec,
+        )
+        for name, worker in celeborn_workers.items()
+    }
+    for proxy in proxies.values():
+        proxy.start()
+    try:
+        yield proxies
+    finally:
+        for proxy in proxies.values():
+            proxy.close()
+
+
+def celeborn_rpc_endpoint_overrides(
+    celeborn_workers: dict[str, WorkerService],
+    celeborn_rpc_proxies: dict[str, EndpointProxy],
+) -> str:
+    """Route the driver's worker RPCs through proxies, retaining other endpoints."""
+    return "[{}]".format(
+        ", ".join(
+            f'{{ internal = "{name.split(":")[0]}:{port}", external = "{host}:{mapped_port}" }}'
+            for name, worker in celeborn_workers.items()
+            for port, host, mapped_port in zip(
+                worker.internal_ports,
+                (celeborn_rpc_proxies[name].host, worker.host, worker.host, worker.host),
+                (celeborn_rpc_proxies[name].port, worker.push_port, worker.fetch_port, worker.replicate_port),
+                strict=True,
+            )
+        )
     )

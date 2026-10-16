@@ -39,10 +39,16 @@ and the Rust tests of the changed crates on its own.
   all its split locations, with a `PartitionReadOptions` API in the client and the Python
   binding. Readers fail clearly on DFS-backed partitions, which the native client does not
   read (see "Blockers").
-- The lifecycle manager reports each shuffle commit (the selected attempt of every mapper
-  and the result) to an observer before acknowledging the last mapper. After a failed
-  `commit_files`, the mapper that triggered it is retried with a new commit instead of
-  being acknowledged with unverified data (open question 3 of the design).
+- A shuffle is committed once. The selected attempt of every mapper (the first attempt
+  of each to end) is fixed when the last mapper ends and is never revised, since a worker
+  that has committed stops storing pushes for the shuffle. Workers commit concurrently,
+  and a failed worker commit is retried with the identical request, which workers answer
+  idempotently. If it keeps failing, the shuffle is lost: every `mapper_end` and every
+  reader of it fails, so the query fails instead of returning partial data (open
+  question 3 of the design).
+- The lifecycle manager reports the commit (selected attempts and result) to an observer
+  before answering any `mapper_end` that waits for it. `mapper_end` calls made during the
+  commit wait for its outcome, so no producer task succeeds before the commit is known.
 - The driver records the committed attempts per stage from a backend-neutral
   `ShuffleCommitted` message. Task definitions pass them to remote shuffle service readers, and reading a shuffle whose commit failed fails the consumer task.
 - A producer's output stays readable until every consumer region has succeeded (or the
@@ -124,11 +130,12 @@ All results are from the final tree unless noted.
 |---|---|
 | `cargo clippy --all-targets -- -D warnings` (changed crates) | clean, every layer |
 | `cargo +nightly fmt --check`, `hatch fmt --check` | clean |
-| `sail-execution` unit and property tests | 219 passed (layer 1: 143, layer 2: 159, layer 3: 205) |
+| `sail-execution` unit and property tests | 220 passed (layer 1: 144, layer 2: 161, layer 3: 207) |
 | `sail-celeborn` / `sail-common` / `sail-system-store` tests | 12 / 12 / 9 passed |
-| Celeborn client integration tests, Docker (`pysail.tests.celeborn`) | 18 passed |
+| Celeborn client integration tests, Docker (`pysail.tests.celeborn`) | 21 passed |
 | Spark Celeborn tests, Docker (`test_shuffle_celeborn`, `test_adaptive_execution`) | 10 passed |
-| Same suites against a native Celeborn 0.6.3 cluster | passed |
+| Same suites against a native Celeborn 0.6.3 cluster | passed (before the commit protocol change) |
+| Commit failure tests (`test_shuffle_commit`), 10 repetitions | 30 passed |
 
 Property tests cover the size codes (1% bound, emptiness, totals, proto round trip), the
 coalescer (coverage and caps), the exact-coverage contract (valid split specs pair every
@@ -136,8 +143,11 @@ row exactly once, and any corrupted spec that the contract still accepts does to
 Spark's split helper.
 
 Failure injection: a producer task that pushes part of its output and then fails is
-retried, and its output is read exactly once (with and without AQE); a failed Celeborn
-commit fails the consumer's definition; a rule failure keeps the static plan and freezes
+retried, and its output is read exactly once (with and without AQE); a worker that
+rejects `CommitFiles` once, before or after the other worker has committed, gets the
+identical request again and every row is returned; a worker that keeps rejecting it
+makes the query fail with a lost-shuffle error (Docker, through a frame-level proxy that
+sets Celeborn's `mockFailure` flag); a failed commit fails the consumer's definition; a rule failure keeps the static plan and freezes
 the decision; retried consumer tasks reuse the adapted plan; statistics of an attempt that
 Celeborn did not commit are never used.
 
@@ -184,7 +194,12 @@ static plan already builds from the smaller side.
   understate the data a task reads by a large factor.
 - **Minimum-size merges** run left to right in linear time instead of always merging the
   globally smallest range, which can give different (still valid) ranges in ties.
-- **Re-commit after a failed `commit_files`** is implemented (open question 3).
+- **Failed `commit_files`** (open question 3). Workers commit a shuffle once and then
+  drop pushes for it, so the selected attempts can never change after any worker has
+  committed. The commit is retried as is, and a commit that keeps failing loses the
+  shuffle and fails the query. An earlier version re-selected attempts after a failure;
+  a Docker reproduction showed it silently lost the rows of the worker that had already
+  committed, and it was replaced by this protocol.
 - **The table** is `system.execution.stages` (the design refers to `cluster.stages`).
 - **Generic remote shuffle service naming.** Code outside the Celeborn client and its
   stream adapter is named for remote shuffle services (`is_remote_shuffle_service`,
@@ -200,9 +215,8 @@ static plan already builds from the smaller side.
 - **DFS-backed Celeborn partitions** are not read by the native client (the worker returns
   a full path instead of a stream). Readers fail clearly instead of returning partial data.
   Celeborn's default local-disk storage is unaffected.
-- **Re-commit after a failed `commit_files`** is covered by reasoning and the driver-side
-  tests (a failed commit fails the consumer; a new commit replaces the old one and drops
-  cached statistics), not by an integration test that makes a worker fail `commitFiles`.
+- **A lost shuffle fails the query.** Recomputing the producer stage under a new shuffle
+  ID, as Spark does after a fetch failure on Celeborn, is not implemented.
 - **Per-layer Python tests.** The Python suites ran on the final tree. For the lower layers
   they run in CI on their pull requests.
 - **Benchmarks** ran on one 4-core machine. The manual workflow can repeat them with larger

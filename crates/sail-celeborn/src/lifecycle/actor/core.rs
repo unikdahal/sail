@@ -24,9 +24,7 @@ impl Actor for LifecycleManagerActor {
             reservations: Default::default(),
             pending_slot_requests: Default::default(),
             pending_revives: Default::default(),
-            mapper_attempts: Default::default(),
-            committing_shuffles: Default::default(),
-            committed_shuffles: Default::default(),
+            shuffle_commits: Default::default(),
             shuffle_ids: Default::default(),
             next_shuffle_id: 0,
             application_registration: ApplicationRegistration::Pending,
@@ -103,20 +101,9 @@ impl Actor for LifecycleManagerActor {
                 num_mappers,
                 result,
             } => self.handle_mapper_end(ctx, shuffle_id, map_id, attempt_id, num_mappers, result),
-            LifecycleManagerMessage::MapperEndComplete {
-                shuffle_id,
-                map_id,
-                map_attempts,
-                result,
-                reply,
-            } => self.handle_mapper_end_complete(
-                ctx,
-                shuffle_id,
-                map_id,
-                map_attempts,
-                result,
-                reply,
-            ),
+            LifecycleManagerMessage::CommitComplete { shuffle_id, result } => {
+                self.handle_commit_complete(ctx, shuffle_id, result)
+            }
             LifecycleManagerMessage::UnregisterShuffle { shuffle_id, result } => {
                 self.handle_unregister_shuffle(ctx, shuffle_id, result)
             }

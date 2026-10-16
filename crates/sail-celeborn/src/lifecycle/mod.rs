@@ -29,15 +29,17 @@ pub struct ShuffleCommitReport {
     pub shuffle_id: i32,
     /// The attempt selected for each map ID, indexed by map ID.
     pub map_attempts: Vec<i32>,
-    /// `Ok(())` when every worker committed its files.
+    /// `Ok(())` when every worker committed its files, or the reason the shuffle is
+    /// lost.
     pub result: Result<(), String>,
 }
 
 /// Receives shuffle commit reports from the lifecycle manager.
 #[tonic::async_trait]
 pub trait ShuffleCommitObserver: Send + Sync + 'static {
-    /// Called once per global commit attempt. The mapper that triggered the commit
-    /// gets its reply only after this returns.
+    /// Called once per shuffle, when its global commit has succeeded or failed for
+    /// good. No `mapper_end` call that waits for the commit is answered before this
+    /// returns.
     async fn shuffle_committed(&self, report: ShuffleCommitReport);
 }
 

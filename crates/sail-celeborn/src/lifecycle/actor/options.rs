@@ -19,6 +19,10 @@ pub struct LifecycleManagerOptions {
     pub partition_split_mode: PartitionSplitMode,
     pub heartbeat_interval: Duration,
     pub commit_observer: Option<Arc<dyn ShuffleCommitObserver>>,
+    /// How many times a failed worker commit is retried before the shuffle is lost.
+    pub commit_max_retries: usize,
+    /// The wait before retrying a failed worker commit.
+    pub commit_retry_wait: Duration,
 }
 
 impl std::fmt::Debug for LifecycleManagerOptions {
@@ -33,6 +37,8 @@ impl std::fmt::Debug for LifecycleManagerOptions {
             .field("partition_split_threshold", &self.partition_split_threshold)
             .field("partition_split_mode", &self.partition_split_mode)
             .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("commit_max_retries", &self.commit_max_retries)
+            .field("commit_retry_wait", &self.commit_retry_wait)
             .field(
                 "commit_observer",
                 &if self.commit_observer.is_some() {
@@ -60,6 +66,9 @@ impl LifecycleManagerOptions {
             partition_split_mode: PartitionSplitMode::Soft,
             heartbeat_interval: Duration::from_secs(10),
             commit_observer: None,
+            // Match Celeborn's `celeborn.client.requestCommitFiles.maxRetries` default.
+            commit_max_retries: 4,
+            commit_retry_wait: Duration::from_secs(1),
         }
     }
 
@@ -76,6 +85,12 @@ impl LifecycleManagerOptions {
 
     pub fn with_commit_observer(mut self, observer: Arc<dyn ShuffleCommitObserver>) -> Self {
         self.commit_observer = Some(observer);
+        self
+    }
+
+    pub fn with_commit_retries(mut self, max_retries: usize, retry_wait: Duration) -> Self {
+        self.commit_max_retries = max_retries;
+        self.commit_retry_wait = retry_wait;
         self
     }
 

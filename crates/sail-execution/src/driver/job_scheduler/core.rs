@@ -840,6 +840,7 @@ impl JobScheduler {
     }
 
     /// Records the output that the remote shuffle service committed for a stage.
+    /// A shuffle is committed once, successfully or not, and the commit never changes.
     pub fn record_shuffle_commit(
         &mut self,
         job_id: JobId,
@@ -855,6 +856,10 @@ impl JobScheduler {
             warn!("job {job_id} stage {stage} not found for shuffle commit");
             return;
         };
+        if let Some(commit) = &descriptor.commit {
+            warn!("job {job_id} stage {stage} shuffle is already committed: {commit:?}");
+            return;
+        }
         let attempts = map_attempts
             .iter()
             .enumerate()
@@ -885,7 +890,6 @@ impl JobScheduler {
         };
         debug!("job {job_id} stage {stage} shuffle commit: {commit:?}");
         descriptor.commit = Some(commit);
-        descriptor.shuffle_statistics = None;
     }
 
     /// Returns the attempt whose output the shuffle backend committed, for each
