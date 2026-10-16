@@ -13,7 +13,7 @@ use sail_python_udf::error::PyErrExtractor;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::driver::actor::DriverActor;
+use crate::driver::actor::{CommittedShuffle, DriverActor};
 use crate::driver::job_scheduler::{JobAction, TaskState};
 use crate::driver::output::{JobOutputItem, JobOutputOutcome};
 use crate::driver::worker_scaler::{WorkerLaunchRequest, WorkerRetryRequest};
@@ -28,6 +28,24 @@ use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter, TaskStreamAs
 use crate::task_runner::TaskRunnerMessage;
 
 impl DriverActor {
+    pub(super) fn handle_shuffle_committed(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        commit: CommittedShuffle,
+    ) -> ActorAction {
+        let CommittedShuffle {
+            job_id,
+            stage,
+            map_attempts,
+            result,
+        } = commit;
+        self.job_scheduler
+            .record_shuffle_commit(job_id, stage, map_attempts, result);
+        self.refresh_job(ctx, job_id);
+        self.run_tasks(ctx);
+        ActorAction::Continue
+    }
+
     pub(super) fn handle_celeborn_get_lifecycle_manager(
         &mut self,
         result: oneshot::Sender<Option<ActorHandle<LifecycleManagerActor>>>,

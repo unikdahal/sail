@@ -81,6 +81,7 @@ pub enum TaskRunnerMessage {
         job_id: JobId,
         stage: usize,
         channels: Vec<usize>,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
     },

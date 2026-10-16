@@ -367,6 +367,7 @@ impl TaskRunnerActor {
         job_id: JobId,
         stage: usize,
         channels: Vec<usize>,
+        map_attempts: Option<Arc<[i32]>>,
         schema: Arc<Schema>,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
     ) -> ActorAction {
@@ -379,7 +380,11 @@ impl TaskRunnerActor {
         let streams = self.extensions.celeborn_streams.clone();
         ctx.spawn(async move {
             let output = match streams {
-                Some(streams) => streams.fetch_stream(job_id, stage, channels, schema).await,
+                Some(streams) => {
+                    streams
+                        .fetch_stream(job_id, stage, channels, map_attempts, schema)
+                        .await
+                }
                 None => Err(DataFusionError::Internal(
                     "Celeborn stream requested without a Celeborn shuffle backend".to_string(),
                 )),

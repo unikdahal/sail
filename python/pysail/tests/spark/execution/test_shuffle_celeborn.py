@@ -10,6 +10,7 @@ import pyspark.sql.functions as F  # noqa: N812
 import pytest
 from pyspark.sql.types import Row
 
+from pysail.testing.containers.celeborn import celeborn_endpoint_overrides
 from pysail.testing.spark.session import spark_connect_server, spark_session_factory
 from pysail.testing.spark.utils.common import is_jvm_spark
 
@@ -24,24 +25,18 @@ pytestmark = [
 ]
 
 
+# The rows of the retry test, and the row at which its first attempt fails.
+RETRY_ROWS = 200_000
+FAILING_ROW = 150_000
+
+
 @pytest.fixture(scope="module")
 def remote(
     celeborn_master: MasterService,
     celeborn_workers: dict[str, WorkerService],
 ) -> Generator[str, None, None]:
     """Run Spark Connect with a Celeborn shuffle backend."""
-    endpoint_overrides = "[{}]".format(
-        ", ".join(
-            f'{{ internal = "{hostname}:{port}", external = "{worker.host}:{mapped_port}" }}'
-            for hostname, worker in celeborn_workers.items()
-            for port, mapped_port in [
-                (12000, worker.rpc_port),
-                (12001, worker.push_port),
-                (12002, worker.fetch_port),
-                (12003, worker.replicate_port),
-            ]
-        )
-    )
+    endpoint_overrides = celeborn_endpoint_overrides(celeborn_workers)
     envs = {
         "SAIL_MODE": "local-cluster",
         "SAIL_CLUSTER__SHUFFLE_BACKEND__TYPE": "celeborn",
@@ -49,6 +44,27 @@ def remote(
             f'["{celeborn_master.host}:{celeborn_master.port}"]'
         ),
         "SAIL_CLUSTER__SHUFFLE_BACKEND__CELEBORN__ENDPOINT_OVERRIDES": endpoint_overrides,
+    }
+    with spark_connect_server(envs=envs) as server:
+        yield server.remote
+
+
+@pytest.fixture(scope="module")
+def retrying_remote(
+    celeborn_master: MasterService,
+    celeborn_workers: dict[str, WorkerService],
+) -> Generator[str, None, None]:
+    """Run Spark Connect with a Celeborn shuffle backend that retries failed tasks."""
+    envs = {
+        "SAIL_MODE": "local-cluster",
+        "SAIL_CLUSTER__SHUFFLE_BACKEND__TYPE": "celeborn",
+        "SAIL_CLUSTER__SHUFFLE_BACKEND__CELEBORN__MASTER_ENDPOINTS": (
+            f'["{celeborn_master.host}:{celeborn_master.port}"]'
+        ),
+        "SAIL_CLUSTER__SHUFFLE_BACKEND__CELEBORN__ENDPOINT_OVERRIDES": celeborn_endpoint_overrides(celeborn_workers),
+        "SAIL_CLUSTER__TASK_MAX_ATTEMPTS": "3",
+        # Small batches, so that a task pushes output to Celeborn before an injected failure.
+        "SAIL_EXECUTION__BATCH_SIZE": "1024",
     }
     with spark_connect_server(envs=envs) as server:
         yield server.remote
@@ -120,3 +136,44 @@ def test_consumed_celeborn_shuffle_data_is_removed(spark, celeborn_master: Maste
         time.sleep(0.05)
 
     assert shuffle_ids == [], "the Celeborn shuffle was not removed after the query completed"
+
+
+def _fail_once(marker: str):
+    """Returns a UDF that fails the first time it sees `FAILING_ROW`, after earlier
+    batches of the task have already been pushed to Celeborn."""
+
+    @F.udf("long")
+    def fail_once(value):
+        import os
+
+        if value == FAILING_ROW and not os.path.exists(marker):
+            with open(marker, "w") as f:
+                f.write("failed")
+            msg = "injected failure"
+            raise RuntimeError(msg)
+        return value
+
+    return fail_once
+
+
+def test_retried_producer_output_is_read_once(retrying_remote, tmp_path):
+    marker = str(tmp_path / "failed")
+    with spark_session_factory(retrying_remote) as sessions:
+        spark = sessions.create()
+        rows = (
+            spark.range(0, RETRY_ROWS, 1, 2)
+            .select(_fail_once(marker)("id").alias("id"))
+            # Shuffle the rows as they are produced, so that the failing attempt pushes
+            # output to Celeborn before it fails.
+            .repartition(8, "id")
+            .groupBy((F.col("id") % 100).alias("m"))
+            .agg(F.count("*").alias("c"), F.sum("id").alias("s"))
+            .collect()
+        )
+    import os
+
+    assert os.path.exists(marker), "the failure was not injected"
+    # A failed attempt pushed partial output before failing. Reading it in addition to
+    # the retried attempt would duplicate rows.
+    assert sum(row.c for row in rows) == RETRY_ROWS
+    assert sum(row.s for row in rows) == sum(range(RETRY_ROWS))

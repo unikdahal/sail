@@ -63,6 +63,7 @@ impl JobDescriptor {
             let mut descriptor = StageDescriptor {
                 tasks: vec![],
                 state: StageState::Active,
+                commit: None,
             };
             for _ in 0..stage.plan.output_partitioning().partition_count() {
                 descriptor.tasks.push(TaskDescriptor { attempts: vec![] });
@@ -91,6 +92,20 @@ pub struct StageDescriptor {
     /// A list of tasks for each partition of the stage.
     pub tasks: Vec<TaskDescriptor>,
     pub state: StageState,
+    /// The output that the shuffle backend committed for this stage, as reported by
+    /// the backend itself. This is set only for backends whose committed attempt can
+    /// differ from the scheduler's latest successful attempt (remote shuffle services).
+    pub commit: Option<ShuffleCommit>,
+}
+
+/// The output that a shuffle backend committed for a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleCommit {
+    /// The attempt whose output the backend serves, for each producer partition.
+    pub attempts: Vec<usize>,
+    /// Whether the global commit succeeded. The output of a failed commit is lost,
+    /// and reading it fails.
+    pub succeeded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
