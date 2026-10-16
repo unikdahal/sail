@@ -233,6 +233,7 @@ impl TaskStreamAccessor {
         job_id: JobId,
         stage: usize,
         channels: Vec<usize>,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
         let (result, rx) = oneshot::channel();
@@ -241,6 +242,7 @@ impl TaskStreamAccessor {
                 job_id,
                 stage,
                 channels,
+                map_attempts,
                 schema,
                 result,
             },
@@ -321,7 +323,10 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                 }))
                 .await?
             }
-            TaskInputLocator::ShuffleService { channels } => {
+            TaskInputLocator::ShuffleService {
+                channels,
+                map_attempts,
+            } => {
                 let channels = channels.get(partition).ok_or_else(|| {
                     DataFusionError::Execution(format!("input partition {partition} not found"))
                 })?;
@@ -331,6 +336,7 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                             self.key.job_id,
                             self.input.stage,
                             channels.clone(),
+                            map_attempts.clone(),
                             self.schema.clone(),
                         )
                         .await?,

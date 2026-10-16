@@ -89,9 +89,25 @@ pub enum DriverMessage {
     CelebornGetLifecycleManager {
         result: oneshot::Sender<Option<ActorHandle<LifecycleManagerActor>>>,
     },
+    /// The remote shuffle service committed (or failed to commit) the shuffle
+    /// written by a stage.
+    ShuffleCommitted {
+        commit: CommittedShuffle,
+    },
     Shutdown {
         result: Option<oneshot::Sender<()>>,
     },
+}
+
+/// The output that a remote shuffle service committed for a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedShuffle {
+    pub job_id: JobId,
+    pub stage: usize,
+    /// The committed attempt of each map task.
+    pub map_attempts: Vec<i32>,
+    /// The result of the global commit.
+    pub result: Result<(), String>,
 }
 
 /// The observed task status that drives the task state transition.
@@ -155,6 +171,7 @@ impl SpanAssociation for DriverMessage {
             DriverMessage::FetchDriverStream { .. } => "FetchDriverStream",
             DriverMessage::FetchWorkerStream { .. } => "FetchWorkerStream",
             DriverMessage::CelebornGetLifecycleManager { .. } => "CelebornGetLifecycleManager",
+            DriverMessage::ShuffleCommitted { .. } => "ShuffleCommitted",
             DriverMessage::Shutdown { .. } => "Shutdown",
         };
         name.into()
@@ -285,6 +302,10 @@ impl SpanAssociation for DriverMessage {
                 p.push((SpanAttribute::EXECUTION_CHANNEL, channel.to_string()));
             }
             DriverMessage::CelebornGetLifecycleManager { result: _ } => {}
+            DriverMessage::ShuffleCommitted { commit } => {
+                p.push((SpanAttribute::EXECUTION_JOB_ID, commit.job_id.to_string()));
+                p.push((SpanAttribute::EXECUTION_STAGE, commit.stage.to_string()));
+            }
             DriverMessage::Shutdown { .. } => {}
         }
         p.into_iter().map(|(k, v)| (k.into(), v.into()))

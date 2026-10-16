@@ -23,3 +23,15 @@ impl From<&DriverOptions> for JobSchedulerOptions {
         }
     }
 }
+
+#[cfg(test)]
+impl JobSchedulerOptions {
+    pub fn new_for_test(shuffle_backend: ShuffleBackendKind) -> Self {
+        Self {
+            session_id: "test".to_string(),
+            task_launch_timeout: Duration::from_secs(10),
+            task_max_attempts: 3,
+            shuffle_backend,
+        }
+    }
+}

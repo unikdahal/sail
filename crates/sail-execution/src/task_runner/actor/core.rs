@@ -98,9 +98,18 @@ impl Actor for TaskRunnerActor {
                 job_id,
                 stage,
                 channels,
+                map_attempts,
                 schema,
                 result,
-            } => self.handle_fetch_celeborn_stream(ctx, job_id, stage, channels, schema, result),
+            } => self.handle_fetch_celeborn_stream(
+                ctx,
+                job_id,
+                stage,
+                channels,
+                map_attempts,
+                schema,
+                result,
+            ),
             TaskRunnerMessage::CleanUpLocalStreams { job_id, stage } => {
                 self.handle_clean_up_local_streams(job_id, stage)
             }

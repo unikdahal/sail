@@ -8,7 +8,7 @@ use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::{DataFusionError, Result};
 use futures::{StreamExt, TryStreamExt};
-use sail_celeborn::shuffle::ShuffleClient;
+use sail_celeborn::shuffle::{PartitionReadOptions, ShuffleClient};
 
 use crate::id::{JobId, TaskKey};
 use crate::stream::error::TaskStreamError;
@@ -16,6 +16,9 @@ use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{
     MultiChannelTaskStreamSink, TaskStreamChannelSink, TaskStreamSink, TaskStreamWriteState,
 };
+
+/// The largest number of shuffle partitions that one task reads at a time.
+const MAX_CONCURRENT_PARTITION_READS: usize = 8;
 
 #[derive(Clone)]
 pub(crate) struct CelebornStreamManager {
@@ -119,8 +122,13 @@ impl CelebornStreamManager {
         job_id: JobId,
         stage: usize,
         channels: Vec<usize>,
+        map_attempts: Option<Arc<[i32]>>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
+        let options = PartitionReadOptions {
+            map_range: None,
+            map_attempts,
+        };
         let shuffle_id = self
             .client
             .get_shuffle_id(job_id.into(), stage as u64)
@@ -138,33 +146,34 @@ impl CelebornStreamManager {
             .register_shuffle(shuffle_id, partition_ids.clone(), false, 0)
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let streams = futures::future::join_all(
-            partition_ids
-                .into_iter()
-                .map(|partition_id| self.client.read_partition_stream(shuffle_id, partition_id)),
-        )
-        .await;
-        let streams = streams
-            .into_iter()
-            .map(|stream| {
-                let schema = schema.clone();
-                Box::pin(
-                    stream
-                        .map(move |result| {
-                            result
-                                .map_err(|error| TaskStreamError::External(Arc::new(error)))
-                                .and_then(|data| {
-                                    decode_batches(data, &schema).map_err(|error| {
-                                        TaskStreamError::Unknown(error.to_string())
-                                    })
-                                })
-                        })
-                        .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
-                        .try_flatten(),
-                ) as TaskStreamSource
+        // Partition streams are opened lazily and at most a few at a time, so a task
+        // that reads many channels (e.g. a broadcast input) does not open all of them
+        // on the shuffle service at once.
+        let client = self.client.clone();
+        let streams = futures::stream::iter(partition_ids).map(move |partition_id| {
+            let client = client.clone();
+            let options = options.clone();
+            let schema = schema.clone();
+            Box::pin(futures::stream::once(async move {
+                client
+                    .read_partition_stream_with_options(shuffle_id, partition_id, options)
+                    .await
+            }))
+            .flatten()
+            .map(move |result| {
+                result
+                    .map_err(|error| TaskStreamError::External(Arc::new(error)))
+                    .and_then(|data| {
+                        decode_batches(data, &schema)
+                            .map_err(|error| TaskStreamError::Unknown(error.to_string()))
+                    })
             })
-            .collect::<Vec<TaskStreamSource>>();
-        Ok(Box::pin(futures::stream::select_all(streams)))
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
+        });
+        Ok(Box::pin(
+            streams.flatten_unordered(MAX_CONCURRENT_PARTITION_READS),
+        ))
     }
 }
 

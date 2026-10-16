@@ -17,9 +17,9 @@ use sail_telemetry::events::SystemEventReporter;
 
 use crate::driver::DriverActor;
 use crate::driver::job_scheduler::state::{
-    JobDescriptor, StageState, TaskAttemptDescriptor, TaskRegionState, TaskState,
+    JobDescriptor, ShuffleCommit, StageState, TaskAttemptDescriptor, TaskRegionState, TaskState,
 };
-use crate::driver::job_scheduler::topology::TaskRegionTopology;
+use crate::driver::job_scheduler::topology::{TaskRegionTopology, TaskTopology};
 use crate::driver::job_scheduler::{JobAction, JobScheduler, JobSchedulerOptions, JobState};
 use crate::driver::output::{JobOutputOutcome, build_job_output};
 use crate::error::{ExecutionError, ExecutionResult};
@@ -188,14 +188,15 @@ impl JobScheduler {
             &session_id,
         ));
         actions.extend(Self::extend_job_output(job_id, job));
+
+        Self::update_task_regions(job, &self.options);
+
         actions.extend(Self::clean_up_job_by_stage(
             job_id,
             job,
             &event_reporter,
             &session_id,
         ));
-
-        Self::update_task_regions(job, &self.options);
 
         if job
             .regions
@@ -246,7 +247,7 @@ impl JobScheduler {
         actions
     }
 
-    fn update_task_regions(job: &mut JobDescriptor, options: &JobSchedulerOptions) {
+    pub(super) fn update_task_regions(job: &mut JobDescriptor, options: &JobSchedulerOptions) {
         for (r, region) in job.topology.regions.iter().enumerate() {
             let failed = region.tasks.iter().any(|t| {
                 let attempts = &job.stages[t.stage].tasks[t.partition].attempts;
@@ -329,7 +330,7 @@ impl JobScheduler {
         actions
     }
 
-    fn clean_up_job_by_stage(
+    pub(super) fn clean_up_job_by_stage(
         job_id: JobId,
         job: &mut JobDescriptor,
         event_reporter: &SystemEventReporter,
@@ -341,20 +342,53 @@ impl JobScheduler {
             if matches!(job.stages[s].state, StageState::Inactive) {
                 continue;
             }
-            let all_consumers_succeeded = stage.consumers.iter().all(|&c| {
+            // The output must stay readable while any consumer task can still be retried.
+            // A failed task reschedules its whole region, including consumer tasks that
+            // have succeeded. A retried region that also holds producer tasks recreates
+            // the output, so only the consumer tasks must have succeeded. Otherwise the
+            // output is released only once the consumer region has succeeded, since
+            // succeeded regions never run again.
+            // The producer regions are computed only once every consumer task has
+            // succeeded, since this runs on every task status update.
+            let producer_regions = std::cell::OnceCell::new();
+            let producer_regions = || {
+                producer_regions.get_or_init(|| {
+                    (0..job.stages[s].tasks.len())
+                        .filter_map(|p| {
+                            job.topology
+                                .task_regions
+                                .get(&TaskTopology {
+                                    stage: s,
+                                    partition: p,
+                                })
+                                .copied()
+                        })
+                        .collect::<IndexSet<_>>()
+                })
+            };
+            let all_consumer_regions_succeeded = stage.consumers.iter().all(|&c| {
                 let partitions = job.graph.stages()[c]
                     .plan
                     .output_partitioning()
                     .partition_count();
                 (0..partitions).all(|p| {
-                    job.stages[c].tasks[p]
+                    let task_succeeded = job.stages[c].tasks[p]
                         .attempts
                         .last()
-                        .is_some_and(|a| matches!(a.state, TaskState::Succeeded))
+                        .is_some_and(|a| matches!(a.state, TaskState::Succeeded));
+                    let region = job.topology.task_regions.get(&TaskTopology {
+                        stage: c,
+                        partition: p,
+                    });
+                    task_succeeded
+                        && region.is_some_and(|r| {
+                            matches!(job.regions[*r].state, TaskRegionState::Succeeded)
+                                || producer_regions().contains(r)
+                        })
                 })
             });
 
-            if all_consumers_succeeded && !stage.consumers.is_empty() {
+            if all_consumer_regions_succeeded && !stage.consumers.is_empty() {
                 job.stages[s].state = StageState::Inactive;
                 event_reporter.report(SystemEvent::StageUpdated {
                     session_id: session_id.to_string(),
@@ -733,6 +767,59 @@ impl JobScheduler {
         }
     }
 
+    /// Records the output that the remote shuffle service committed for a stage.
+    /// A shuffle is committed once, successfully or not, and the commit never changes.
+    pub fn record_shuffle_commit(
+        &mut self,
+        job_id: JobId,
+        stage: usize,
+        map_attempts: Vec<i32>,
+        result: Result<(), String>,
+    ) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            warn!("job {job_id} not found for shuffle commit of stage {stage}");
+            return;
+        };
+        let Some(descriptor) = job.stages.get_mut(stage) else {
+            warn!("job {job_id} stage {stage} not found for shuffle commit");
+            return;
+        };
+        if let Some(commit) = &descriptor.commit {
+            warn!("job {job_id} stage {stage} shuffle is already committed: {commit:?}");
+            return;
+        }
+        let attempts = map_attempts
+            .iter()
+            .enumerate()
+            .map(|(p, &a)| {
+                let a = usize::try_from(a).ok()?;
+                // The selected attempt must be one that the scheduler created.
+                (a < descriptor.tasks.get(p)?.attempts.len()).then_some(a)
+            })
+            .collect::<Option<Vec<_>>>();
+        let commit = match (attempts, &result) {
+            (Some(attempts), Ok(())) if attempts.len() == descriptor.tasks.len() => ShuffleCommit {
+                attempts,
+                succeeded: true,
+            },
+            (attempts, _) => {
+                if let Err(error) = &result {
+                    warn!("job {job_id} stage {stage} shuffle commit failed: {error}");
+                } else {
+                    warn!(
+                        "job {job_id} stage {stage} shuffle commit has unexpected attempts: {map_attempts:?}"
+                    );
+                }
+                ShuffleCommit {
+                    attempts: attempts.unwrap_or_default(),
+                    succeeded: false,
+                }
+            }
+        };
+        debug!("job {job_id} stage {stage} shuffle commit: {commit:?}");
+        descriptor.commit = Some(commit);
+    }
+
     fn get_latest_task_attempt(
         job: &JobDescriptor,
         stage: usize,
@@ -850,6 +937,7 @@ impl<'a> TaskInputBuilder<'a> {
     fn build_shuffle_service_locator(&self) -> ExecutionResult<TaskInputLocator> {
         let input_channels = self.producer.distribution.channels();
         let output_partitions = self.consumer.plan.output_partitioning().partition_count();
+        let map_attempts = self.committed_map_attempts()?;
         let channels = match self.input.mode {
             InputMode::Shuffle => (0..output_partitions)
                 .map(|partition| vec![partition])
@@ -864,7 +952,40 @@ impl<'a> TaskInputBuilder<'a> {
                 )));
             }
         };
-        Ok(TaskInputLocator::ShuffleService { channels })
+        Ok(TaskInputLocator::ShuffleService {
+            channels,
+            map_attempts,
+        })
+    }
+
+    /// Returns the attempt that the shuffle service committed for each producer partition, so
+    /// that readers skip output of other attempts (e.g. partial data of a failed
+    /// attempt). Reading a shuffle whose global commit failed is an error, since its
+    /// files are not verified.
+    fn committed_map_attempts(&self) -> ExecutionResult<Option<Arc<[i32]>>> {
+        match &self.job.stages[self.input.stage].commit {
+            Some(commit) if commit.succeeded => commit
+                .attempts
+                .iter()
+                .map(|&a| {
+                    i32::try_from(a).map_err(|e| ExecutionError::InternalError(e.to_string()))
+                })
+                .collect::<ExecutionResult<Vec<_>>>()
+                .map(|x| Some(Arc::from(x))),
+            Some(_) => Err(ExecutionError::InternalError(format!(
+                "job {} stage {} shuffle commit failed",
+                self.key.job_id, self.input.stage
+            ))),
+            // A producer without partitions never commits a shuffle.
+            None if self.job.stages[self.input.stage].tasks.is_empty() => Ok(None),
+            // The commit is reported before any producer task succeeds, so it is known
+            // whenever a consumer runs. Reading without it would not skip the output of
+            // attempts that the shuffle service did not commit.
+            None => Err(ExecutionError::InternalError(format!(
+                "job {} stage {} shuffle commit is not known",
+                self.key.job_id, self.input.stage
+            ))),
+        }
     }
 
     fn assignment(&self, key: &TaskInputKey) -> Option<&TaskAssignment> {
@@ -1104,6 +1225,31 @@ impl StageGroup {
         let bucket =
             (self.partition_offsets[&entry.key.stage] + entry.key.partition) % self.buckets.len();
         self.buckets[bucket].push(entry);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::sync::Arc;
+
+    use super::{JobDescriptor, TaskInputBuilder};
+    use crate::id::TaskKey;
+    use crate::job_graph::StageInput;
+    use crate::task::definition::TaskInputLocator;
+    use crate::task::scheduling::TaskAssignmentGetter;
+
+    /// Builds the input locator of a task, as the scheduler does at launch.
+    pub(crate) fn build_input_locator(
+        job: &JobDescriptor,
+        key: &TaskKey,
+        input: &StageInput,
+        assignments: &dyn TaskAssignmentGetter,
+    ) -> Arc<TaskInputLocator> {
+        #[expect(clippy::unwrap_used)]
+        TaskInputBuilder::try_new(job, key, input, assignments)
+            .and_then(|builder| builder.build())
+            .unwrap()
+            .locator
     }
 }
 
