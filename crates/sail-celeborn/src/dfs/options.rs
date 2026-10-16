@@ -160,3 +160,107 @@ impl DfsReadOptions {
         Ok((store, object_path))
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use object_store::memory::InMemory;
+
+    use super::*;
+
+    #[test]
+    fn defaults_and_debug_hide_credentials() {
+        let mut options = DfsReadOptions::default();
+        assert_eq!(options.read_chunk_size, 8 * 1024 * 1024);
+        assert!(options.s3_options.is_empty());
+        assert!(options.hdfs_options.is_empty());
+        assert!(options.object_stores.is_empty());
+        options
+            .s3_options
+            .insert("secret_access_key".into(), "s3-secret".into());
+        options
+            .hdfs_options
+            .insert("secret".into(), "hdfs-secret".into());
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("s3-secret"));
+        assert!(!debug.contains("hdfs-secret"));
+    }
+
+    #[test]
+    fn registered_stores_override_builtins_and_support_custom_schemes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = DfsReadOptions::default();
+        // Invalid built-in configuration does not affect registered stores.
+        options.s3_options.insert("unknown".into(), "x".into());
+        for authority in [
+            "s3://bucket",
+            "oss://bucket",
+            "hdfs://namenode:8020",
+            "memory://bucket",
+        ] {
+            options
+                .object_stores
+                .insert(authority.into(), store.clone());
+            let (resolved, path) = options
+                .resolve(&format!("{authority}/shuffle/file"))
+                .unwrap();
+            assert!(Arc::ptr_eq(&store, &resolved));
+            assert_eq!(path.as_ref(), "shuffle/file");
+        }
+        for scheme in ["s3a", "s3n"] {
+            let (resolved, _) = options.resolve(&format!("{scheme}://bucket/file")).unwrap();
+            assert!(Arc::ptr_eq(&store, &resolved));
+        }
+    }
+
+    #[test]
+    fn decodes_object_paths_once() {
+        let options = DfsReadOptions {
+            object_stores: HashMap::from([(
+                "memory://bucket".into(),
+                Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
+            )]),
+            ..Default::default()
+        };
+        let (_, path) = options
+            .resolve("memory://bucket/shuffle/a%20b/%252F/%E2%98%83")
+            .unwrap();
+        assert_eq!(path.as_ref(), "shuffle/a b/%2F/☃");
+        assert!(options.resolve("memory://bucket/file%FF").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_urls_and_zero_chunk_size() {
+        let options = DfsReadOptions::default();
+        for path in [
+            "relative/file",
+            "memory:file",
+            "hdfs:///file",
+            "s3://user:secret@bucket/file",
+            "s3://bucket/file?secret=value",
+            "s3://bucket/file#fragment",
+            "unregistered://bucket/file",
+        ] {
+            assert!(options.resolve(path).is_err());
+        }
+        let options = DfsReadOptions {
+            read_chunk_size: 0,
+            ..Default::default()
+        };
+        assert!(options.resolve("s3://bucket/file").is_err());
+    }
+
+    #[test]
+    fn configuration_errors_do_not_expose_values() {
+        let options = DfsReadOptions {
+            s3_options: HashMap::from([("unknown".into(), "config-secret".into())]),
+            ..Default::default()
+        };
+        let error = options.resolve("s3://bucket/file").unwrap_err();
+        assert!(!error.to_string().contains("config-secret"));
+        let error = options
+            .resolve("s3://user:url-secret@bucket/file")
+            .unwrap_err();
+        assert!(!error.to_string().contains("url-secret"));
+    }
+}
