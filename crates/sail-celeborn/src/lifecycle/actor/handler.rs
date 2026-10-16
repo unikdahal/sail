@@ -534,8 +534,8 @@ impl LifecycleManagerActor {
                 match unreadable.first() {
                     None => Ok(metrics),
                     Some((id, storage)) => Err(CelebornError::Application(format!(
-                        "{} committed partition files are on distributed storage, which is \
-                         not supported (for example, location {id} on {storage})",
+                        "{} committed partition files use unsupported storage \
+                         (for example, location {id} on {storage})",
                         unreadable.len()
                     ))),
                 }

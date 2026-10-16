@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -10,7 +11,7 @@ use tokio::sync::Mutex;
 use crate::common::BatchHeader;
 use crate::error::{CelebornError, CelebornResult};
 use crate::protocol::StatusCode;
-use crate::protocol::proto::MessageType;
+use crate::protocol::proto::{MessageType, PbBufferStreamEnd, StreamType};
 
 /// Netty transport frame types, mirroring the `Message.Type` identifiers in Java.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
@@ -261,6 +262,47 @@ impl TransportConnection {
         self.request(TransportFrame::rpc_request(request_id, body)?)
             .await?
             .into_rpc_response(request_id)
+    }
+
+    /// Release a worker's chunk stream registration without awaiting a reply.
+    pub(crate) async fn end_chunk_stream(&self, stream_id: i64) -> CelebornResult<()> {
+        let body = TransportMessage::new(
+            MessageType::BufferStreamEnd,
+            PbBufferStreamEnd {
+                stream_type: StreamType::ChunkStream as i32,
+                stream_id,
+            }
+            .encode_to_vec(),
+        )
+        .encode()?;
+        // Java's TransportClient.sendRpc without a callback still sends an RPC
+        // request, but FetchHandler handles BufferStreamEnd without replying.
+        let frame = TransportFrame::rpc_request(self.next_request_id(), body)?;
+        let mut stream = self.stream.lock().await;
+        let result = tokio::time::timeout(self.timeout, async {
+            if stream.is_none() {
+                let connection = TcpStream::connect((&*self.host, self.port)).await?;
+                connection.set_nodelay(true)?;
+                *stream = Some(connection);
+            }
+            let stream = stream.as_mut().ok_or_else(|| {
+                CelebornError::Protocol("connection was not initialized".to_string())
+            })?;
+            frame.write(stream).await
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                // A partial write would corrupt the next transaction's frame.
+                *stream = None;
+                Err(error)
+            }
+            Err(_) => {
+                *stream = None;
+                Err(CelebornError::Timeout)
+            }
+        }
     }
 
     /// Push one map-data batch using Celeborn's `PushData` transport frame.
@@ -686,5 +728,63 @@ impl<'a> JavaReader<'a> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use std::time::Duration;
+
+    use prost::Message;
+    use tokio::net::TcpListener;
+
+    use super::{
+        MessageType, PbBufferStreamEnd, StreamType, TransportConnection, TransportFrame,
+        TransportFrameType, TransportMessage,
+    };
+
+    #[tokio::test]
+    async fn chunk_stream_end_requires_no_reply_and_preserves_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let frame = TransportFrame::read(&mut socket).await.unwrap();
+            assert_eq!(frame.frame_type, TransportFrameType::RpcRequest);
+            assert_eq!(frame.header.len(), 12);
+            assert_eq!(&frame.header[..8], &0_i64.to_be_bytes());
+            let body = frame.body.into_owned();
+            assert_eq!(
+                i32::from_be_bytes(frame.header[8..].try_into().unwrap()),
+                i32::try_from(body.len()).unwrap()
+            );
+            let message = TransportMessage::decode(&body).unwrap();
+            assert_eq!(message.message_type, MessageType::BufferStreamEnd);
+            let end = PbBufferStreamEnd::decode(message.payload.as_slice()).unwrap();
+            assert_eq!(end.stream_type, StreamType::ChunkStream as i32);
+            assert_eq!(end.stream_id, 12345);
+
+            // The worker sends no response for the close. A subsequent RPC must
+            // reuse this connection and receive only its own response.
+            let request = TransportFrame::read(&mut socket).await.unwrap();
+            assert_eq!(request.frame_type, TransportFrameType::RpcRequest);
+            assert_eq!(&request.header[..8], &1_i64.to_be_bytes());
+            assert_eq!(request.body.into_owned(), b"next request");
+            let body = b"next response".to_vec();
+            let mut header = request.header[..8].to_vec();
+            header.extend_from_slice(&i32::try_from(body.len()).unwrap().to_be_bytes());
+            TransportFrame::new(TransportFrameType::RpcResponse, header, body)
+                .write(&mut socket)
+                .await
+                .unwrap();
+        });
+        let connection = TransportConnection::new("127.0.0.1", port, Duration::from_secs(1));
+        connection.end_chunk_stream(12345).await.unwrap();
+        assert_eq!(
+            connection.send_rpc(b"next request".to_vec()).await.unwrap(),
+            b"next response"
+        );
+        worker.await.unwrap();
     }
 }

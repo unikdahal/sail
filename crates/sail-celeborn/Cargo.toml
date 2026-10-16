@@ -12,6 +12,9 @@ sail-common = { path = "../sail-common" }
 log = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+object_store = { workspace = true }
+hdfs-native-object-store = { workspace = true }
+url = { workspace = true }
 crc32fast = { workspace = true }
 lz4_flex = { workspace = true }
 num_enum = { workspace = true }
