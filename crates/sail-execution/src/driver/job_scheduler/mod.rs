@@ -1,3 +1,4 @@
+mod adaptive;
 mod core;
 mod options;
 mod state;

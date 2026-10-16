@@ -34,11 +34,11 @@ name: "test_filter_and_limit_pushdown_for_system_tables.3"
 data:
   |-
     == Physical Plan ==
-    ProjectionExec: expr=[#17@0 as session_id, #18@1 as job_id, #19@2 as stage, #20@3 as partitions, #21@4 as inputs, #22@5 as group, #23@6 as mode, #24@7 as distribution, #25@8 as placement, #26@9 as status, #27@10 as created_at, #28@11 as stopped_at, #29@12 as rows, #30@13 as physical_bytes, #31@14 as logical_bytes, #32@15 as max_partition_bytes, #33@16 as median_partition_bytes]
-      ProjectionExec: expr=[session_id@0 as #17, job_id@1 as #18, stage@2 as #19, partitions@3 as #20, inputs@4 as #21, group@5 as #22, mode@6 as #23, distribution@7 as #24, placement@8 as #25, status@9 as #26, created_at@10 as #27, stopped_at@11 as #28, rows@12 as #29, physical_bytes@13 as #30, logical_bytes@14 as #31, max_partition_bytes@15 as #32, median_partition_bytes@16 as #33]
+    ProjectionExec: expr=[#20@0 as session_id, #21@1 as job_id, #22@2 as stage, #23@3 as partitions, #24@4 as inputs, #25@5 as group, #26@6 as mode, #27@7 as distribution, #28@8 as placement, #29@9 as status, #30@10 as created_at, #31@11 as stopped_at, #32@12 as rows, #33@13 as physical_bytes, #34@14 as logical_bytes, #35@15 as max_partition_bytes, #36@16 as median_partition_bytes, #37@17 as replanned, #38@18 as adaptive_rules, #39@19 as initial_partitions]
+      ProjectionExec: expr=[session_id@0 as #20, job_id@1 as #21, stage@2 as #22, partitions@3 as #23, inputs@4 as #24, group@5 as #25, mode@6 as #26, distribution@7 as #27, placement@8 as #28, status@9 as #29, created_at@10 as #30, stopped_at@11 as #31, rows@12 as #32, physical_bytes@13 as #33, logical_bytes@14 as #34, max_partition_bytes@15 as #35, median_partition_bytes@16 as #36, replanned@17 as #37, adaptive_rules@18 as #38, initial_partitions@19 as #39]
         GlobalLimitExec: skip=0, fetch=1
           CooperativeExec
-            SystemTableExec: table=stages, projection=Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]), filters=[BinaryExpr { left: Column { name: "session_id", index: 0 }, op: Eq, right: Literal { value: Utf8(""), field: Field { name: "lit", data_type: Utf8 } }, fail_on_overflow: false }, BinaryExpr { left: Column { name: "job_id", index: 1 }, op: Eq, right: Literal { value: UInt64(0), field: Field { name: "lit", data_type: UInt64 } }, fail_on_overflow: false }], fetch=Some(1)
+            SystemTableExec: table=stages, projection=Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]), filters=[BinaryExpr { left: Column { name: "session_id", index: 0 }, op: Eq, right: Literal { value: Utf8(""), field: Field { name: "lit", data_type: Utf8 } }, fail_on_overflow: false }, BinaryExpr { left: Column { name: "job_id", index: 1 }, op: Eq, right: Literal { value: UInt64(0), field: Field { name: "lit", data_type: UInt64 } }, fail_on_overflow: false }], fetch=Some(1)
 ---
 name: "test_filter_and_limit_pushdown_for_system_tables.4"
 data:

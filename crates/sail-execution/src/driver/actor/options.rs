@@ -87,6 +87,13 @@ impl DriverOptions {
                 let adaptive = &config.cluster.adaptive;
                 AdaptiveOptions {
                     enabled: adaptive.enabled,
+                    coalesce_enabled: adaptive.coalesce.enabled,
+                    coalesce_target_size: adaptive.coalesce.target_size,
+                    coalesce_min_partition_size: adaptive.coalesce.min_partition_size,
+                    coalesce_min_partitions: adaptive.coalesce.min_partitions,
+                    coalesce_max_logical_size: adaptive.coalesce.max_logical_size,
+                    join_enabled: adaptive.join.enabled,
+                    join_max_build_partition_size: adaptive.join.max_build_partition_size,
                 }
             },
             shuffle_backend: (&config.cluster.shuffle_backend).into(),

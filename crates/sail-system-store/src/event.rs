@@ -78,6 +78,22 @@ pub enum SystemEvent {
         median_partition_bytes: u64,
         reported_at: DateTime<Utc>,
     },
+    StageReplanned {
+        session_id: String,
+        job_id: u64,
+        stage: u64,
+        /// The partition count before re-planning.
+        old_partitions: u64,
+        /// The partition count after re-planning.
+        new_partitions: u64,
+        /// Names of the adaptive rules that fired, e.g. "coalesce", "sort_merge_join".
+        rules: Vec<String>,
+        /// Stages whose placeholders were updated with the new partition count.
+        updated_consumers: Vec<u64>,
+        /// A short human-readable summary of the rewrite.
+        summary: String,
+        replanned_at: DateTime<Utc>,
+    },
     TaskCreated {
         session_id: String,
         job_id: u64,

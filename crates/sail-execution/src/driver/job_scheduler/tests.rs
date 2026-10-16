@@ -29,8 +29,11 @@ use crate::task::definition::TaskInputLocator;
 #[test]
 fn output_is_retained_until_consumer_regions_succeed() {
     let mut job = job(aggregate_graph());
-    let options =
-        JobSchedulerOptions::new_for_test(remote_shuffle_service(), AdaptiveOptions::default());
+    let options = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
     succeed(&mut job, 0, producer_statistics);
     // Stage 1 succeeds, but stage 2 in the same region is still running, so a failure
     // of stage 2 would rerun stage 1, which reads stage 0 again.
@@ -64,11 +67,18 @@ fn statistics_are_collected_only_for_adaptive_execution_on_a_remote_shuffle_serv
     let job = job(aggregate_graph());
     let enabled = JobSchedulerOptions::new_for_test(
         remote_shuffle_service(),
-        AdaptiveOptions { enabled: true },
+        AdaptiveOptions {
+            enabled: true,
+            ..AdaptiveOptions::default()
+        },
+        None,
     );
     assert!(JobScheduler::collects_statistics(&enabled, &job));
-    let disabled =
-        JobSchedulerOptions::new_for_test(remote_shuffle_service(), AdaptiveOptions::default());
+    let disabled = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
     assert!(!JobScheduler::collects_statistics(&disabled, &job));
 }
 
@@ -116,7 +126,7 @@ fn pipelined_output_is_released_when_its_region_reruns_the_producer() {
     .unwrap();
     let mut job = job(graph);
     assert_eq!(job.topology.regions.len(), 1);
-    let options = JobSchedulerOptions::new_for_test(flight, AdaptiveOptions::default());
+    let options = JobSchedulerOptions::new_for_test(flight, AdaptiveOptions::default(), None);
     succeed(&mut job, 0, |_| ChannelCounts::default());
     succeed(&mut job, 1, |_| ChannelCounts::default());
     job.stages[2].tasks[0].attempts.push(TaskAttemptDescriptor {
@@ -182,8 +192,11 @@ fn failed_shuffle_commit_fails_the_consumer_definition() {
 
 #[test]
 fn shuffle_commit_is_recorded_once() {
-    let options =
-        JobSchedulerOptions::new_for_test(remote_shuffle_service(), AdaptiveOptions::default());
+    let options = JobSchedulerOptions::new_for_test(
+        remote_shuffle_service(),
+        AdaptiveOptions::default(),
+        None,
+    );
     let mut scheduler = JobScheduler::new(options, reporter());
     let job_id = JobId::from(1);
     let mut descriptor = job(aggregate_graph());

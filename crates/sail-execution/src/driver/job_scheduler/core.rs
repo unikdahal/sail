@@ -278,10 +278,25 @@ impl JobScheduler {
                 status: job.state.status().to_string(),
                 updated_at: Utc::now(),
             });
-            Self::log_statistics_metrics(job_id, job, &self.options);
+            Self::log_adaptive_metrics(job_id, job, &self.options);
             return actions;
         }
-        Self::release_statistics(job);
+
+        if self.options.adaptive.enabled
+            && Self::adapt_ready_stages(
+                job_id,
+                job,
+                &self.options,
+                self.codec.as_ref(),
+                &event_reporter,
+                &session_id,
+            )
+        {
+            // A re-planned stage changes the topology, so region states are recomputed
+            // from the task attempts before scheduling.
+            Self::update_task_regions(job, &self.options);
+        }
+        Self::release_statistics(job, &self.options);
 
         actions.extend(Self::schedule_task_regions(
             job_id,
@@ -991,8 +1006,9 @@ impl JobScheduler {
         }
     }
 
-    /// Releases the statistics of every stage whose statistics have been reported.
-    fn release_statistics(job: &mut JobDescriptor) {
+    /// Releases the statistics of every stage whose statistics are no longer needed:
+    /// they have been reported, and every consumer has made its adaptive decision.
+    fn release_statistics(job: &mut JobDescriptor, options: &JobSchedulerOptions) {
         if job.adaptive.retained_statistics_bytes == 0 {
             return;
         }
@@ -1000,9 +1016,14 @@ impl JobScheduler {
             if job.stages[s].retained_statistics_bytes == 0 {
                 continue;
             }
+            let consumers_frozen = !options.adaptive.enabled
+                || job.topology.stages[s]
+                    .consumers
+                    .iter()
+                    .all(|&c| job.stages[c].adaptive.is_frozen());
             let finished = job.stages[s].statistics_reported
                 || matches!(job.stages[s].state, StageState::Inactive);
-            if finished {
+            if consumers_frozen && finished {
                 for task in &mut job.stages[s].tasks {
                     for attempt in &mut task.attempts {
                         attempt.statistics = None;
@@ -1018,13 +1039,16 @@ impl JobScheduler {
         }
     }
 
-    fn log_statistics_metrics(job_id: JobId, job: &JobDescriptor, options: &JobSchedulerOptions) {
-        if !Self::collects_statistics(options, job) {
+    fn log_adaptive_metrics(job_id: JobId, job: &JobDescriptor, options: &JobSchedulerOptions) {
+        if !options.adaptive.enabled {
             return;
         }
         info!(
-            "job {job_id} statistics: {} bytes received, peak {} bytes retained",
-            job.adaptive.statistics_payload_bytes, job.adaptive.peak_retained_statistics_bytes
+            "job {job_id} adaptive execution: {} stage(s) re-planned in {:?}, {} bytes of statistics received, peak {} bytes of statistics retained",
+            job.adaptive.replanned_stages,
+            job.adaptive.replanning_time,
+            job.adaptive.statistics_payload_bytes,
+            job.adaptive.peak_retained_statistics_bytes
         );
     }
 
@@ -1146,18 +1170,38 @@ impl<'a> TaskInputBuilder<'a> {
         let input_channels = self.producer.distribution.channels();
         let output_partitions = self.consumer.plan.output_partitioning().partition_count();
         let map_attempts = self.committed_map_attempts()?;
-        let channels = match self.input.mode {
-            InputMode::Shuffle => (0..output_partitions)
-                .map(|partition| vec![partition])
-                .collect(),
-            InputMode::Broadcast => {
-                let channels = (0..input_channels).collect::<Vec<_>>();
-                vec![channels; output_partitions]
-            }
-            mode => {
-                return Err(ExecutionError::InvalidArgument(format!(
-                    "Celeborn shuffle service does not support {mode} input"
-                )));
+        let channels = if let Some(adaptive) = &self.input.adaptive {
+            // Partition `i` of this input's own domain reads the buckets of its spec entry.
+            adaptive
+                .spec
+                .iter()
+                .map(|slices| {
+                    let mut channels = vec![];
+                    for slice in slices {
+                        if slice.buckets.end > input_channels {
+                            return Err(ExecutionError::InternalError(format!(
+                                "invalid shuffle service bucket slice {slice} for {input_channels} channels"
+                            )));
+                        }
+                        channels.extend(slice.buckets.clone());
+                    }
+                    Ok(channels)
+                })
+                .collect::<ExecutionResult<Vec<_>>>()?
+        } else {
+            match self.input.mode {
+                InputMode::Shuffle => (0..output_partitions)
+                    .map(|partition| vec![partition])
+                    .collect(),
+                InputMode::Broadcast => {
+                    let channels = (0..input_channels).collect::<Vec<_>>();
+                    vec![channels; output_partitions]
+                }
+                mode => {
+                    return Err(ExecutionError::InvalidArgument(format!(
+                        "Celeborn shuffle service does not support {mode} input"
+                    )));
+                }
             }
         };
         Ok(TaskInputLocator::ShuffleService {
@@ -1547,10 +1591,7 @@ mod tests {
         }
         // Exercise the routing builder with a forward edge of the same partition shape.
         // Partitions 2 and 3 have attempts, but their regions have no assignments yet.
-        let edge = StageInput {
-            stage: 0,
-            mode: InputMode::Forward,
-        };
+        let edge = StageInput::new(0, InputMode::Forward);
         let consumer = key(1, 0, 0);
         let original = TaskInputBuilder::try_new(&job, &consumer, &edge, &assignments)?.build()?;
         let TaskInputLocator::Worker { keys } = original.locator.as_ref() else {
