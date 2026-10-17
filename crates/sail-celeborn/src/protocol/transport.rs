@@ -225,7 +225,8 @@ impl TransportFrame<'_> {
 ///
 /// Netty permits multiple outstanding RPCs, but a small client only needs one transaction at a
 /// time. The mutex gives clones a single reusable connection while retaining exact request/reply
-/// ordering. I/O, timeout, and framing errors invalidate the connection before it is reused.
+/// ordering. I/O, timeout, framing errors, and cancelled transactions invalidate the connection
+/// before it is reused.
 #[derive(Debug, Clone)]
 pub(crate) struct TransportConnection {
     host: String,
@@ -385,36 +386,34 @@ impl TransportConnection {
     async fn request(&self, frame: TransportFrame<'_>) -> CelebornResult<TransportFrame<'static>> {
         // Keep the lock outside the I/O timeout. A caller queued behind another transaction must
         // not time out and clear the connection that the active transaction is using.
-        let mut stream = self.stream.lock().await;
-        let result = tokio::time::timeout(self.timeout, async {
-            if stream.is_none() {
-                let connection = TcpStream::connect((&*self.host, self.port)).await?;
-                // Every request waits for its response, so Nagle's algorithm would hold
-                // back the last segment of each request until a delayed acknowledgement.
-                connection.set_nodelay(true)?;
-                *stream = Some(connection);
-            }
-            let stream = stream.as_mut().ok_or_else(|| {
-                CelebornError::Protocol("connection was not initialized".to_string())
-            })?;
-            frame.write(stream).await?;
-            TransportFrame::read(stream).await
+        let mut shared_stream = self.stream.lock().await;
+        // The transaction owns the socket until it has read a complete response. If its
+        // future is dropped, the socket closes rather than retaining a partial or late
+        // response that a subsequent request could mistake for its own.
+        let stream = shared_stream.take();
+        let result = tokio::time::timeout(self.timeout, async move {
+            let mut stream = match stream {
+                Some(stream) => stream,
+                None => {
+                    let connection = TcpStream::connect((&*self.host, self.port)).await?;
+                    // Every request waits for its response, so Nagle's algorithm would hold
+                    // back the last segment of each request until a delayed acknowledgement.
+                    connection.set_nodelay(true)?;
+                    connection
+                }
+            };
+            frame.write(&mut stream).await?;
+            let response = TransportFrame::read(&mut stream).await?;
+            Ok::<_, CelebornError>((response, stream))
         })
         .await;
         match result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => {
-                // A failed transaction can leave unread bytes in the socket. Starting fresh is
-                // safer than allowing the next request to interpret those bytes as its reply.
-                *stream = None;
-                Err(error)
+            Ok(Ok((response, stream))) => {
+                *shared_stream = Some(stream);
+                Ok(response)
             }
-            Err(_) => {
-                // `timeout` cancels its future before it can run error cleanup. Discard the
-                // socket here, otherwise a late response can be mistaken for the next request.
-                *stream = None;
-                Err(CelebornError::Timeout)
-            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(CelebornError::Timeout),
         }
     }
 }
@@ -686,5 +685,94 @@ impl<'a> JavaReader<'a> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    use super::{TransportConnection, TransportFrame, TransportFrameType};
+
+    fn rpc_response(request: &TransportFrame<'_>, body: &[u8]) -> TransportFrame<'static> {
+        let mut header = request.header[..8].to_vec();
+        header.extend_from_slice(&(body.len() as i32).to_be_bytes());
+        TransportFrame::new(TransportFrameType::RpcResponse, header, body.to_vec())
+    }
+
+    async fn check_cancelled_request_reconnects(partial: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = TransportConnection::new(
+                address.ip().to_string(),
+                address.port(),
+                Duration::from_secs(5),
+            );
+            let (response_started, response_started_received) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = TransportFrame::read(&mut socket).await.unwrap();
+                rpc_response(&request, b"warmup")
+                    .write(&mut socket)
+                    .await
+                    .unwrap();
+
+                let request = TransportFrame::read(&mut socket).await.unwrap();
+                if partial {
+                    // Start a response, then hold the remainder during cancellation.
+                    socket.write_all(&[0, 0, 0, 12, 4]).await.unwrap();
+                }
+                response_started.send(()).unwrap();
+                match socket.read(&mut [0]).await {
+                    Ok(read) => assert_eq!(read, 0),
+                    // Closing with unread response bytes can reset the socket.
+                    Err(error) => assert_eq!(error.kind(), ErrorKind::ConnectionReset),
+                }
+                if !partial {
+                    // A complete response arriving after cancellation must also stay
+                    // on the discarded connection. The peer may already have reset it.
+                    let _ = rpc_response(&request, b"late").write(&mut socket).await;
+                }
+
+                let (mut socket, _) = listener.accept().await.unwrap();
+                for body in [b"next".as_slice(), b"reused".as_slice()] {
+                    let request = TransportFrame::read(&mut socket).await.unwrap();
+                    rpc_response(&request, body)
+                        .write(&mut socket)
+                        .await
+                        .unwrap();
+                }
+            });
+
+            assert_eq!(client.send_rpc(vec![]).await.unwrap(), b"warmup");
+            let cancelled_client = client.clone();
+            let cancelled = tokio::spawn(async move { cancelled_client.send_rpc(vec![]).await });
+            response_started_received.await.unwrap();
+            cancelled.abort();
+            assert!(cancelled.await.unwrap_err().is_cancelled());
+
+            assert_eq!(client.send_rpc(vec![]).await.unwrap(), b"next");
+            assert_eq!(client.send_rpc(vec![]).await.unwrap(), b"reused");
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_discards_partial_response_and_reconnects() {
+        check_cancelled_request_reconnects(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_discards_late_response_and_reconnects() {
+        check_cancelled_request_reconnects(false).await;
     }
 }

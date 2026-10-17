@@ -55,6 +55,11 @@ enum ShuffleCommitState {
         attempts: Vec<i32>,
         waiters: Vec<oneshot::Sender<CelebornResult<()>>>,
     },
+    /// Workers have finished, but the observer has not yet received their outcome.
+    /// New `mapper_end` calls must also wait so that task success cannot overtake it.
+    Reporting {
+        waiters: Vec<oneshot::Sender<CelebornResult<()>>>,
+    },
     Committed,
     /// The commit failed. The shuffle's output cannot be read.
     Lost {

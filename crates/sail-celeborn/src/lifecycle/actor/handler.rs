@@ -435,7 +435,8 @@ impl LifecycleManagerActor {
                 let _ = reply.send(Err(shuffle_lost(shuffle_id, reason)));
                 return ActorAction::Continue;
             }
-            ShuffleCommitState::Committing { waiters, .. } => {
+            ShuffleCommitState::Committing { waiters, .. }
+            | ShuffleCommitState::Reporting { waiters } => {
                 waiters.push(reply);
                 return ActorAction::Continue;
             }
@@ -557,18 +558,13 @@ impl LifecycleManagerActor {
         let Some(state) = self.shuffle_commits.get_mut(&shuffle_id) else {
             return ActorAction::Continue;
         };
-        let outcome = match &result {
-            Ok(_) => ShuffleCommitState::Committed,
-            Err(error) => ShuffleCommitState::Lost {
-                reason: error.to_string(),
-            },
-        };
-        let ShuffleCommitState::Committing { attempts, waiters } =
-            std::mem::replace(state, outcome)
-        else {
+        let ShuffleCommitState::Committing { attempts, waiters } = state else {
             warn!("unexpected commit completion for shuffle {shuffle_id}");
             return ActorAction::Continue;
         };
+        let attempts = std::mem::take(attempts);
+        let waiters = std::mem::take(waiters);
+        *state = ShuffleCommitState::Reporting { waiters };
         let reply = match result {
             Ok(metrics) => {
                 self.application_metrics.add_assign(metrics);
@@ -597,20 +593,50 @@ impl LifecycleManagerActor {
                 }
             }
         });
-        // The observer learns about the commit before any mapper does, so the commit
-        // is known before any task of the shuffle reports success.
+        // Keep every mapper awaiting the global commit blocked until its report is
+        // known, including attempts that end while the observer is running.
+        let handle = ctx.handle().clone();
         ctx.spawn(async move {
             if let Some((observer, report)) = report {
                 observer.shuffle_committed(report).await;
             }
-            for waiter in waiters {
-                let _ = waiter.send(
-                    reply
-                        .clone()
-                        .map_err(|reason| shuffle_lost(shuffle_id, &reason)),
-                );
-            }
+            let _ = handle
+                .send(LifecycleManagerMessage::CommitReported {
+                    shuffle_id,
+                    result: reply,
+                })
+                .await;
         });
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_commit_reported(
+        &mut self,
+        shuffle_id: i32,
+        result: Result<(), String>,
+    ) -> ActorAction {
+        let Some(state) = self.shuffle_commits.get_mut(&shuffle_id) else {
+            return ActorAction::Continue;
+        };
+        let ShuffleCommitState::Reporting { waiters } = state else {
+            warn!("unexpected commit report completion for shuffle {shuffle_id}");
+            return ActorAction::Continue;
+        };
+        let waiters = std::mem::take(waiters);
+        let outcome = match &result {
+            Ok(()) => ShuffleCommitState::Committed,
+            Err(reason) => ShuffleCommitState::Lost {
+                reason: reason.clone(),
+            },
+        };
+        *state = outcome;
+        for waiter in waiters {
+            let _ = waiter.send(
+                result
+                    .clone()
+                    .map_err(|reason| shuffle_lost(shuffle_id, &reason)),
+            );
+        }
         ActorAction::Continue
     }
 
@@ -782,4 +808,139 @@ fn shuffle_lost(shuffle_id: i32, reason: &str) -> CelebornError {
     CelebornError::Application(format!(
         "shuffle {shuffle_id} is lost: commit failed: {reason}"
     ))
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use sail_common::actor::ActorSystem;
+    use tokio::sync::{Notify, oneshot};
+
+    use crate::common::SlotReservation;
+    use crate::lifecycle::{
+        LifecycleManagerActor, LifecycleManagerMessage, LifecycleManagerOptions,
+        ShuffleCommitObserver, ShuffleCommitReport,
+    };
+    use crate::master::MasterClientOptions;
+
+    #[derive(Default)]
+    struct BlockingCommitObserver {
+        started: Notify,
+        resume: Notify,
+        reported: AtomicBool,
+    }
+
+    #[tonic::async_trait]
+    impl ShuffleCommitObserver for BlockingCommitObserver {
+        async fn shuffle_committed(&self, _report: ShuffleCommitReport) {
+            self.started.notify_one();
+            self.resume.notified().await;
+            self.reported.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_mapper_end_waits_for_commit_observer() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let observer = Arc::new(BlockingCommitObserver::default());
+            let mut system = ActorSystem::new();
+            let handle = system.spawn::<LifecycleManagerActor>(
+                LifecycleManagerOptions::new("test", MasterClientOptions::new(vec![]))
+                    .with_commit_observer(observer.clone()),
+            );
+            let (result, shuffle_id) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::GetShuffleId {
+                        job_id: 1,
+                        stage: 0,
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            let shuffle_id = shuffle_id.await.unwrap().unwrap();
+            // An empty worker reservation completes the worker phase without a service.
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::RegisterShuffleComplete {
+                        shuffle_id,
+                        result: Ok(SlotReservation {
+                            worker_ids: vec![],
+                            primary_locations: Default::default(),
+                            worker_locations: Default::default(),
+                        }),
+                    })
+                    .await
+                    .is_ok()
+            );
+            let (result, mut original) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::MapperEnd {
+                        shuffle_id,
+                        map_id: 0,
+                        attempt_id: 0,
+                        num_mappers: 1,
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            observer.started.notified().await;
+
+            let (result, mut duplicate) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::MapperEnd {
+                        shuffle_id,
+                        map_id: 0,
+                        attempt_id: 1,
+                        num_mappers: 1,
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            // A reply to a later message proves the duplicate was processed while
+            // the observer was blocked, without relying on timing or sleeps.
+            let (result, barrier) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::GetJobShuffleIds { job_id: 1, result })
+                    .await
+                    .is_ok()
+            );
+            barrier.await.unwrap().unwrap();
+            assert!(matches!(
+                original.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                duplicate.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+
+            observer.resume.notify_one();
+            original.await.unwrap().unwrap();
+            duplicate.await.unwrap().unwrap();
+            assert!(observer.reported.load(Ordering::SeqCst));
+
+            let (result, stopped) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::StopComplete { result })
+                    .await
+                    .is_ok()
+            );
+            stopped.await.unwrap();
+            system.join().await;
+        })
+        .await
+        .unwrap();
+    }
 }
