@@ -289,6 +289,31 @@ GitHub reports the fork's Build workflow as `disabled_fork`; these results are
 local checks, not GitHub Actions results. The corrected benchmark has not been
 rerun for performance measurements.
 
+### Ordering follow-up (2026-10-17)
+
+A further review of `84b25f68` found that adapted inputs retained ordering and
+partition-local constant metadata after combining shuffle buckets. A hash shuffle
+with one sorted producer can legitimately advertise individually sorted buckets
+without its explicit preserve-order option. Coalesced remote reads interleave
+those buckets, so the old metadata could let a sort-merge join accept unsorted rows.
+
+Adapted placeholders now clear orderings and partition-local constants and refresh
+the cached output ordering. Valid column equivalences and global constants remain.
+The existing validator rejects a proposal that loses required ordering, preserving
+the original plan, task count and input specs and freezing the static decision.
+
+The real JobGraph regression failed on the original code because the unsafe
+four-to-one proposal passed validation. It now passes, along with a separate
+regression for ordering inferred from partition-local constants. Two independent
+reviews found no issues in the fix.
+
+Local checks on this follow-up: 15 Celeborn and 244 execution Rust tests passed;
+all 31 Docker integration tests passed; native build, clippy with warnings denied,
+nightly formatting and diff checks passed. After strengthening the ordering error
+assertions, all three focused coalescing tests and clippy passed again. The Docker
+suite retains the existing pytest configuration deprecation warning. GitHub Build
+is still `disabled_fork`; these are local results.
+
 ## Remaining work
 
 - Measure peak hash-join build memory (`build_mem_used`) against the build cap on

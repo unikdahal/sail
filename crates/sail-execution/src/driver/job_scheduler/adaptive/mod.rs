@@ -658,7 +658,8 @@ fn coalesce_ranges(
 /// `UnknownPartitioning` with its new partition count, and every input with
 /// committed statistics exposes them when its spec preserves total reads. Skew
 /// splits may replicate an input, so their original totals are no longer exact.
-/// Ancestors are rebuilt, so their properties follow from their inputs.
+/// Bucket reads can interleave, so orderings and partition-local constants are
+/// discarded. Ancestors are rebuilt, so their properties follow from their inputs.
 fn rewrite_placeholders(
     plan: Arc<dyn ExecutionPlan>,
     view: &StageView,
@@ -672,10 +673,22 @@ fn rewrite_placeholders(
             let i = *placeholder.input();
             let mut properties = placeholder.properties().clone();
             if let Some(Some(adaptive)) = inputs.get(i) {
-                properties =
-                    Arc::new(properties.as_ref().clone().with_partitioning(
-                        Partitioning::UnknownPartitioning(adaptive.partitions()),
-                    ));
+                // Each original bucket may be sorted even for a non-order-
+                // preserving shuffle with a single producer. Combining buckets
+                // does not merge their ordering or preserve constants that can
+                // differ between buckets.
+                let mut equivalence = node.equivalence_properties().clone();
+                equivalence.clear_orderings();
+                equivalence.clear_per_partition_constants();
+                properties = Arc::new(
+                    properties
+                        .as_ref()
+                        .clone()
+                        .with_eq_properties(equivalence)
+                        .with_partitioning(Partitioning::UnknownPartitioning(
+                            adaptive.partitions(),
+                        )),
+                );
             }
             let mut rewritten = StageInputExec::new(i, properties);
             let preserves_totals = !matches!(

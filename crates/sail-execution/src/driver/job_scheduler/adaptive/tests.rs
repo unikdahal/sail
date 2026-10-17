@@ -1323,3 +1323,123 @@ fn coalesced_inputs_keep_exact_rows_and_estimated_bytes() {
         Precision::Inexact(statistics.total_logical_bytes as usize)
     );
 }
+
+#[test]
+fn coalescing_sorted_shuffle_buckets_keeps_the_static_sort_merge_join() {
+    use datafusion::arrow::compute::SortOptions;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap();
+    let side = || {
+        let source = MemorySourceConfig::try_new_exec(&[vec![]], schema(), None).unwrap();
+        let sorted = Arc::new(SortExec::new(ordering.clone(), source));
+        let shuffled =
+            Arc::new(RepartitionExec::try_new(sorted, Partitioning::Hash(vec![key()], 4)).unwrap());
+        // With one producer, each original hash bucket is still sorted even
+        // without RepartitionExec's explicit preserve-order option.
+        assert!(!shuffled.preserve_order());
+        let shuffled: Arc<dyn ExecutionPlan> = shuffled;
+        assert!(shuffled.output_ordering().is_some());
+        shuffled
+    };
+    let join = Arc::new(
+        SortMergeJoinExec::try_new(
+            side(),
+            side(),
+            vec![(key(), key())],
+            None,
+            JoinType::Inner,
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap(),
+    );
+    let graph = JobGraph::try_new(
+        join,
+        JobGraphOptions {
+            shuffle_backend: remote_shuffle_service(),
+        },
+    )
+    .unwrap();
+    assert_eq!(graph.stages().len(), 3);
+    let mut job = job(graph);
+    let options = adaptive_options();
+    for producer in 0..2 {
+        succeed(&mut job, producer, |_| ChannelCounts {
+            rows: vec![10; 4],
+            physical_bytes: Some(vec![100; 4]),
+            logical_bytes: vec![200; 4],
+        });
+        commit(&mut job, producer);
+    }
+    let before = job.graph.stages()[2].plan.clone();
+    validate::validate_plan(&before).unwrap();
+    let view = JobScheduler::stage_view(&mut job, 2, &options.adaptive, None).unwrap();
+    let rewrite = adapt(&view).unwrap().expect("a coalescing proposal");
+    assert_eq!(count(&rewrite.plan), 1);
+    // The remote reader interleaves buckets without merging their sort order.
+    // A consumer that needs sorted rows must reject this proposal.
+    let reason = validate::validate_plan(&rewrite.plan).unwrap_err();
+    assert!(reason.contains("input ordering is not satisfied"), "{reason}");
+    assert!(!adapt_job(&mut job, &options));
+    assert!(Arc::ptr_eq(&before, &job.graph.stages()[2].plan));
+    assert_eq!(job.stages[2].tasks.len(), 4);
+    assert_eq!(job.stages[2].adaptive, AdaptiveDecision::Static);
+    assert!(
+        job.graph.stages()[2]
+            .inputs
+            .iter()
+            .all(|input| input.adaptive.is_none())
+    );
+}
+
+#[test]
+fn coalescing_partition_constants_cannot_satisfy_sort_merge_ordering() {
+    use datafusion::arrow::compute::SortOptions;
+    use datafusion::physical_expr::equivalence::{AcrossPartitions, ConstExpr};
+
+    let side = |input: usize| {
+        let mut equivalence = EquivalenceProperties::new(schema());
+        equivalence
+            .add_constants([ConstExpr::new(key(), AcrossPartitions::Heterogeneous)])
+            .unwrap();
+        Arc::new(StageInputExec::new(
+            input,
+            Arc::new(PlanProperties::new(
+                equivalence,
+                Partitioning::Hash(vec![key()], 4),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        )) as Arc<dyn ExecutionPlan>
+    };
+    let join: Arc<dyn ExecutionPlan> = Arc::new(
+        SortMergeJoinExec::try_new(
+            side(0),
+            side(1),
+            vec![(key(), key())],
+            None,
+            JoinType::Inner,
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap(),
+    );
+    // A key that is constant within each original bucket trivially satisfies
+    // that bucket's ordering requirement, even without an explicit ordering.
+    validate::validate_plan(&join).unwrap();
+    let view = view(
+        join,
+        vec![
+            shuffle_input(statistics(&[MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a coalescing proposal");
+    assert_eq!(count(&rewrite.plan), 1);
+    // Different buckets may have different constant values. Merging them must
+    // not let those old constants prove that the merged stream is sorted.
+    let reason = validate::validate_plan(&rewrite.plan).unwrap_err();
+    assert!(reason.contains("input ordering is not satisfied"), "{reason}");
+}
