@@ -73,10 +73,12 @@ and the Rust tests of the changed crates on its own.
   output is committed, and only when the task definition asks for them: the driver sets
   `collect_statistics` only when adaptive execution is enabled on a remote shuffle service, so execution
   without it is unchanged (design invariant 10).
-- Tasks report exact totals and per-channel sizes as `ChannelSizes`: a 16-bit code
-  `1 + ceil(log_1.01(size))` per channel (within 1%, every `u64` representable), or above
-  2,000 channels a sparse form (nonempty bitmap, accurate codes for channels above twice
-  the average, one average for the rest) when it is smaller. Empty stays exactly zero.
+- Tasks report exact totals and per-channel sizes as `ChannelSizes`. Logical bytes use
+  a dense 16-bit code per channel, rounded upward within 1%, so averages cannot
+  understate a coalescing cap. Physical bytes may use a sparse form above 2,000
+  channels (nonempty bitmap, accurate codes for large channels, an average for the
+  rest) when it is smaller. Legacy sparse logical reports conservatively bound each
+  nonempty channel by the task's total. Empty stays exactly zero.
 - The driver keeps the reported form, binds statistics to the attempt the shuffle service committed,
   folds them per bucket once per producer stage and caches the fold, and releases them
   once every consumer has made its decision. Received and peak retained bytes are logged
@@ -98,11 +100,15 @@ and the Rust tests of the changed crates on its own.
   coalesced range: uncompressed bytes (`cluster.adaptive.coalesce.max_logical_size`) and
   the build side of every partitioned hash join in the group.
 - Join decisions: empty-input pruning, build/probe swap and hash join to sort-merge join.
-- Sizes of operator outputs come from sound bounds of the committed input sizes: exact
-  through reordering projections and sorts, an upper bound through filters, limits and
+- Sizes of operator outputs come from bounds of the committed input sizes: exact
+  through reordering projections, an upper bound through filters, limits and
   column-dropping projections, and no bound otherwise. A swap needs an exact build size
   larger than the probe's upper bound. A sort-merge conversion needs an exact build size
   above the cap. A group whose hash-join build side has no bound is not coalesced.
+  Sorts do not preserve these sizes because rebatching can repeat dictionary values.
+  Caps bound recorded logical shuffle bytes; rebatching and operator allocations
+  can change execution memory. DataFusion receives exact row counts and inexact
+  byte totals, and skew-replicated inputs receive no original exact totals.
 - User-chosen partition counts (`repartition(n, ...)`) are kept.
 - `EXPLAIN` notes that adaptive execution may re-plan the initial job graph, and
   `system.execution.stages` shows which stages were re-planned, by which rules, and their
@@ -160,6 +166,11 @@ Celeborn did not commit are never used.
 
 ### Benchmark
 
+The table below records the original run. Its task and partition counts include
+telemetry-query jobs from the old measurement code, so the task-reduction percentages
+are not reliable. The benchmark now observes each workload from a separate session;
+a new run is required before using these counts for performance conclusions.
+
 `scripts/adaptive/benchmark.py`, release build, native Celeborn 0.6.3 with two workers,
 local-cluster mode on a 4-core machine, parallelism 200, coalesce target and skew threshold
 4 MiB, median of three runs. Results are identical with AQE off and on for every workload.
@@ -175,7 +186,6 @@ local-cluster mode on a 4-core machine, parallelism 200, coalesce target and ske
 | join with an empty side | off | 3.51 | 805 | 805 | - | 511.5 |
 | join with an empty side | on | 3.61 | 805 | 805 | empty_input | 542.8 |
 
-Where coalescing applies, AQE removes 32-38% of the tasks and 12-40% of the task time.
 Wall time changes little on one 4-core machine, where the longest task dominates. No swap fires in the third
 workload: the computed join keys come from a projection in the producer stage, and the
 static plan already builds from the smaller side.

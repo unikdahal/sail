@@ -108,31 +108,43 @@ def _poll(df, timeout: float = 10.0):
     return rows
 
 
-def test_coalesced_stages_are_recorded(spark):
-    keys = 7
-    rows = spark.createDataFrame([Row(k=i % keys, v=i) for i in range(100)]).groupBy("k").count().orderBy("k").collect()
-    assert [row.k for row in rows] == list(range(keys))
-
-    replanned = _poll(
-        spark.sql(
-            "SELECT CAST(partitions AS BIGINT) AS partitions, "
-            "CAST(initial_partitions AS BIGINT) AS initial_partitions, adaptive_rules "
-            "FROM system.execution.stages WHERE replanned AND initial_partitions IS NOT NULL"
+def test_coalesced_stages_are_recorded(remote):
+    with spark_session_factory(remote) as sessions:
+        spark = sessions.create()
+        observer = sessions.create()
+        keys = 7
+        rows = (
+            spark.createDataFrame([Row(k=i % keys, v=i) for i in range(100)])
+            .groupBy("k")
+            .count()
+            .orderBy("k")
+            .collect()
         )
-    )
+        assert [row.k for row in rows] == list(range(keys))
+
+        replanned = _poll(
+            observer.sql(
+                "SELECT session_id, CAST(partitions AS BIGINT) AS partitions, "
+                "CAST(initial_partitions AS BIGINT) AS initial_partitions, adaptive_rules "
+                "FROM system.execution.stages WHERE replanned AND initial_partitions IS NOT NULL"
+            ).where(F.col("session_id") == spark.session_id)
+        )
     assert replanned, "no stage was re-planned"
     assert any(row.partitions < row.initial_partitions for row in replanned)
     assert any("coalesce" in row.adaptive_rules for row in replanned)
 
 
-def test_committed_statistics_are_recorded(spark):
-    spark.range(1000).repartition(8, "id").groupBy((F.col("id") % 3).alias("m")).count().collect()
-    rows = _poll(
-        spark.sql(
-            "SELECT session_id, CAST(rows AS BIGINT) AS rows, CAST(logical_bytes AS BIGINT) AS logical_bytes "
-            "FROM system.execution.stages WHERE rows IS NOT NULL"
-        ).where(F.col("session_id") == spark.session_id)
-    )
+def test_committed_statistics_are_recorded(remote):
+    with spark_session_factory(remote) as sessions:
+        spark = sessions.create()
+        observer = sessions.create()
+        spark.range(1000).repartition(8, "id").groupBy((F.col("id") % 3).alias("m")).count().collect()
+        rows = _poll(
+            observer.sql(
+                "SELECT session_id, CAST(rows AS BIGINT) AS rows, CAST(logical_bytes AS BIGINT) AS logical_bytes "
+                "FROM system.execution.stages WHERE rows IS NOT NULL"
+            ).where(F.col("session_id") == spark.session_id)
+        )
     assert rows
     assert all(row.logical_bytes >= 0 for row in rows)
 
@@ -140,21 +152,26 @@ def test_committed_statistics_are_recorded(spark):
 def test_statistics_are_not_collected_without_adaptive_execution(static_remote):
     with spark_session_factory(static_remote) as sessions:
         spark = sessions.create()
+        observer = sessions.create()
         spark.range(1000).repartition(8, "id").groupBy((F.col("id") % 3).alias("m")).count().collect()
         # System events are recorded asynchronously, so allow time for any to arrive.
         time.sleep(2)
         # Both servers of this module share the system store, so look at this session only.
         rows = (
-            spark.sql("SELECT session_id FROM system.execution.stages WHERE rows IS NOT NULL")
+            observer.sql("SELECT session_id FROM system.execution.stages WHERE rows IS NOT NULL")
             .where(F.col("session_id") == spark.session_id)
             .collect()
         )
         assert not rows, "statistics were collected without adaptive execution"
 
 
-def test_user_chosen_partition_count_is_kept(spark):
-    count = 12
-    partitions = spark.range(1000).repartition(count, "id").select(F.spark_partition_id().alias("p")).distinct().count()
+def test_user_chosen_partition_count_is_kept(remote):
+    with spark_session_factory(remote) as sessions:
+        spark = sessions.create()
+        count = 12
+        partitions = (
+            spark.range(1000).repartition(count, "id").select(F.spark_partition_id().alias("p")).distinct().count()
+        )
     assert partitions == count
 
 
@@ -173,15 +190,17 @@ def _skewed_join(spark):
 def test_skewed_join_is_split_with_map_range_reads(remote, static_remote):
     with spark_session_factory(remote) as adaptive_sessions, spark_session_factory(static_remote) as static_sessions:
         adaptive = adaptive_sessions.create()
+        observer = adaptive_sessions.create()
         static = static_sessions.create()
         expected = _skewed_join(static).collect()
         assert sum(row.c for row in expected) == SKEWED_FACT_ROWS
         assert _skewed_join(adaptive).collect() == expected
 
         rules = _poll(
-            adaptive.sql(
-                "SELECT adaptive_rules FROM system.execution.stages WHERE array_contains(adaptive_rules, 'skew_split')"
-            )
+            observer.sql(
+                "SELECT session_id, adaptive_rules FROM system.execution.stages "
+                "WHERE array_contains(adaptive_rules, 'skew_split')"
+            ).where(F.col("session_id") == adaptive.session_id)
         )
         assert rules, "no stage was split for skew"
 
