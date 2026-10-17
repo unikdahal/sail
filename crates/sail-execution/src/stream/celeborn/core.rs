@@ -8,6 +8,7 @@ use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::{DataFusionError, Result};
 use futures::{StreamExt, TryStreamExt};
+use sail_celeborn::common::BatchHeader;
 use sail_celeborn::shuffle::{PartitionReadOptions, ShuffleClient};
 
 use crate::id::{JobId, TaskKey};
@@ -247,7 +248,10 @@ impl TaskStreamChannelSink for CelebornStreamSink {
             )
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        self.pushed_bytes = self.pushed_bytes.saturating_add(size.compressed);
+        // The map-data header is persisted before each compressed payload in
+        // the reduce partition file; it is not just transport framing.
+        let stored_bytes = size.compressed.saturating_add(BatchHeader::SIZE as u64);
+        self.pushed_bytes = self.pushed_bytes.saturating_add(stored_bytes);
         Ok(TaskStreamWriteState::Active)
     }
 

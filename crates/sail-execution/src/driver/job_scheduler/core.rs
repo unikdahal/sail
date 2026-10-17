@@ -119,6 +119,9 @@ impl JobScheduler {
             warn!("{} not found", TaskKeyDisplay(key));
             return;
         };
+        // Finished jobs remain in the scheduler for inspection. Late reports may
+        // update task status, but must not reintroduce statistics after cleanup.
+        let retain_statistics = matches!(job.state, JobState::Running { .. });
         // Only blocking outputs have a committed form that later stages can rely on.
         let channels = job
             .graph
@@ -145,6 +148,7 @@ impl JobScheduler {
         // Statistics are bound to the attempt that reported them, and are kept only
         // when this report is the one that moved the attempt to the succeeded state.
         if let Some(statistics) = statistics
+            && retain_statistics
             && !previous.is_terminal()
             && matches!(attempt.state, TaskState::Succeeded)
         {
@@ -219,6 +223,7 @@ impl JobScheduler {
             return vec![];
         };
         if !matches!(job.state, JobState::Running { .. }) {
+            Self::discard_statistics(job);
             return vec![];
         }
 
@@ -255,6 +260,7 @@ impl JobScheduler {
                 })
             }
             job.state = JobState::Failed;
+            Self::discard_statistics(job);
             event_reporter.report(SystemEvent::JobUpdated {
                 session_id,
                 job_id: u64::from(job_id),
@@ -272,6 +278,7 @@ impl JobScheduler {
             // This drops `JobOutputManager` in the job state,
             // so that `JobOutputStream` turns to the draining state as well.
             job.state = JobState::Draining;
+            Self::discard_statistics(job);
             event_reporter.report(SystemEvent::JobUpdated {
                 session_id,
                 job_id: u64::from(job_id),
@@ -721,6 +728,7 @@ impl JobScheduler {
             context: job.context.clone(),
         });
         job.state.finish_output(outcome);
+        Self::discard_statistics(job);
         event_reporter.report(SystemEvent::JobUpdated {
             session_id,
             job_id: u64::from(job_id),
@@ -1039,6 +1047,21 @@ impl JobScheduler {
         }
     }
 
+    /// No more adaptive decisions can use statistics once a job stops running.
+    /// Clear the data even though its descriptor stays available for inspection.
+    fn discard_statistics(job: &mut JobDescriptor) {
+        for stage in &mut job.stages {
+            for task in &mut stage.tasks {
+                for attempt in &mut task.attempts {
+                    attempt.statistics = None;
+                }
+            }
+            stage.shuffle_statistics = None;
+            stage.retained_statistics_bytes = 0;
+        }
+        job.adaptive.retained_statistics_bytes = 0;
+    }
+
     fn log_adaptive_metrics(job_id: JobId, job: &JobDescriptor, options: &JobSchedulerOptions) {
         if !options.adaptive.enabled {
             return;
@@ -1206,7 +1229,10 @@ impl<'a> TaskInputBuilder<'a> {
                 .collect::<ExecutionResult<Vec<_>>>()?
         } else {
             match self.input.mode {
-                InputMode::Shuffle => (0..output_partitions)
+                // Shuffle placeholders use their own bucket domain. A surrounding
+                // UnionExec can have more output partitions than this input, so the
+                // containing stage's partition count is not this input's count.
+                InputMode::Shuffle => (0..input_channels)
                     .map(|partition| ShuffleServiceRead::channels(vec![partition]))
                     .collect(),
                 InputMode::Broadcast => {
@@ -1523,6 +1549,204 @@ pub(crate) mod tests_support {
             .and_then(|builder| builder.build())
             .unwrap()
             .locator
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod terminal_statistics_regression_tests {
+    use super::JobScheduler;
+    use crate::driver::job_scheduler::state::{JobState, TaskAttemptDescriptor, TaskState};
+    use crate::driver::job_scheduler::test_utils::{
+        aggregate_graph, commit, job, producer_statistics, remote_shuffle_service, reporter,
+        succeed,
+    };
+    use crate::driver::job_scheduler::{AdaptiveOptions, JobSchedulerOptions};
+    use crate::driver::output::JobOutputOutcome;
+    use crate::id::{JobId, TaskKey};
+    use crate::statistics::TaskOutputStatistics;
+
+    fn scheduler() -> JobScheduler {
+        JobScheduler::new(
+            JobSchedulerOptions::new_for_test(
+                remote_shuffle_service(),
+                AdaptiveOptions {
+                    enabled: true,
+                    ..AdaptiveOptions::default()
+                },
+                None,
+            ),
+            reporter(),
+        )
+    }
+
+    fn assert_discarded(scheduler: &JobScheduler, job_id: JobId) {
+        let job = &scheduler.jobs[&job_id];
+        assert_eq!(job.adaptive.retained_statistics_bytes, 0);
+        for stage in &job.stages {
+            assert_eq!(stage.retained_statistics_bytes, 0);
+            assert!(stage.shuffle_statistics.is_none());
+            assert!(stage.tasks.iter().all(|task| {
+                task.attempts
+                    .iter()
+                    .all(|attempt| attempt.statistics.is_none())
+            }));
+        }
+    }
+
+    #[test]
+    fn finished_jobs_release_attempt_statistics_and_cached_folds() {
+        for cleanup in [false, true] {
+            let mut scheduler = scheduler();
+            let job_id = JobId::from(1);
+            let mut job = job(aggregate_graph());
+            succeed(&mut job, 0, producer_statistics);
+            commit(&mut job, 0);
+            assert!(JobScheduler::committed_statistics(&mut job, 0).is_some());
+            let peak = job.adaptive.peak_retained_statistics_bytes;
+            assert!(peak > 0);
+            scheduler.jobs.insert(job_id, job);
+            for _ in 0..2 {
+                if cleanup {
+                    let _ = scheduler.clean_up_job(job_id, JobOutputOutcome::Completed);
+                } else {
+                    let _ = scheduler.refresh_job(job_id);
+                }
+                assert_discarded(&scheduler, job_id);
+                assert_eq!(
+                    scheduler.jobs[&job_id]
+                        .adaptive
+                        .peak_retained_statistics_bytes,
+                    peak
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn late_success_reports_do_not_retain_statistics_for_finished_jobs() {
+        for state in [
+            JobState::Draining,
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Canceled,
+        ] {
+            let mut scheduler = scheduler();
+            let job_id = JobId::from(1);
+            let mut job = job(aggregate_graph());
+            job.state = state;
+            job.stages[0].tasks[0].attempts.push(TaskAttemptDescriptor {
+                state: TaskState::Running,
+                messages: vec![],
+                cause: None,
+                job_output_fetched: false,
+                statistics: None,
+            });
+            scheduler.jobs.insert(job_id, job);
+            let key = TaskKey {
+                job_id,
+                stage: 0,
+                partition: 0,
+                attempt: 0,
+            };
+            scheduler.update_task(
+                &key,
+                TaskState::Succeeded,
+                None,
+                None,
+                Some(TaskOutputStatistics::new(&producer_statistics(0)).unwrap()),
+            );
+            assert!(matches!(
+                scheduler.get_task_state(&key),
+                Some(TaskState::Succeeded)
+            ));
+            assert_discarded(&scheduler, job_id);
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod shuffle_domain_regression_tests {
+    use std::sync::Arc;
+
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_expr::Partitioning;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::union::UnionExec;
+
+    use super::tests_support::build_input_locator;
+    use crate::driver::job_scheduler::test_utils::{
+        NoAssignments, commit, job, remote_shuffle_service, schema,
+    };
+    use crate::id::{JobId, TaskKey};
+    use crate::job_graph::{InputMode, JobGraph, JobGraphOptions};
+    use crate::task::definition::{ShuffleServiceRead, TaskInputLocator};
+
+    #[test]
+    fn union_shuffle_inputs_use_their_own_partition_domains() -> crate::error::ExecutionResult<()> {
+        let branch = |partitions| {
+            let input = MemorySourceConfig::try_new_exec(&[vec![]], schema(), None).unwrap();
+            Arc::new(
+                RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(partitions)).unwrap(),
+            ) as Arc<dyn datafusion::physical_plan::ExecutionPlan>
+        };
+        let graph = JobGraph::try_new(
+            UnionExec::try_new(vec![branch(2), branch(4)]).unwrap(),
+            JobGraphOptions {
+                shuffle_backend: remote_shuffle_service(),
+            },
+        )
+        .unwrap();
+        let mut job = job(graph);
+        let consumer = job
+            .graph
+            .stages()
+            .iter()
+            .position(|stage| {
+                stage.inputs.len() == 2
+                    && stage
+                        .inputs
+                        .iter()
+                        .all(|input| matches!(input.mode, InputMode::Shuffle))
+            })
+            .unwrap();
+        assert_eq!(
+            job.graph.stages()[consumer]
+                .plan
+                .output_partitioning()
+                .partition_count(),
+            6
+        );
+        let inputs = job.graph.stages()[consumer].inputs.clone();
+        for input in &inputs {
+            commit(&mut job, input.stage);
+            let locator = build_input_locator(
+                &job,
+                &TaskKey {
+                    job_id: JobId::from(1),
+                    stage: consumer,
+                    partition: 0,
+                    attempt: 0,
+                },
+                input,
+                &NoAssignments,
+            );
+            let TaskInputLocator::ShuffleService { reads, .. } = locator.as_ref() else {
+                return Err(crate::error::ExecutionError::InternalError(
+                    "expected a shuffle service locator".into(),
+                ));
+            };
+            let channels = job.graph.stages()[input.stage].distribution.channels();
+            assert_eq!(
+                *reads,
+                (0..channels)
+                    .map(|channel| ShuffleServiceRead::channels(vec![channel]))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
     }
 }
 

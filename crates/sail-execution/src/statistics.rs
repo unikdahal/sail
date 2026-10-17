@@ -8,6 +8,8 @@
 //! reports [`TaskOutputStatistics`]: exact totals and per-channel sizes in a compact
 //! encoding ([`ChannelSizes`]) of at most two bytes per channel, which the driver
 //! retains as is until every consumer of the shuffle has made its adaptive decision.
+//! Logical sizes use dense upper bounds for safe coalescing caps; physical sizes
+//! may use sparse averages for advisory targets and skew detection.
 //!
 //! Every metric has a fixed unit:
 //!   - `rows`: rows accepted by the sink, reported as a total only.
@@ -134,11 +136,11 @@ impl ChannelCounter {
 
 /// Returns the uncompressed size of the Arrow data that the batch references.
 ///
-/// Unlike [`RecordBatch::get_array_memory_size`], this counts sliced arrays and
-/// shared buffers only by the bytes they reference, so splitting a batch into
-/// slices leaves the total unchanged. View arrays count their views plus the
-/// bytes each out-of-line view references. Dictionary values are counted in
-/// full for every batch, since every batch carries the dictionary.
+/// Unlike [`RecordBatch::get_array_memory_size`], this counts sliced arrays only
+/// by the bytes they reference. Splitting a batch can add offset boundaries and
+/// bitmap rounding, and repeats the full dictionary values for every batch.
+/// Consequently these sizes are not invariant under operators that rebatch data.
+/// View arrays count their views plus the bytes each out-of-line view references.
 pub fn logical_batch_size(batch: &RecordBatch) -> Result<u64> {
     batch.columns().iter().try_fold(0u64, |acc, array| {
         Ok(acc.saturating_add(logical_array_size(array)?))
@@ -226,8 +228,9 @@ fn logical_array_size(array: &ArrayRef) -> Result<u64> {
     Ok(size.saturating_add(nulls))
 }
 
-/// The base of the logarithmic size code. A decoded size is within 1% of the
-/// encoded size, and every `u64` has a code, so large sizes never saturate.
+/// The base of the logarithmic size code. A decoded size is an upper bound no
+/// more than about 1% larger than the encoded size, and every `u64` has a code,
+/// so large sizes never saturate.
 const SIZE_CODE_BASE: f64 = 1.01;
 
 /// Encodes a size in two bytes: `0` for zero, otherwise `1 + ceil(log_1.01(size))`.
@@ -237,7 +240,13 @@ pub(crate) fn encode_size(size: u64) -> u16 {
         return 0;
     }
     let exponent = ((size as f64).ln() / SIZE_CODE_BASE.ln()).ceil();
-    (1.0 + exponent).min(u16::MAX as f64) as u16
+    let mut code = (1.0 + exponent).min(u16::MAX as f64) as u16;
+    // At large values, float conversion or logarithm rounding can round down
+    // across an integer boundary. Logical sizes must remain upper bounds.
+    while decode_size(code) < size {
+        code += 1;
+    }
+    code
 }
 
 pub(crate) fn decode_size(code: u16) -> u64 {
@@ -285,36 +294,43 @@ pub struct SparseChannelSizes {
 }
 
 impl ChannelSizes {
+    fn encode_dense(sizes: &[u64]) -> Self {
+        Self::Dense(sizes.iter().map(|&x| encode_size(x)).collect())
+    }
+
     pub fn encode(sizes: &[u64]) -> Self {
-        let dense = || Self::Dense(sizes.iter().map(|&x| encode_size(x)).collect());
+        let dense = || Self::encode_dense(sizes);
         if sizes.len() <= DENSE_CHANNEL_LIMIT || u32::try_from(sizes.len()).is_err() {
             return dense();
         }
+        // Sum before dividing in a wider type. Saturating at u64::MAX before
+        // taking an average can substantially understate large channels.
         let (total, count) = sizes
             .iter()
             .filter(|&&x| x > 0)
-            .fold((0u64, 0u64), |(t, c), &x| (t.saturating_add(x), c + 1));
-        let threshold = (total / count.max(1)).saturating_mul(HUGE_CHANNEL_FACTOR);
+            .fold((0u128, 0u128), |(t, c), &x| (t + u128::from(x), c + 1));
+        let threshold = (total / count.max(1)) * u128::from(HUGE_CHANNEL_FACTOR);
         let mut nonempty = vec![0u8; sizes.len().div_ceil(8)];
         let mut huge = vec![];
-        let (mut rest_total, mut rest_count) = (0u64, 0u64);
+        let (mut rest_total, mut rest_count) = (0u128, 0u128);
         for (channel, &size) in sizes.iter().enumerate() {
             if size == 0 {
                 continue;
             }
             nonempty[channel / 8] |= 1 << (channel % 8);
-            if size > threshold {
+            if u128::from(size) > threshold {
                 // The channel count fits in `u32`, as checked above.
                 huge.push((channel as u32, encode_size(size)));
             } else {
-                rest_total = rest_total.saturating_add(size);
+                rest_total += u128::from(size);
                 rest_count += 1;
             }
         }
         let sparse = SparseChannelSizes {
             channels: sizes.len(),
             nonempty: nonempty.into(),
-            average: rest_total.div_ceil(rest_count.max(1)).max(1),
+            // An average of u64 values also fits in u64.
+            average: rest_total.div_ceil(rest_count.max(1)).max(1) as u64,
             huge: huge.into(),
         };
         if sparse.encoded_bytes() < sizes.len() * size_of::<u16>() {
@@ -386,9 +402,11 @@ impl ChannelSizes {
 
 impl SparseChannelSizes {
     fn is_nonempty(&self, channel: usize) -> bool {
-        self.nonempty
-            .get(channel / 8)
-            .is_some_and(|x| x & (1 << (channel % 8)) != 0)
+        channel < self.channels
+            && self
+                .nonempty
+                .get(channel / 8)
+                .is_some_and(|x| x & (1 << (channel % 8)) != 0)
     }
 
     fn encoded_bytes(&self) -> usize {
@@ -441,6 +459,14 @@ impl TryFrom<r#gen::ChannelSizes> for ChannelSizes {
                 if sparse.nonempty.len() != channels.div_ceil(8) {
                     return Err(invalid("bitmap does not match the channels"));
                 }
+                if channels % 8 != 0
+                    && sparse
+                        .nonempty
+                        .last()
+                        .is_some_and(|&byte| byte >> (channels % 8) != 0)
+                {
+                    return Err(invalid("bitmap has bits beyond the channels"));
+                }
                 let huge_codes = codes(&sparse.huge_codes)?;
                 if huge_codes.len() != sparse.huge_channels.len() {
                     return Err(invalid("huge channels and codes differ in length"));
@@ -479,6 +505,9 @@ pub struct TaskOutputStatistics {
     pub logical_bytes: u64,
     /// `None` when the backend cannot tell the stored size of the channels.
     pub physical_bytes: Option<u64>,
+    /// New reports use dense size codes, upper bounds with about 1% precision.
+    /// Legacy sparse reports are read conservatively using the exact task total
+    /// for every nonempty channel, rather than their potentially low averages.
     pub channel_logical_bytes: ChannelSizes,
     pub channel_physical_bytes: Option<ChannelSizes>,
 }
@@ -491,7 +520,7 @@ impl TaskOutputStatistics {
             rows: sum(&counts.rows),
             logical_bytes: sum(&counts.logical_bytes),
             physical_bytes: counts.physical_bytes.as_deref().map(sum),
-            channel_logical_bytes: ChannelSizes::encode(&counts.logical_bytes),
+            channel_logical_bytes: ChannelSizes::encode_dense(&counts.logical_bytes),
             channel_physical_bytes: counts.physical_bytes.as_deref().map(ChannelSizes::encode),
         })
     }
@@ -529,7 +558,30 @@ impl TaskOutputStatistics {
     }
 
     pub fn logical_bytes_of(&self, channel: usize) -> u64 {
-        self.channel_logical_bytes.get(channel)
+        match &self.channel_logical_bytes {
+            ChannelSizes::Dense(_) => self.channel_logical_bytes.get(channel),
+            // Older workers may report sparse logical averages. A nonempty
+            // channel cannot exceed the exact task total, which gives a safe
+            // conservative bound without trusting the average.
+            ChannelSizes::Sparse(sparse) => {
+                if sparse.is_nonempty(channel) {
+                    self.logical_bytes
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    fn add_logical_bytes_to(&self, totals: &mut [u64]) {
+        match &self.channel_logical_bytes {
+            ChannelSizes::Dense(_) => self.channel_logical_bytes.add_to(totals),
+            ChannelSizes::Sparse(_) => {
+                for (channel, total) in totals.iter_mut().enumerate() {
+                    *total = total.saturating_add(self.logical_bytes_of(channel));
+                }
+            }
+        }
     }
 }
 
@@ -577,8 +629,9 @@ pub struct ShuffleStatistics {
     pub total_rows: u64,
     pub total_logical_bytes: u64,
     pub total_physical_bytes: Option<u64>,
-    /// Approximate sizes per bucket. A bucket is zero only if it is exactly empty.
+    /// Upper bounds per bucket. A bucket is zero only if it is exactly empty.
     pub logical_bytes: Vec<u64>,
+    /// Approximate sizes per bucket, used for advisory sizing and skew detection.
     pub physical_bytes: Option<Vec<u64>>,
 }
 
@@ -596,6 +649,7 @@ impl ShuffleStatistics {
             physical_bytes: Some(vec![0; channels]),
         };
         for attempt in attempts {
+            attempt.validate()?;
             if attempt.channels() != channels {
                 return Err(DataFusionError::Internal(format!(
                     "expected statistics for {channels} channels, got {}",
@@ -610,9 +664,7 @@ impl ShuffleStatistics {
                 .total_physical_bytes
                 .zip(attempt.physical_bytes)
                 .map(|(a, b)| a.saturating_add(b));
-            attempt
-                .channel_logical_bytes
-                .add_to(&mut result.logical_bytes);
+            attempt.add_logical_bytes_to(&mut result.logical_bytes);
             match (&mut result.physical_bytes, &attempt.channel_physical_bytes) {
                 (Some(physical), Some(sizes)) => sizes.add_to(physical),
                 (physical, _) => *physical = None,
@@ -649,7 +701,8 @@ impl ShuffleStatistics {
 #[expect(clippy::unwrap_used)]
 mod tests {
     use datafusion::arrow::array::{
-        BinaryViewArray, Int32Array, ListArray, StringArray, StringViewArray, StructArray,
+        BinaryViewArray, DictionaryArray, Int32Array, ListArray, StringArray, StringViewArray,
+        StructArray,
     };
     use datafusion::arrow::datatypes::Int32Type;
     use proptest::prelude::*;
@@ -730,6 +783,55 @@ mod tests {
         assert!(slice.get_array_memory_size() >= batch.get_array_memory_size() / 2);
     }
 
+    #[tokio::test]
+    async fn sorting_can_increase_logical_size_by_repeating_dictionaries() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::TaskContext;
+        use datafusion::execution::context::SessionConfig;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0; 100]),
+            Arc::new(StringArray::from(vec!["x".repeat(10_000)])),
+        )
+        .unwrap();
+        let input = RecordBatch::try_from_iter(vec![
+            (
+                "key",
+                Arc::new(Int32Array::from_iter_values((0..100).rev())) as ArrayRef,
+            ),
+            ("value", Arc::new(dictionary) as ArrayRef),
+        ])
+        .unwrap();
+        let input_size = logical_batch_size(&input).unwrap();
+        let source =
+            MemorySourceConfig::try_new_exec(&[vec![input.clone()]], input.schema(), None).unwrap();
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            Column::new("key", 0),
+        ))])
+        .unwrap();
+        let sort = Arc::new(SortExec::new(ordering, source));
+        let context = Arc::new(
+            TaskContext::default().with_session_config(
+                SessionConfig::new()
+                    .with_batch_size(10)
+                    .with_sort_in_place_threshold_bytes(usize::MAX),
+            ),
+        );
+        let output = datafusion::physical_plan::collect(sort, context)
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 100);
+        assert!(output.len() > 1);
+        let output_size = output
+            .iter()
+            .map(|batch| logical_batch_size(batch).unwrap())
+            .sum::<u64>();
+        assert!(output_size > input_size * 5);
+    }
+
     #[test]
     fn counts_round_trip_through_completion_batch() {
         for physical_bytes in [Some(vec![3, 0, 5]), None] {
@@ -769,17 +871,32 @@ mod tests {
         assert_eq!(decode_size(encode_size(1)), 1);
         for size in [2u64, 10, 1000, 123_456, 1 << 30, 7 << 32, 1 << 50] {
             let approx = decode_size(encode_size(size));
+            assert!(approx >= size, "{size} -> {approx}");
             assert!(within_one_percent(approx, size), "{size} -> {approx}");
         }
         assert!(encode_size(u64::MAX) < 4500);
         assert!(decode_size(encode_size(u64::MAX)) > u64::MAX / 2);
     }
 
+    #[test]
+    fn size_codes_are_upper_bounds_at_rounding_boundaries() {
+        for code in 1..=encode_size(u64::MAX) {
+            let boundary = decode_size(code);
+            for size in [
+                boundary.saturating_sub(1),
+                boundary,
+                boundary.saturating_add(1),
+            ] {
+                assert!(decode_size(encode_size(size)) >= size, "{size}");
+            }
+        }
+    }
+
     proptest! {
         #[test]
-        fn size_codes_are_within_one_percent(size in 1u64..u64::MAX / 2) {
+        fn size_codes_are_within_one_percent(size in 1u64..u64::MAX) {
             let approx = decode_size(encode_size(size));
-            prop_assert!(approx > 0);
+            prop_assert!(approx >= size, "{} -> {}", size, approx);
             prop_assert!(within_one_percent(approx, size), "{} -> {}", size, approx);
         }
 
@@ -829,6 +946,28 @@ mod tests {
     }
 
     #[test]
+    fn sparse_averages_do_not_saturate_before_dividing() {
+        let channels = 4096;
+        for size in [u64::MAX / 4096 + u64::MAX / 8192, u64::MAX] {
+            let encoded = ChannelSizes::encode(&vec![size; channels]);
+            assert!(matches!(encoded, ChannelSizes::Sparse(_)));
+            assert_eq!(encoded.get(0), size);
+            assert_eq!(encoded.get(channels - 1), size);
+            assert_eq!(encoded.get(channels), 0);
+        }
+    }
+
+    #[test]
+    fn sparse_padding_channels_are_empty() {
+        let sizes = vec![1; DENSE_CHANNEL_LIMIT + 1];
+        let encoded = ChannelSizes::encode(&sizes);
+        assert!(matches!(encoded, ChannelSizes::Sparse(_)));
+        for channel in sizes.len()..sizes.len().div_ceil(8) * 8 {
+            assert_eq!(encoded.get(channel), 0);
+        }
+    }
+
+    #[test]
     fn invalid_sparse_sizes_are_rejected() {
         let proto = r#gen::ChannelSizes {
             kind: Some(r#gen::channel_sizes::Kind::Sparse(
@@ -842,6 +981,22 @@ mod tests {
             )),
         };
         // Channel 3 is recorded as huge but marked empty.
+        assert!(ChannelSizes::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn sparse_bitmap_padding_is_rejected() {
+        let proto = r#gen::ChannelSizes {
+            kind: Some(r#gen::channel_sizes::Kind::Sparse(
+                r#gen::SparseChannelSizes {
+                    channels: 9,
+                    nonempty: vec![1, 2],
+                    average: 10,
+                    huge_channels: vec![],
+                    huge_codes: vec![],
+                },
+            )),
+        };
         assert!(ChannelSizes::try_from(proto).is_err());
     }
 
@@ -880,6 +1035,20 @@ mod tests {
     }
 
     #[test]
+    fn fold_rejects_inconsistent_physical_sizes() {
+        let mut statistics = TaskOutputStatistics::new(&ChannelCounts {
+            rows: vec![1, 2],
+            physical_bytes: Some(vec![1, 2]),
+            logical_bytes: vec![10, 20],
+        })
+        .unwrap();
+        statistics.channel_physical_bytes = Some(ChannelSizes::encode(&[1]));
+        assert!(ShuffleStatistics::fold(2, [&statistics]).is_err());
+        statistics.channel_physical_bytes = None;
+        assert!(ShuffleStatistics::fold(2, [&statistics]).is_err());
+    }
+
+    #[test]
     fn statistics_round_trip_through_proto() {
         for physical_bytes in [Some(vec![3, 0, 5]), None] {
             let statistics = TaskOutputStatistics::new(&ChannelCounts {
@@ -890,6 +1059,44 @@ mod tests {
             .unwrap();
             let proto: r#gen::TaskOutputStatistics = statistics.clone().into();
             assert_eq!(TaskOutputStatistics::try_from(proto).unwrap(), statistics);
+        }
+    }
+
+    #[test]
+    fn logical_channel_sizes_upper_bound_skewed_channels_and_legacy_sparse_reports() {
+        let mut sizes = (0..6000)
+            .map(|channel| if channel < 3000 { 1 } else { 1000 })
+            .collect::<Vec<_>>();
+        sizes[3] = 0;
+        let statistics = TaskOutputStatistics::new(&ChannelCounts {
+            rows: vec![1; sizes.len()],
+            physical_bytes: Some(sizes.clone()),
+            logical_bytes: sizes.clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            statistics.channel_logical_bytes,
+            ChannelSizes::Dense(_)
+        ));
+        assert!(matches!(
+            statistics.channel_physical_bytes,
+            Some(ChannelSizes::Sparse(_))
+        ));
+        let mut legacy = statistics.clone();
+        legacy.channel_logical_bytes = ChannelSizes::encode(&sizes);
+        assert!(matches!(
+            legacy.channel_logical_bytes,
+            ChannelSizes::Sparse(_)
+        ));
+        for original in [statistics, legacy] {
+            let proto: r#gen::TaskOutputStatistics = original.into();
+            let decoded = TaskOutputStatistics::try_from(proto).unwrap();
+            let folded = ShuffleStatistics::fold(sizes.len(), [&decoded]).unwrap();
+            for (channel, &size) in sizes.iter().enumerate() {
+                assert!(decoded.logical_bytes_of(channel) >= size);
+                assert!(folded.logical_bytes[channel] >= size);
+                assert_eq!(decoded.logical_bytes_of(channel) == 0, size == 0);
+            }
         }
     }
 }
