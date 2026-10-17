@@ -556,6 +556,9 @@ fn group_sizes(view: &StageView, group: &AlignmentGroup) -> Result<Option<GroupS
     if group.fixed {
         return Err("the group reads a source that is not a stage input".to_string());
     }
+    if group.partition_fetch {
+        return Err("the group contains an operator with a finite fetch limit".to_string());
+    }
     let options = &view.options;
     let mut buckets = None;
     let mut sizes: Vec<u64> = vec![];

@@ -34,6 +34,9 @@ pub(crate) struct AlignmentGroup {
     /// Whether the group contains a leaf that is not a stage input (e.g. a scan),
     /// whose partitioning cannot be rewritten.
     pub fixed: bool,
+    /// An operator in the domain has a finite fetch limit. Such limits may apply
+    /// per partition, so conservatively keep this domain's boundaries static.
+    pub partition_fetch: bool,
 }
 
 /// Returns the alignment groups of a stage plan, or the reason why the stage
@@ -65,6 +68,11 @@ fn walk(
             groups[g].inputs.insert(*placeholder.input());
         }
         return Ok(());
+    }
+    if let Some(g) = group
+        && node.fetch().is_some()
+    {
+        groups[g].partition_fetch = true;
     }
     if node.is::<InterleaveExec>() {
         // Its constructor demands hash or range partitioned inputs.
@@ -116,8 +124,11 @@ fn walk(
         }
         for child in node.children() {
             let child_group = match group {
-                Some(_) => {
-                    groups.push(AlignmentGroup::default());
+                Some(g) => {
+                    groups.push(AlignmentGroup {
+                        partition_fetch: groups[g].partition_fetch,
+                        ..AlignmentGroup::default()
+                    });
                     Some(groups.len() - 1)
                 }
                 None => None,

@@ -314,6 +314,61 @@ assertions, all three focused coalescing tests and clippy passed again. The Dock
 suite retains the existing pytest configuration deprecation warning. GitHub Build
 is still `disabled_fork`; these are local results.
 
+### Worker cleanup and fetch-limit follow-up (2026-10-17)
+
+Fetched PR #10 and the AQE stack again before continuing from `e0c7ec67`;
+the base remained `0b236c9f`. Two further defects were reproduced and fixed:
+
+- Successful OpenStream registrations were never ended after reading. Celeborn
+  0.6.3 retains their stream state, and an active stream can pin the original
+  shuffle file while a map-range read creates a sorted replacement. The reader
+  now sends the one-way `PbBufferStreamEnd(ChunkStream)` RPC on EOF, read errors
+  and early drop. The socket is discarded if that write is interrupted. A guard
+  captures the runtime for drops outside Tokio, and cancellation during cleanup
+  leaves the stream ID armed for a best-effort retry. Cleanup does not replace
+  the original read error.
+- Finite embedded fetch limits were treated as partition-independent. Skew
+  splitting could restart a filter's limit for each slice; coalescing could apply
+  it once across several original buckets. Actual DataFusion joins demonstrate
+  one match becoming two after splitting and four matches becoming one after
+  coalescing. Alignment domains containing finite fetch limits now keep their
+  boundaries through both rules. The restriction propagates through unions;
+  independent union siblings and broadcast probe domains remain eligible.
+
+The EOF wire regression timed out on the original reader because no stream-end
+message arrived. Both filter eligibility regressions failed before their fixes;
+the unsafe coalescing proposal also passed plan validation. Nine loopback
+regressions cover normal/empty EOF, fetch and batch errors, invalid chunk counts,
+unpolled/partial drops outside Tokio and cancellation during a pending fetch.
+Planner controls cover filters on either join side and above joins, local limits,
+fetched sorts/joins, a single-bucket skew domain, unions and broadcast isolation.
+The production changes and expanded regression coverage were independently
+reviewed with no blocking findings.
+
+Latest local checks on the final code:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 24 + 250 passed; doc tests passed |
+| Nine new worker lifecycle regressions, 20 consecutive rounds | 180 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 31 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 2 passed |
+| Nightly Rust formatting and diff checks | passed |
+
+The earlier 60 repeated cancellation/commit-observer checks, Python lint/format
+and workflow lint results above remain historical validation, not fresh runs.
+The current formatting check also reformatted two assertions from the ordering
+follow-up. The fork's GitHub Build workflow is still `disabled_fork`; these are
+local checks. Performance benchmarks have not been rerun.
+
+Stream cleanup is best effort and requires a known server-generated stream ID.
+If the initial OpenStream response is lost before its ID is decoded, cleanup
+still depends on Celeborn's eventual shuffle cleanup. Normal stream-end also
+leaves Celeborn's own per-shuffle numeric ID tracking until shuffle cleanup;
+this fix releases the registered stream state and original-file pin.
+
 ## Remaining work
 
 - Measure peak hash-join build memory (`build_mem_used`) against the build cap on

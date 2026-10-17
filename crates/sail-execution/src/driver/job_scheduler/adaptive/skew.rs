@@ -138,7 +138,9 @@ fn split_safe_input(node: &Arc<dyn ExecutionPlan>) -> Option<usize> {
                 .iter()
                 .all(|expr| deterministic(&expr.expr))
         } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
-            deterministic(filter.predicate())
+            // An embedded limit restarts for every slice, admitting rows that
+            // the original partition's filter would not have emitted.
+            filter.fetch().is_none() && deterministic(filter.predicate())
         } else {
             node.is::<CooperativeExec>()
                 || node
@@ -344,11 +346,18 @@ impl Side {
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::NullEquality;
     use datafusion::common::config::ConfigOptions;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::TaskContext;
     use datafusion::logical_expr::Operator;
-    use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_expr::expressions::{BinaryExpr, lit};
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, ScalarFunctionExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::limit::LocalLimitExec;
+    use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{Partitioning, PlanProperties};
 
     use super::*;
@@ -359,11 +368,15 @@ mod tests {
     use crate::statistics::{ChannelCounts, ShuffleStatistics};
 
     fn input(i: usize) -> Arc<dyn ExecutionPlan> {
+        input_with_buckets(i, 4)
+    }
+
+    fn input_with_buckets(i: usize, buckets: usize) -> Arc<dyn ExecutionPlan> {
         Arc::new(StageInputExec::new(
             i,
             Arc::new(PlanProperties::new(
                 datafusion::physical_expr::EquivalenceProperties::new(schema()),
-                Partitioning::UnknownPartitioning(4),
+                Partitioning::UnknownPartitioning(buckets),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             )),
@@ -425,6 +438,324 @@ mod tests {
             producers,
             committed: Some(Arc::new(committed)),
         }
+    }
+
+    fn positive_filter(
+        input: Arc<dyn ExecutionPlan>,
+        fetch: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let predicate = Arc::new(BinaryExpr::new(key(), Operator::Gt, lit(0i64)));
+        FilterExec::try_new(predicate, input)
+            .unwrap()
+            .with_fetch(fetch)
+            .unwrap()
+    }
+
+    fn join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        mode: PartitionMode,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                vec![(key(), key())],
+                None,
+                &JoinType::Inner,
+                None,
+                mode,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn small_input() -> InputView {
+        let output = Arc::new(
+            TaskOutputStatistics::new(&ChannelCounts {
+                rows: vec![1; 4],
+                physical_bytes: Some(vec![100; 4]),
+                logical_bytes: vec![100; 4],
+            })
+            .unwrap(),
+        );
+        let statistics = Arc::new(ShuffleStatistics::fold(4, [output.as_ref()]).unwrap());
+        InputView {
+            statistics: Some(statistics),
+            producers: 1,
+            committed: Some(Arc::new(vec![output])),
+            ..skewed_input(1)
+        }
+    }
+
+    fn coalescing_view(plan: Arc<dyn ExecutionPlan>, inputs: Vec<InputView>) -> StageView {
+        StageView {
+            plan,
+            inputs,
+            options: AdaptiveOptions {
+                join_enabled: false,
+                skew_enabled: false,
+                coalesce_target_size: 1024,
+                coalesce_min_partition_size: 1,
+                ..AdaptiveOptions::default()
+            },
+            slot_cap: None,
+        }
+    }
+
+    #[test]
+    fn limited_filters_are_not_skew_split() {
+        for limited_side in [0, 1, 2] {
+            for fetch in [None, Some(1), Some(0)] {
+                let mut children = [input(0), input(1)];
+                if limited_side < 2 {
+                    children[limited_side] = positive_filter(children[limited_side].clone(), fetch);
+                }
+                let mut plan = join(
+                    children[0].clone(),
+                    children[1].clone(),
+                    PartitionMode::Partitioned,
+                );
+                if limited_side == 2 {
+                    plan = positive_filter(plan, fetch);
+                }
+                let view = StageView {
+                    plan,
+                    inputs: vec![skewed_input(2), skewed_input(2)],
+                    options: AdaptiveOptions {
+                        join_enabled: false,
+                        coalesce_enabled: false,
+                        skew_threshold: 1,
+                        coalesce_target_size: 1,
+                        ..AdaptiveOptions::default()
+                    },
+                    slot_cap: None,
+                };
+                let rewrite = crate::driver::job_scheduler::adaptive::adapt(&view).unwrap();
+                let split = rewrite
+                    .as_ref()
+                    .is_some_and(|rewrite| rewrite.rules.contains(&RULE_SKEW_SPLIT));
+                assert_eq!(
+                    split,
+                    fetch.is_none(),
+                    "side {limited_side}, fetch {fetch:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn limited_filters_are_not_coalesced() {
+        for fetch in [None, Some(1)] {
+            let view = coalescing_view(positive_filter(input(0), fetch), vec![small_input()]);
+            let rewrite = crate::driver::job_scheduler::adaptive::adapt(&view).unwrap();
+            if let Some(rewrite) = &rewrite {
+                crate::driver::job_scheduler::adaptive::validate::validate_plan(&rewrite.plan)
+                    .unwrap();
+            }
+            let coalesced = rewrite.as_ref().is_some_and(|rewrite| {
+                rewrite
+                    .rules
+                    .contains(&crate::driver::job_scheduler::adaptive::RULE_COALESCE)
+            });
+            // Four original buckets may each emit one row. A single coalesced
+            // partition would apply the embedded limit once and emit only one.
+            assert_eq!(coalesced, fetch.is_none(), "fetch {fetch:?}");
+        }
+    }
+
+    #[test]
+    fn partition_fetch_limits_preserve_coalescing_domains() {
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap();
+        let limited: Vec<Arc<dyn ExecutionPlan>> = vec![
+            Arc::new(LocalLimitExec::new(input(0), 1)),
+            Arc::new(
+                SortExec::new(ordering, input(0))
+                    .with_preserve_partitioning(true)
+                    .with_fetch(Some(1)),
+            ),
+            join(input(0), input(1), PartitionMode::Partitioned)
+                .with_fetch(Some(1))
+                .unwrap(),
+            positive_filter(
+                join(input(0), input(1), PartitionMode::Partitioned),
+                Some(1),
+            ),
+        ];
+        for plan in limited {
+            let name = plan.name().to_string();
+            let view = coalescing_view(plan, vec![small_input(); 2]);
+            assert!(
+                crate::driver::job_scheduler::adaptive::adapt(&view)
+                    .unwrap()
+                    .is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_fetch_limits_keep_independent_union_and_broadcast_domains_available() {
+        let plan = UnionExec::try_new(vec![positive_filter(input(0), Some(1)), input(1)]).unwrap();
+        let view = coalescing_view(plan, vec![small_input(); 2]);
+        let rewrite = crate::driver::job_scheduler::adaptive::adapt(&view)
+            .unwrap()
+            .unwrap();
+        assert!(rewrite.inputs[0].is_none());
+        assert_eq!(rewrite.inputs[1].as_ref().unwrap().partitions(), 1);
+
+        let plan = positive_filter(
+            UnionExec::try_new(vec![input(0), input(1)]).unwrap(),
+            Some(1),
+        );
+        let view = coalescing_view(plan, vec![small_input(); 2]);
+        assert!(
+            crate::driver::job_scheduler::adaptive::adapt(&view)
+                .unwrap()
+                .is_none()
+        );
+
+        let plan = join(
+            positive_filter(input_with_buckets(0, 1), Some(1)),
+            input(1),
+            PartitionMode::CollectLeft,
+        );
+        let mut broadcast = small_input();
+        broadcast.mode = InputMode::Broadcast;
+        broadcast.layout = BucketLayout::Opaque;
+        let view = coalescing_view(plan, vec![broadcast, small_input()]);
+        let rewrite = crate::driver::job_scheduler::adaptive::adapt(&view)
+            .unwrap()
+            .unwrap();
+        assert!(rewrite.inputs[0].is_none());
+        assert_eq!(rewrite.inputs[1].as_ref().unwrap().partitions(), 1);
+    }
+
+    #[test]
+    fn a_fetch_above_a_single_bucket_join_prevents_skew_splitting() {
+        let output = Arc::new(
+            TaskOutputStatistics::new(&ChannelCounts {
+                rows: vec![1],
+                physical_bytes: Some(vec![100]),
+                logical_bytes: vec![100],
+            })
+            .unwrap(),
+        );
+        let committed = vec![output; 2];
+        let statistics =
+            Arc::new(ShuffleStatistics::fold(1, committed.iter().map(Arc::as_ref)).unwrap());
+        let source = InputView {
+            buckets: 1,
+            statistics: Some(statistics),
+            committed: Some(Arc::new(committed)),
+            ..skewed_input(2)
+        };
+        for fetch in [None, Some(1)] {
+            let plan = positive_filter(
+                join(
+                    input_with_buckets(0, 1),
+                    input_with_buckets(1, 1),
+                    PartitionMode::Partitioned,
+                ),
+                fetch,
+            );
+            let view = StageView {
+                plan,
+                inputs: vec![source.clone(); 2],
+                options: AdaptiveOptions {
+                    join_enabled: false,
+                    coalesce_enabled: false,
+                    skew_threshold: 1,
+                    // A one-bucket input equals its median; this supported
+                    // setting makes the unlimited control eligible for a split.
+                    skew_factor: 0.5,
+                    coalesce_target_size: 1,
+                    ..AdaptiveOptions::default()
+                },
+                slot_cap: None,
+            };
+            let rewrite = crate::driver::job_scheduler::adaptive::adapt(&view).unwrap();
+            assert_eq!(rewrite.is_some(), fetch.is_none(), "fetch {fetch:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn splitting_below_a_limited_filter_changes_join_rows() {
+        fn batch(key_value: i64, value: i64) -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![key_value])),
+                    Arc::new(Int64Array::from(vec![value])),
+                ],
+            )
+            .unwrap()
+        }
+
+        async fn joined_rows(
+            partitions: Vec<Vec<RecordBatch>>,
+            probe_partitions: Vec<Vec<RecordBatch>>,
+        ) -> usize {
+            let left = MemorySourceConfig::try_new_exec(&partitions, schema(), None).unwrap();
+            let right =
+                MemorySourceConfig::try_new_exec(&probe_partitions, schema(), None).unwrap();
+            let join = Arc::new(
+                HashJoinExec::try_new(
+                    positive_filter(left, Some(1)),
+                    right,
+                    vec![(key(), key())],
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            );
+            datafusion::physical_plan::collect(join, Arc::new(TaskContext::default()))
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum()
+        }
+
+        // One bucket contains two producer batches. Splitting it into two map
+        // ranges resets the embedded filter limit for each range, admitting a
+        // row that the original join never saw. The other side is replicated.
+        assert_eq!(
+            joined_rows(
+                vec![vec![batch(1, 11), batch(1, 22)]],
+                vec![vec![batch(1, 99)]]
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            joined_rows(
+                vec![vec![batch(1, 11)], vec![batch(1, 22)]],
+                vec![vec![batch(1, 99)]; 2],
+            )
+            .await,
+            2
+        );
+
+        // Coalescing has the opposite effect: four buckets each admit their own
+        // matching key, whereas merging the buckets applies the limit only once.
+        let build = (1..=4).map(|k| batch(k, k * 10)).collect::<Vec<_>>();
+        let probe = (1..=4).map(|k| batch(k, k * 100)).collect::<Vec<_>>();
+        assert_eq!(
+            joined_rows(
+                build.iter().map(|batch| vec![batch.clone()]).collect(),
+                probe.iter().map(|batch| vec![batch.clone()]).collect(),
+            )
+            .await,
+            4
+        );
+        assert_eq!(joined_rows(vec![build], vec![probe]).await, 1);
     }
 
     #[test]

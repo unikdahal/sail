@@ -1381,7 +1381,10 @@ fn coalescing_sorted_shuffle_buckets_keeps_the_static_sort_merge_join() {
     // The remote reader interleaves buckets without merging their sort order.
     // A consumer that needs sorted rows must reject this proposal.
     let reason = validate::validate_plan(&rewrite.plan).unwrap_err();
-    assert!(reason.contains("input ordering is not satisfied"), "{reason}");
+    assert!(
+        reason.contains("input ordering is not satisfied"),
+        "{reason}"
+    );
     assert!(!adapt_job(&mut job, &options));
     assert!(Arc::ptr_eq(&before, &job.graph.stages()[2].plan));
     assert_eq!(job.stages[2].tasks.len(), 4);
@@ -1441,5 +1444,8 @@ fn coalescing_partition_constants_cannot_satisfy_sort_merge_ordering() {
     // Different buckets may have different constant values. Merging them must
     // not let those old constants prove that the merged stream is sorted.
     let reason = validate::validate_plan(&rewrite.plan).unwrap_err();
-    assert!(reason.contains("input ordering is not satisfied"), "{reason}");
+    assert!(
+        reason.contains("input ordering is not satisfied"),
+        "{reason}"
+    );
 }
