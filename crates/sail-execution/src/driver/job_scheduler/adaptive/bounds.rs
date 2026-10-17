@@ -9,8 +9,13 @@
 //!   - an exact size proves that a size is large (a build side is larger than its
 //!     probe side, or a build partition exceeds the build cap).
 //!
+//! These bounds describe the recorded input data. Read rebatching can repeat or
+//! retain Arrow buffers, and hash table overhead is unmeasured, so byte caps do
+//! not guarantee a bound on a task's actual memory usage.
+//!
 //! Any other operator (an aggregate, a join, a projection that computes values,
-//! a window, an unnest) has no bound, and decisions that need one are not made.
+//! a rebatching sort, a window, an unnest) has no bound, and decisions that need
+//! one are not made.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -80,12 +85,11 @@ fn operator_bound(node: &Arc<dyn ExecutionPlan>) -> Option<Bound> {
     if node.is::<CooperativeExec>() {
         return Some(Bound::Exact);
     }
-    if let Some(sort) = node.downcast_ref::<SortExec>() {
-        return Some(if sort.fetch().is_some() {
-            Bound::Upper
-        } else {
-            Bound::Exact
-        });
+    if node.is::<SortExec>() {
+        // Sorting can rebatch the rows. In particular, every output dictionary
+        // batch carries the dictionary values, so the total logical bytes may
+        // exceed the committed input even though the rows are unchanged.
+        return None;
     }
     if node.is::<LocalLimitExec>() || node.is::<GlobalLimitExec>() {
         return Some(Bound::Upper);
@@ -166,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_through_reordering_and_sorting() {
+    fn exact_through_column_reordering() {
         let plan = project(input(3), vec![column("b", 1), column("a", 0)]);
         assert_eq!(
             input_bound(&plan),
@@ -187,6 +191,26 @@ mod tests {
         assert_eq!(input_bound(&limit).unwrap().bound, Bound::Upper);
         let dropped = project(input(0), vec![column("a", 0)]);
         assert_eq!(input_bound(&dropped).unwrap().bound, Bound::Upper);
+    }
+
+    #[test]
+    fn no_bound_through_sort_rebatching() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            column("a", 0),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        for fetch in [None, Some(1)] {
+            let sort: Arc<dyn ExecutionPlan> = Arc::new(
+                SortExec::new(ordering.clone(), input(0))
+                    .with_preserve_partitioning(true)
+                    .with_fetch(fetch),
+            );
+            assert_eq!(input_bound(&sort), None);
+        }
     }
 
     #[test]

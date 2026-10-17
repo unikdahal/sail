@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use datafusion::common::JoinType;
-use datafusion::physical_expr::Distribution;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::physical_expr::{Distribution, PhysicalExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::filter::FilterExec;
@@ -128,17 +129,32 @@ fn split_safe_input(node: &Arc<dyn ExecutionPlan>) -> Option<usize> {
         if let Some(placeholder) = node.downcast_ref::<StageInputExec<usize>>() {
             return Some(*placeholder.input());
         }
-        let safe = node.is::<ProjectionExec>()
-            || node.is::<FilterExec>()
-            || node.is::<CooperativeExec>()
-            || node
-                .downcast_ref::<SortExec>()
-                .is_some_and(|sort| sort.fetch().is_none());
+        // A replicated slice re-evaluates these expressions. Volatile expressions
+        // could then produce different values or select different rows for each
+        // copy of the same input row.
+        let safe = if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+            projection
+                .expr()
+                .iter()
+                .all(|expr| deterministic(&expr.expr))
+        } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
+            deterministic(filter.predicate())
+        } else {
+            node.is::<CooperativeExec>()
+                || node
+                    .downcast_ref::<SortExec>()
+                    .is_some_and(|sort| sort.fetch().is_none())
+        };
         match node.children().as_slice() {
             [child] if safe => node = child,
             _ => return None,
         }
     }
+}
+
+fn deterministic(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.exists(|expr| Ok(expr.is_volatile_node()))
+        .is_ok_and(|volatile| !volatile)
 }
 
 /// Splits the skewed single-bucket ranges of a join's inputs.
@@ -215,6 +231,25 @@ pub(crate) fn split_skewed_buckets(
                 spec.push(vec![BucketSlice::whole(range.clone())]);
             }
             continue;
+        }
+        // Count the Cartesian product before constructing it. The slot cap is
+        // also an allocation guard: two skewed inputs can each have thousands of
+        // producer slices even when only a handful of tasks are allowed.
+        let partitions = parts.iter().try_fold(1usize, |count, part| {
+            count.checked_mul(part.as_ref().map_or(1, Vec::len))
+        });
+        let total = partitions.and_then(|count| specs[0].len().checked_add(count));
+        let Some(total) = total else {
+            notes.push("skew split skipped: partition count overflow".to_string());
+            return Ok(None);
+        };
+        if let Some(cap) = view.slot_cap
+            && total > cap
+        {
+            notes.push(format!(
+                "skew split skipped: at least {total} partitions exceed the limit of {cap} slots"
+            ));
+            return Ok(None);
         }
         split_any = true;
         let slices = parts
@@ -303,5 +338,117 @@ impl Side {
         }
         let ranges = ranges_from_starts(&split_by_target_size(&sizes, self.target), sizes.len());
         (ranges.len() > 1).then_some(ranges)
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use datafusion::common::config::ConfigOptions;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::ScalarFunctionExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, lit};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::{Partitioning, PlanProperties};
+
+    use super::*;
+    use crate::driver::job_scheduler::AdaptiveOptions;
+    use crate::driver::job_scheduler::adaptive::view::InputView;
+    use crate::driver::job_scheduler::test_utils::{key, schema};
+    use crate::job_graph::{BucketLayout, InputMode, ShuffleOrigin};
+    use crate::statistics::{ChannelCounts, ShuffleStatistics};
+
+    fn input(i: usize) -> Arc<dyn ExecutionPlan> {
+        Arc::new(StageInputExec::new(
+            i,
+            Arc::new(PlanProperties::new(
+                datafusion::physical_expr::EquivalenceProperties::new(schema()),
+                Partitioning::UnknownPartitioning(4),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        ))
+    }
+
+    fn random() -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                datafusion::functions::math::random(),
+                vec![],
+                schema().as_ref(),
+                Arc::new(ConfigOptions::default()),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn replicated_inputs_must_not_re_evaluate_volatile_expressions() {
+        let projection: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                vec![(key(), "k".to_string()), (random(), "r".to_string())],
+                input(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(split_safe_input(&projection), None);
+
+        let predicate = Arc::new(BinaryExpr::new(random(), Operator::Gt, lit(0.5f64)));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input(0)).unwrap());
+        assert_eq!(split_safe_input(&filter), None);
+
+        let deterministic: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new(vec![(key(), "k".to_string())], input(0)).unwrap());
+        assert_eq!(split_safe_input(&deterministic), Some(0));
+    }
+
+    fn skewed_input(producers: usize) -> InputView {
+        let output = Arc::new(
+            TaskOutputStatistics::new(&ChannelCounts {
+                rows: vec![0, 1, 0, 0],
+                physical_bytes: Some(vec![0, 100, 0, 0]),
+                logical_bytes: vec![0, 100, 0, 0],
+            })
+            .unwrap(),
+        );
+        let committed = vec![output; producers];
+        let statistics =
+            Arc::new(ShuffleStatistics::fold(4, committed.iter().map(Arc::as_ref)).unwrap());
+        InputView {
+            mode: InputMode::Shuffle,
+            origin: ShuffleOrigin::Engine,
+            layout: BucketLayout::Direct,
+            hash_partitioned: true,
+            buckets: 4,
+            statistics: Some(statistics),
+            producers,
+            committed: Some(Arc::new(committed)),
+        }
+    }
+
+    #[test]
+    fn slot_cap_is_checked_before_allocating_slice_combinations() {
+        let view = StageView {
+            plan: input(0),
+            inputs: vec![skewed_input(512), skewed_input(512)],
+            options: AdaptiveOptions {
+                skew_threshold: 1,
+                coalesce_target_size: 1,
+                ..AdaptiveOptions::default()
+            },
+            slot_cap: Some(8),
+        };
+        let join = SkewJoin {
+            sides: vec![(0, true), (1, true)],
+        };
+        let mut notes = vec![];
+        assert!(
+            split_skewed_buckets(&view, &join, &[0..1, 1..2, 2..3, 3..4], &mut notes)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("262145 partitions"));
     }
 }

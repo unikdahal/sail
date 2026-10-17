@@ -243,6 +243,9 @@ pub(crate) fn apply_sort_merge_joins(
 fn should_swap(join: &HashJoinExec, build: &ShuffleStatistics, probe: &ShuffleStatistics) -> bool {
     !join.null_aware
         && join.fetch().is_none()
+        // DataFusion cannot swap after filter pushdown has wired the build and
+        // probe sides together. Keep that join so the other adaptive rules run.
+        && join.dynamic_expressions_produced().is_empty()
         && join.join_type.supports_swap()
         && build.total_logical_bytes
             > probe
@@ -304,7 +307,8 @@ fn to_sort_merge_join(join: &HashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
 }
 
 /// Converts committed statistics into DataFusion statistics for a stage input.
-pub(crate) fn exact_statistics(
+/// Row counts survive read rebatching exactly; referenced byte sizes do not.
+pub(crate) fn committed_input_statistics(
     statistics: &ShuffleStatistics,
     schema: &datafusion::arrow::datatypes::Schema,
 ) -> Statistics {
@@ -314,7 +318,7 @@ pub(crate) fn exact_statistics(
             .map(Precision::Exact)
             .unwrap_or(Precision::Absent),
         total_byte_size: usize::try_from(statistics.total_logical_bytes)
-            .map(Precision::Exact)
+            .map(Precision::Inexact)
             .unwrap_or(Precision::Absent),
         column_statistics: Statistics::unknown_column(schema),
     }

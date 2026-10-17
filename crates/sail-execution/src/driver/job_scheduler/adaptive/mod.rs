@@ -43,7 +43,7 @@ use crate::driver::job_scheduler::adaptive::coalesce::{
 };
 use crate::driver::job_scheduler::adaptive::domain::{AlignmentGroup, alignment_groups};
 use crate::driver::job_scheduler::adaptive::joins::{
-    apply_join_rules, apply_sort_merge_joins, exact_statistics,
+    apply_join_rules, apply_sort_merge_joins, committed_input_statistics,
 };
 use crate::driver::job_scheduler::adaptive::skew::{
     RULE_SKEW_SPLIT, skew_joins, split_skewed_buckets,
@@ -656,8 +656,9 @@ fn coalesce_ranges(
 
 /// Rewrites the stage input placeholders: an adapted input declares
 /// `UnknownPartitioning` with its new partition count, and every input with
-/// committed statistics exposes them. Ancestors are rebuilt, so their properties
-/// follow from their inputs.
+/// committed statistics exposes them when its spec preserves total reads. Skew
+/// splits may replicate an input, so their original totals are no longer exact.
+/// Ancestors are rebuilt, so their properties follow from their inputs.
 fn rewrite_placeholders(
     plan: Arc<dyn ExecutionPlan>,
     view: &StageView,
@@ -677,9 +678,18 @@ fn rewrite_placeholders(
                     ));
             }
             let mut rewritten = StageInputExec::new(i, properties);
-            if let Some(statistics) = view.statistics(i) {
-                rewritten = rewritten
-                    .with_statistics(Arc::new(exact_statistics(statistics, &node.schema())));
+            let preserves_totals = !matches!(
+                inputs.get(i).and_then(|input| input.as_deref()),
+                Some(AdaptiveInput {
+                    property: AdaptiveProperty::Unknown,
+                    ..
+                })
+            );
+            if preserves_totals && let Some(statistics) = view.statistics(i) {
+                rewritten = rewritten.with_statistics(Arc::new(committed_input_statistics(
+                    statistics,
+                    &node.schema(),
+                )));
             }
             Ok(Transformed::yes(
                 Arc::new(rewritten) as Arc<dyn ExecutionPlan>

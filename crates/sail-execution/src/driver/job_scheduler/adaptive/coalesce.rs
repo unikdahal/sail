@@ -5,9 +5,10 @@
 //! `ShufflePartitionsUtil.coalescePartitions`, with two differences:
 //!   - every bucket is read exactly once, including empty buckets, so the coverage of
 //!     a spec can be validated without statistics;
-//!   - hard caps bound other per-range sizes, such as the uncompressed bytes of the
-//!     range or the build side of a hash join. A range of more than one bucket never
-//!     exceeds a cap; a single bucket above a cap is left alone, since coalescing
+//!   - hard caps bound the recorded input bytes of each range or hash join build
+//!     side. They do not bound retained Arrow buffers or hash table memory.
+//!     A range of more than one bucket never exceeds a cap; a single bucket above
+//!     a cap is left alone, since coalescing
 //!     cannot make it smaller.
 //!
 //! Both passes are linear in the number of buckets.
@@ -62,7 +63,7 @@ impl Run {
             .iter()
             .zip(&next.capped)
             .zip(caps)
-            .all(|((a, b), cap)| a.saturating_add(*b) <= cap.limit)
+            .all(|((a, b), cap)| a.checked_add(*b).is_some_and(|size| size <= cap.limit))
     }
 
     fn absorb(&mut self, next: Run) {
@@ -148,7 +149,8 @@ pub(crate) fn within_caps(ranges: &[Range<usize>], caps: &[Cap]) -> bool {
                 || cap
                     .sizes
                     .get(range.clone())
-                    .is_some_and(|x| x.iter().fold(0u64, |a, b| a.saturating_add(*b)) <= cap.limit)
+                    .and_then(|x| x.iter().try_fold(0u64, |a, b| a.checked_add(*b)))
+                    .is_some_and(|size| size <= cap.limit)
         })
     })
 }
@@ -243,6 +245,17 @@ mod tests {
             limit: 25,
         };
         assert!(!within_caps(std::slice::from_ref(&(0..2)), &[pair]));
+    }
+
+    #[test]
+    fn overflowing_sums_cannot_bypass_a_cap() {
+        let cap = Cap {
+            sizes: vec![u64::MAX, 1],
+            limit: u64::MAX,
+        };
+        let ranges = coalesce(&[1, 1], std::slice::from_ref(&cap), &params(1000, 1));
+        assert_eq!(ranges, vec![0..1, 1..2]);
+        assert!(!within_caps(&[0..2], &[cap]));
     }
 
     #[test]

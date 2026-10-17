@@ -16,7 +16,9 @@ use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoi
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, PlanProperties};
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, PlanProperties, StatisticsArgs, StatisticsContext,
+};
 
 use super::*;
 use crate::driver::job_scheduler::JobSchedulerOptions;
@@ -949,6 +951,28 @@ fn inner_join_splits_both_skewed_sides_into_pairs() {
         .filter(|(l, r)| l[0].part.is_some() && r[0].part.is_some())
         .count();
     assert!(pairs >= 4, "{pairs} pairs");
+
+    // Both sides repeat producer ranges across the cross product. The original
+    // shuffle totals must not be advertised as exact statistics of these reads.
+    let _ = rewrite
+        .plan
+        .apply(|node| {
+            if node.is::<StageInputExec<usize>>() {
+                let statistics = StatisticsContext::new()
+                    .compute(node.as_ref(), &StatisticsArgs::default())
+                    .unwrap();
+                assert_eq!(
+                    statistics.num_rows,
+                    datafusion::common::stats::Precision::Absent
+                );
+                assert_eq!(
+                    statistics.total_byte_size,
+                    datafusion::common::stats::Precision::Absent
+                );
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
 }
 
 #[test]
@@ -1236,4 +1260,66 @@ fn retried_tasks_reuse_the_adapted_plan() {
     assert!(!adapt_job(&mut job, &options));
     assert_eq!(job.graph.to_string(), adapted);
     assert_eq!(job.stages[1].adaptive, AdaptiveDecision::Replanned);
+}
+
+#[test]
+fn coalescing_remains_available_after_join_dynamic_filter_pushdown() {
+    use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+    let filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![key()], lit(true)));
+    let join = HashJoinExec::try_new(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        vec![(key(), key())],
+        None,
+        &JoinType::Inner,
+        None,
+        PartitionMode::Partitioned,
+        NullEquality::NullEqualsNothing,
+        false,
+    )
+    .unwrap()
+    .with_dynamic_filter_expr(filter)
+    .unwrap();
+    let view = view(
+        Arc::new(join),
+        vec![
+            shuffle_input(statistics(&[8 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a coalescing rewrite");
+    assert_eq!(rewrite.rules, vec![RULE_COALESCE]);
+    assert_eq!(count(&rewrite.plan), 1);
+    assert_eq!(build_input(&rewrite.plan), Some(0));
+    assert_eq!(
+        rewrite
+            .plan
+            .downcast_ref::<HashJoinExec>()
+            .unwrap()
+            .dynamic_expressions_produced()
+            .len(),
+        1
+    );
+    validate::validate_plan(&rewrite.plan).unwrap();
+}
+
+#[test]
+fn coalesced_inputs_keep_exact_rows_and_estimated_bytes() {
+    use datafusion::common::stats::Precision;
+
+    let statistics = statistics(&[MIB; 4]);
+    let view = view(placeholder(0, 4), vec![shuffle_input(statistics.clone())]);
+    let rewrite = adapt(&view).unwrap().expect("a coalescing rewrite");
+    let actual = StatisticsContext::new()
+        .compute(rewrite.plan.as_ref(), &StatisticsArgs::default())
+        .unwrap();
+    assert_eq!(
+        actual.num_rows,
+        Precision::Exact(statistics.total_rows as usize)
+    );
+    assert_eq!(
+        actual.total_byte_size,
+        Precision::Inexact(statistics.total_logical_bytes as usize)
+    );
 }

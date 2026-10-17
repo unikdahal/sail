@@ -229,9 +229,11 @@ pub(crate) fn split_by_target_size(sizes: &[u64], target: u64) -> Vec<usize> {
     const MERGED_PARTITION_FACTOR: f64 = 1.2;
     let target_f = target as f64;
     let mut starts = vec![0];
-    let mut current = 0u64;
-    let mut last: Option<u64> = None;
-    let mut try_merge = |starts: &mut Vec<usize>, current: u64| {
+    // A producer or bucket size can already be saturated at u64::MAX. Keep
+    // accumulated sizes wider so overflow neither panics nor hides a boundary.
+    let mut current = 0u128;
+    let mut last: Option<u128> = None;
+    let mut try_merge = |starts: &mut Vec<usize>, current: u128| {
         let merge = last.is_some_and(|last| {
             ((current + last) as f64) < target_f * MERGED_PARTITION_FACTOR
                 || (current as f64) < target_f * SMALL_PARTITION_FACTOR
@@ -245,12 +247,13 @@ pub(crate) fn split_by_target_size(sizes: &[u64], target: u64) -> Vec<usize> {
         }
     };
     for (i, &size) in sizes.iter().enumerate() {
-        if i > 0 && current.saturating_add(size) > target {
+        let size = u128::from(size);
+        if i > 0 && current + size > u128::from(target) {
             try_merge(&mut starts, current);
             starts.push(i);
             current = size;
         } else {
-            current = current.saturating_add(size);
+            current += size;
         }
     }
     try_merge(&mut starts, current);
@@ -395,6 +398,18 @@ mod tests {
         assert_eq!(split_by_target_size(&[60, 50], 100), vec![0]);
         assert_eq!(split_by_target_size(&[], 100), vec![0]);
         assert_eq!(ranges_from_starts(&[0, 2], 5), vec![0..2, 2..5]);
+    }
+
+    #[test]
+    fn split_by_target_size_handles_saturated_producer_sizes() {
+        assert_eq!(
+            split_by_target_size(&[u64::MAX, u64::MAX], u64::MAX),
+            vec![0, 1]
+        );
+        assert_eq!(
+            split_by_target_size(&[u64::MAX, u64::MAX, 1], u64::MAX / 2),
+            vec![0, 1]
+        );
     }
 
     /// Builds specs as the adaptive rules do: coalesce, then split single-bucket
