@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -10,7 +11,7 @@ use tokio::sync::Mutex;
 use crate::common::BatchHeader;
 use crate::error::{CelebornError, CelebornResult};
 use crate::protocol::StatusCode;
-use crate::protocol::proto::MessageType;
+use crate::protocol::proto::{MessageType, PbBufferStreamEnd, StreamType};
 
 /// Netty transport frame types, mirroring the `Message.Type` identifiers in Java.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
@@ -262,6 +263,45 @@ impl TransportConnection {
         self.request(TransportFrame::rpc_request(request_id, body)?)
             .await?
             .into_rpc_response(request_id)
+    }
+
+    /// Release a worker chunk stream. FetchHandler consumes this RPC without replying.
+    pub(crate) async fn end_chunk_stream(&self, stream_id: i64) -> CelebornResult<()> {
+        let body = TransportMessage::new(
+            MessageType::BufferStreamEnd,
+            PbBufferStreamEnd {
+                stream_type: StreamType::ChunkStream as i32,
+                stream_id,
+            }
+            .encode_to_vec(),
+        )
+        .encode()?;
+        let frame = TransportFrame::rpc_request(self.next_request_id(), body)?;
+        let mut shared_stream = self.stream.lock().await;
+        // As in request(), cancellation during a partial write must close the
+        // socket instead of letting the next transaction reuse a broken frame.
+        let stream = shared_stream.take();
+        let result = tokio::time::timeout(self.timeout, async move {
+            let mut stream = match stream {
+                Some(stream) => stream,
+                None => {
+                    let connection = TcpStream::connect((&*self.host, self.port)).await?;
+                    connection.set_nodelay(true)?;
+                    connection
+                }
+            };
+            frame.write(&mut stream).await?;
+            Ok::<_, CelebornError>(stream)
+        })
+        .await;
+        match result {
+            Ok(Ok(stream)) => {
+                *shared_stream = Some(stream);
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(CelebornError::Timeout),
+        }
     }
 
     /// Push one map-data batch using Celeborn's `PushData` transport frame.

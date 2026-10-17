@@ -280,36 +280,59 @@ impl WorkerClient {
             Ok(handler) => handler,
             Err(error) => return Box::pin(stream::once(async move { Err(error.into()) })),
         };
+        let guard = WorkerStreamGuard::new(self.fetch.clone(), handler.stream_id);
+        if handler.num_chunks < 0 {
+            guard.close().await;
+            return Box::pin(stream::once(async {
+                Err(CelebornError::Protocol(
+                    "negative stream chunk count".to_string(),
+                ))
+            }));
+        }
         let client = self.clone();
         Box::pin(stream::try_unfold(
             (
                 client,
+                guard,
                 handler.stream_id,
                 0,
                 handler.num_chunks,
                 BytesMut::new(),
             ),
-            |(client, stream_id, mut chunk_index, num_chunks, mut buffered)| async move {
+            |(client, guard, stream_id, mut chunk_index, num_chunks, mut buffered)| async move {
                 loop {
-                    if let Some(batch) = take_batch(&mut buffered)? {
-                        return Ok(Some((
-                            batch,
-                            (client, stream_id, chunk_index, num_chunks, buffered),
-                        )));
+                    match take_batch(&mut buffered) {
+                        Ok(Some(batch)) => {
+                            return Ok(Some((
+                                batch,
+                                (client, guard, stream_id, chunk_index, num_chunks, buffered),
+                            )));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            guard.close().await;
+                            return Err(error);
+                        }
                     }
                     if chunk_index == num_chunks {
+                        guard.close().await;
                         return if buffered.is_empty() {
                             Ok(None)
                         } else {
                             Err(CelebornError::Protocol("truncated batch data".to_string()))
                         };
                     }
-                    buffered.extend_from_slice(
-                        &client
-                            .fetch
-                            .fetch_chunk(stream_id, chunk_index, 0, i32::MAX)
-                            .await?,
-                    );
+                    match client
+                        .fetch
+                        .fetch_chunk(stream_id, chunk_index, 0, i32::MAX)
+                        .await
+                    {
+                        Ok(chunk) => buffered.extend_from_slice(&chunk),
+                        Err(error) => {
+                            guard.close().await;
+                            return Err(error);
+                        }
+                    }
                     chunk_index += 1;
                 }
             },
@@ -373,6 +396,50 @@ impl WorkerClient {
             .encode()?;
         let response = self.rpc.send_rpc(payload).await?;
         TransportMessage::decode_java(&response)
+    }
+}
+
+/// An OpenStream registration pins worker metadata and may keep the original
+/// unsorted file alive after a range read creates its sorted replacement.
+struct WorkerStreamGuard {
+    fetch: TransportConnection,
+    stream_id: Option<i64>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl WorkerStreamGuard {
+    fn new(fetch: TransportConnection, stream_id: i64) -> Self {
+        Self {
+            fetch,
+            stream_id: Some(stream_id),
+            // Streams are Send and may be dropped outside their originating runtime.
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+
+    async fn close(mut self) {
+        if let Some(stream_id) = self.stream_id
+            && let Err(error) = self.fetch.end_chunk_stream(stream_id).await
+        {
+            log::debug!("failed to close Celeborn stream {stream_id}: {error}");
+        }
+        // Keep the ID armed across the await: if close is cancelled, Drop retries.
+        self.stream_id = None;
+    }
+}
+
+impl Drop for WorkerStreamGuard {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.stream_id.take()
+            && let Some(runtime) = &self.runtime
+        {
+            let fetch = self.fetch.clone();
+            runtime.spawn(async move {
+                if let Err(error) = fetch.end_chunk_stream(stream_id).await {
+                    log::debug!("failed to close Celeborn stream {stream_id}: {error}");
+                }
+            });
+        }
     }
 }
 
@@ -633,14 +700,274 @@ fn endpoint(
 #[expect(clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use bytes::{Bytes, BytesMut};
+    use futures::StreamExt;
+    use prost::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        BatchFilter, WorkerClientOptions, WorkerClientPool, compress, decompress, take_batch,
-        unreadable_files,
+        BatchFilter, WorkerClient, WorkerClientOptions, WorkerClientPool, compress, decompress,
+        take_batch, unreadable_files,
     };
     use crate::common::{BatchHeader, CompressionCodec, PartitionLocation, PartitionReadOptions};
+    use crate::protocol::proto::{MessageType, PbBufferStreamEnd, PbStreamHandler, StreamType};
+    use crate::protocol::transport::TransportMessage;
+
+    async fn read_frame(socket: &mut TcpStream) -> (u8, Vec<u8>, Vec<u8>) {
+        let header_length = socket.read_i32().await.unwrap() as usize;
+        let frame_type = socket.read_u8().await.unwrap();
+        let body_length = socket.read_i32().await.unwrap() as usize;
+        let mut header = vec![0; header_length];
+        let mut body = vec![0; body_length];
+        socket.read_exact(&mut header).await.unwrap();
+        socket.read_exact(&mut body).await.unwrap();
+        (frame_type, header, body)
+    }
+
+    async fn write_frame(socket: &mut TcpStream, frame_type: u8, header: &[u8], body: &[u8]) {
+        socket.write_i32(header.len() as i32).await.unwrap();
+        socket.write_u8(frame_type).await.unwrap();
+        socket.write_i32(body.len() as i32).await.unwrap();
+        socket.write_all(header).await.unwrap();
+        socket.write_all(body).await.unwrap();
+    }
+
+    async fn check_stream_cleanup(
+        num_chunks: i32,
+        chunks: Vec<Vec<u8>>,
+        fail_fetch: bool,
+        drop_after: Option<usize>,
+        expected_error: Option<&str>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            const STREAM_ID: i64 = 12345;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut location = location(0);
+            location.host = address.ip().to_string();
+            location.fetch_port = address.port();
+            let client = WorkerClient::new(WorkerClientOptions::new(location));
+            let (closed, closed_received) = tokio::sync::oneshot::channel();
+            let worker = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (frame_type, header, body) = read_frame(&mut socket).await;
+                assert_eq!(frame_type, 3); // RpcRequest
+                assert_eq!(
+                    TransportMessage::decode(&body).unwrap().message_type,
+                    MessageType::OpenStream
+                );
+                let response = TransportMessage::new(
+                    MessageType::StreamHandler,
+                    PbStreamHandler {
+                        stream_id: STREAM_ID,
+                        num_chunks,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .encode()
+                .unwrap();
+                let mut response_header = header[..8].to_vec();
+                response_header.extend_from_slice(&(response.len() as i32).to_be_bytes());
+                write_frame(&mut socket, 4, &response_header, &response).await;
+                let mut fetched = 0;
+                loop {
+                    let (frame_type, header, body) = read_frame(&mut socket).await;
+                    if frame_type == 3 {
+                        let message = TransportMessage::decode(&body).unwrap();
+                        assert_eq!(message.message_type, MessageType::BufferStreamEnd);
+                        let end = PbBufferStreamEnd::decode(message.payload.as_slice()).unwrap();
+                        assert_eq!(end.stream_type, StreamType::ChunkStream as i32);
+                        assert_eq!(end.stream_id, STREAM_ID);
+                        closed.send(()).unwrap();
+                        // FetchHandler deliberately sends no reply to this RPC. A
+                        // subsequent OpenStream must still reuse the connection.
+                        let (frame_type, header, body) = read_frame(&mut socket).await;
+                        assert_eq!(frame_type, 3);
+                        assert_eq!(
+                            TransportMessage::decode(&body).unwrap().message_type,
+                            MessageType::OpenStream
+                        );
+                        let mut response_header = header[..8].to_vec();
+                        response_header.extend_from_slice(&(response.len() as i32).to_be_bytes());
+                        write_frame(&mut socket, 4, &response_header, &response).await;
+                        return;
+                    }
+                    assert_eq!(frame_type, 0); // ChunkFetchRequest
+                    assert!(fetched < chunks.len());
+                    write_frame(
+                        &mut socket,
+                        if fail_fetch { 2 } else { 1 },
+                        &header,
+                        &chunks[fetched],
+                    )
+                    .await;
+                    fetched += 1;
+                }
+            });
+            let mut stream = client.read_partition_stream("app-0", None).await;
+            let _exhausted = if let Some(count) = drop_after {
+                for _ in 0..count {
+                    assert_eq!(stream.next().await.unwrap().unwrap().1.as_ref(), b"abc");
+                }
+                // Callers can release a Send stream outside its Tokio runtime.
+                std::thread::spawn(move || drop(stream)).join().unwrap();
+                None
+            } else {
+                let mut errors = 0;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok((_, payload)) => assert_eq!(payload.as_ref(), b"abc"),
+                        Err(error) => {
+                            assert!(error.to_string().contains(expected_error.unwrap()));
+                            errors += 1;
+                        }
+                    }
+                }
+                assert_eq!(errors, usize::from(expected_error.is_some()));
+                // Keep the exhausted stream alive: EOF itself must release it.
+                Some(stream)
+            };
+            // Serialize a further request after the cleanup (the server receives
+            // StreamEnd before replying). Drop paths schedule cleanup asynchronously.
+            closed_received.await.unwrap();
+            let _next_stream = client.read_partition_stream("app-0", None).await;
+            worker.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn partition_stream_closes_worker_registration_at_eof() {
+        let mut batch = header(0, 0, 0, 3).encode();
+        batch.extend_from_slice(b"abc");
+        check_stream_cleanup(
+            2,
+            vec![batch[..10].to_vec(), batch[10..].to_vec()],
+            false,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_partition_stream_closes_worker_registration() {
+        check_stream_cleanup(0, vec![], false, None, None).await;
+    }
+
+    #[tokio::test]
+    async fn failed_partition_stream_closes_worker_registration() {
+        check_stream_cleanup(
+            1,
+            vec![vec![]],
+            true,
+            None,
+            Some("invalid chunk fetch response"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dropped_unpolled_partition_stream_closes_worker_registration() {
+        check_stream_cleanup(1, vec![vec![]], false, Some(0), None).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_partial_partition_stream_closes_worker_registration() {
+        let mut batch = header(0, 0, 0, 3).encode();
+        batch.extend_from_slice(b"abc");
+        check_stream_cleanup(2, vec![batch, vec![]], false, Some(1), None).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_partition_stream_closes_worker_registration() {
+        check_stream_cleanup(
+            1,
+            vec![header(0, 0, 0, 3).encode()],
+            false,
+            None,
+            Some("truncated batch data"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_closes_worker_registration() {
+        check_stream_cleanup(
+            1,
+            vec![header(0, 0, 0, -1).encode()],
+            false,
+            None,
+            Some("invalid batch length"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn negative_chunk_count_closes_worker_registration() {
+        check_stream_cleanup(-1, vec![], false, None, Some("negative stream chunk count")).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_chunk_fetch_closes_worker_registration_on_a_new_connection() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut location = location(0);
+            location.host = address.ip().to_string();
+            location.fetch_port = address.port();
+            let client = WorkerClient::new(WorkerClientOptions::new(location));
+            let (fetch_started, fetch_started_received) = tokio::sync::oneshot::channel();
+            let worker = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (_, header, _) = read_frame(&mut socket).await;
+                let response = TransportMessage::new(
+                    MessageType::StreamHandler,
+                    PbStreamHandler {
+                        stream_id: 12345,
+                        num_chunks: 1,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .encode()
+                .unwrap();
+                let mut response_header = header[..8].to_vec();
+                response_header.extend_from_slice(&(response.len() as i32).to_be_bytes());
+                write_frame(&mut socket, 4, &response_header, &response).await;
+                let (frame_type, _, _) = read_frame(&mut socket).await;
+                assert_eq!(frame_type, 0);
+                fetch_started.send(()).unwrap();
+                // The cancelled request discards its socket; its guard must then
+                // release the known stream ID through a new connection.
+                match socket.read(&mut [0]).await {
+                    Ok(size) => assert_eq!(size, 0),
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+                }
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (frame_type, _, body) = read_frame(&mut socket).await;
+                assert_eq!(frame_type, 3);
+                let message = TransportMessage::decode(&body).unwrap();
+                assert_eq!(message.message_type, MessageType::BufferStreamEnd);
+                let end = PbBufferStreamEnd::decode(message.payload.as_slice()).unwrap();
+                assert_eq!(end.stream_type, StreamType::ChunkStream as i32);
+                assert_eq!(end.stream_id, 12345);
+            });
+            let mut stream = client.read_partition_stream("app-0", None).await;
+            let cancelled = tokio::spawn(async move { stream.next().await });
+            fetch_started_received.await.unwrap();
+            cancelled.abort();
+            assert!(cancelled.await.unwrap_err().is_cancelled());
+            worker.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     fn header(map_id: i32, attempt_id: i32, batch_id: i32, length: i32) -> BatchHeader {
         BatchHeader {
