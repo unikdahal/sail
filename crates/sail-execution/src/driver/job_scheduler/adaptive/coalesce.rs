@@ -255,7 +255,7 @@ mod tests {
         };
         let ranges = coalesce(&[1, 1], std::slice::from_ref(&cap), &params(1000, 1));
         assert_eq!(ranges, vec![0..1, 1..2]);
-        assert!(!within_caps(&[0..2], &[cap]));
+        assert!(!within_caps(std::slice::from_ref(&(0..2)), &[cap]));
     }
 
     #[test]

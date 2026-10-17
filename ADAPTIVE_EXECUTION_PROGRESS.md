@@ -137,7 +137,8 @@ and the Rust tests of the changed crates on its own.
 
 ## Validation
 
-All results are from the final tree unless noted.
+The following results record the original stack. Follow-up validation is recorded
+separately below.
 
 | Check | Result |
 |---|---|
@@ -202,7 +203,9 @@ static plan already builds from the smaller side.
 - **Statistics encoding.** The design keeps per-channel rows and one-byte log sizes with
   about 10% error. Per-channel rows were unused and doubled the volume, and one byte
   saturates above about 36 GB, so tasks report exact totals and two-byte sizes within 1%,
-  with a sparse form for many channels. The driver keeps that form instead of re-encoding.
+  with a sparse form for physical bytes on many channels. Logical bytes stay dense
+  to provide per-channel upper bounds. The driver keeps the reported form instead
+  of re-encoding.
 - **Statistics only with AQE.** The design collects statistics for observability before
   any rule ships. They are collected only when AQE is enabled on a remote shuffle service, so execution
   without AQE is unchanged.
@@ -241,6 +244,50 @@ static plan already builds from the smaller side.
   they run in CI on their pull requests.
 - **Benchmarks** ran on one 4-core machine. The manual workflow can repeat them with larger
   scales on GitHub-hosted runners.
+
+## Correctness follow-up (2026-10-17)
+
+[PR #10](https://github.com/unikdahal/sail/pull/10) follows the top of the stack
+at `0b236c9f` and fixes several issues found in repeated reviews:
+
+- A canceled Celeborn request discards its socket, so a later request cannot read
+  its partial or delayed response. Duplicate mapper completions wait for the
+  driver's commit observer before returning success.
+- Logical channel sizes are conservative upper bounds. Sparse averaging,
+  floating-point rounding and overflowing sums cannot bypass coalescing caps.
+  Stored physical bytes include the persisted batch header.
+- Skew splitting rejects volatile projections and filters, and checks its Cartesian
+  partition count before allocation. Sort rebatching no longer supplies a byte
+  bound, and joins with pushed-down dynamic filters keep their other adaptive rules.
+- Terminal jobs release attempt statistics and cached folds, including on failure;
+  late task reports cannot retain them again. Validation checks every placeholder
+  occurrence, and shuffle locators use each input's own partition domain.
+- Benchmark and test telemetry use separate observer sessions. Build covers stacked
+  PRs, configuration edits trigger Celeborn coverage, and Python CI runs the new
+  benchmark regressions.
+
+Local validation used Rust 1.99.1, Python 3.12.14 and Celeborn 0.6.3:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked -p sail-celeborn -p sail-execution --no-fail-fast` | 15 + 242 passed; doc tests passed |
+| New cancellation and commit-observer tests, 20 consecutive rounds | 60 passed |
+| `cargo clippy --locked -p sail-celeborn -p sail-execution --all-targets -- -D warnings` | passed |
+| Native extension build (`maturin develop --locked`) | passed |
+| Docker client, static shuffle and AQE integration suites | 31 passed; existing pytest configuration deprecation warning |
+| `scripts/adaptive/test_benchmark.py` | 2 passed |
+| Nightly Rust formatting, Python lint/format, actionlint, diff checks | passed |
+
+Rust checks used `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_INCREMENTAL=0` and `CARGO_BUILD_JOBS=2`. This environment's Python sysconfig
+names `/install/lib`; the linker and loader used the actual runtime library
+directory through `LIBRARY_PATH` and `LD_LIBRARY_PATH`. The mounted Celeborn config
+needed mode `0644` so the container user could read it. These were environment
+corrections, without repository configuration changes.
+
+GitHub reports the fork's Build workflow as `disabled_fork`; these results are
+local checks, not GitHub Actions results. The corrected benchmark has not been
+rerun for performance measurements.
 
 ## Remaining work
 
