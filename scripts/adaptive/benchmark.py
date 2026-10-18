@@ -39,6 +39,7 @@ class Measurement:
     """What one workload did in one mode."""
 
     wall_seconds: list[float] = field(default_factory=list)
+    results_match_warmup: bool = True
     jobs: int = 0
     stages: int = 0
     tasks: int = 0
@@ -177,8 +178,11 @@ def _run_mode(args: argparse.Namespace, *, adaptive: bool) -> dict[str, tuple[li
                 _record(observer, spark.session_id, measurement)
                 for _ in range(args.repeat):
                     start = time.perf_counter()
-                    workload(spark, args.scale).collect()
+                    timed_rows = workload(spark, args.scale).collect()
                     measurement.wall_seconds.append(time.perf_counter() - start)
+                    # Compare after stopping the timer, and retain any mismatch
+                    # even if a later repetition returns the expected rows.
+                    measurement.results_match_warmup &= sorted(tuple(row) for row in timed_rows) == rows
                 results[name] = (rows, measurement)
     return results
 
@@ -223,9 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     on = _run_mode(args, adaptive=True)
     report = {}
     for name in WORKLOADS:
-        parity = off[name][0] == on[name][0]
+        parity = off[name][0] == on[name][0] and all(mode[name][1].results_match_warmup for mode in (off, on))
         if not parity:
-            print(f"error: results of {name} differ with adaptive execution", file=sys.stderr)  # noqa: T201
+            print(f"error: results of {name} differ between modes or timed repetitions", file=sys.stderr)  # noqa: T201
         report[name] = {
             "parity": parity,
             "off": {**asdict(off[name][1]), "median_wall_seconds": off[name][1].median_wall_seconds},

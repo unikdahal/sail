@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 spec = importlib.util.spec_from_file_location("aqe_benchmark", Path(__file__).with_name("benchmark.py"))
 benchmark = importlib.util.module_from_spec(spec)
@@ -110,3 +113,47 @@ def test_run_mode_does_not_count_observer_or_other_workload_jobs(monkeypatch):
         assert rows == [(2, 5), (2, 10)]
         assert (measurement.jobs, measurement.stages, measurement.tasks, measurement.partitions) == (1, 1, 1, 2)
         assert len(measurement.wall_seconds) == args.repeat
+
+
+@pytest.mark.parametrize("corrupted_mode", [None, "off", "on"])
+def test_main_checks_every_timed_result(monkeypatch, tmp_path, capsys, corrupted_mode):
+    calls = {"off": 0, "on": 0}
+
+    @contextmanager
+    def server(*, envs):
+        mode = "on" if envs["SAIL_CLUSTER__ADAPTIVE__ENABLED"] == "true" else "off"
+        yield SimpleNamespace(remote=mode)
+
+    @contextmanager
+    def factory(remote):
+        yield SimpleNamespace(create=lambda: SimpleNamespace(session_id=f"workload-{remote}", mode=remote))
+
+    def workload(spark, scale):
+        calls[spark.mode] += 1
+        # Both warmups match. Only the first timed run can be wrong; the next
+        # returns the warmup again, so an earlier failure must remain recorded.
+        if calls[spark.mode] == 1:
+            return Frame([(scale, 5), (scale, 10)])
+        value = 99 if spark.mode == corrupted_mode and calls[spark.mode] == 2 else 10  # noqa: PLR2004
+        # Identical rows in a different order must continue to pass parity.
+        return Frame([(scale, value), (scale, 5)])
+
+    monkeypatch.setattr(benchmark, "spark_connect_server", server)
+    monkeypatch.setattr(benchmark, "spark_session_factory", factory)
+    monkeypatch.setattr(benchmark, "WORKLOADS", {"repeat_parity": workload})
+    monkeypatch.setattr(benchmark, "_record", lambda *_args: None)
+    output = tmp_path / "report.json"
+    status = benchmark.main(["--master", "fake:1", "--repeat", "2", "--output", str(output)])
+
+    assert status == (0 if corrupted_mode is None else 1)
+    report = json.loads(output.read_text(encoding="utf-8"))["workloads"]["repeat_parity"]
+    assert report["parity"] is (corrupted_mode is None)
+    assert calls == {"off": 3, "on": 3}
+    assert len(report["off"]["wall_seconds"]) == len(report["on"]["wall_seconds"]) == 2  # noqa: PLR2004
+    stderr = capsys.readouterr().err
+    if corrupted_mode is None:
+        assert stderr == ""
+    else:
+        assert "error:" in stderr
+        assert "repeat_parity" in stderr
+        assert "differ" in stderr
