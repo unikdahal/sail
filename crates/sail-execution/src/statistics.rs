@@ -832,6 +832,60 @@ mod tests {
         assert!(output_size > input_size * 5);
     }
 
+    #[tokio::test]
+    async fn filtering_can_increase_logical_size_by_repeating_dictionaries() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::TaskContext;
+        use datafusion::physical_expr::expressions::lit;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let values = Arc::new(StringArray::from(vec!["x".repeat(10_000)]));
+        let batches = [3, 100]
+            .into_iter()
+            .map(|rows| {
+                let dictionary = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![0; rows]),
+                    values.clone(),
+                )
+                .unwrap();
+                RecordBatch::try_from_iter(vec![("value", Arc::new(dictionary) as ArrayRef)])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_size = batches
+            .iter()
+            .map(|batch| logical_batch_size(batch).unwrap())
+            .sum::<u64>();
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
+        )
+        .unwrap();
+        // The first small batch remains buffered. The next batch crosses several
+        // output boundaries, so every output batch carries dictionary values even
+        // though the filter preserves every input row and column.
+        let filter = Arc::new(
+            FilterExec::try_new(lit(true), source)
+                .unwrap()
+                .with_batch_size(10)
+                .unwrap(),
+        );
+        let output = datafusion::physical_plan::collect(filter, Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 103);
+        assert!(output.len() > batches.len());
+        let output_size = output
+            .iter()
+            .map(|batch| logical_batch_size(batch).unwrap())
+            .sum::<u64>();
+        assert!(
+            output_size > input_size * 3,
+            "filter output {output_size} bytes exceeds input {input_size} bytes"
+        );
+    }
+
     #[test]
     fn counts_round_trip_through_completion_batch() {
         for physical_bytes in [Some(vec![3, 0, 5]), None] {

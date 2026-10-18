@@ -18,6 +18,7 @@ use datafusion::physical_plan::joins::{
     SortMergeJoinExec, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
+use sail_physical_plan::remote_checkpoint::RemoteCheckpointWriteExec;
 
 use crate::driver::job_scheduler::adaptive::bounds::input_bound;
 use crate::plan::StageInputExec;
@@ -63,6 +64,13 @@ fn walk(
     aligned: bool,
     groups: &mut Vec<AlignmentGroup>,
 ) -> Result<(), String> {
+    if node.is::<RemoteCheckpointWriteExec>() {
+        // The separate checkpoint commit stage retains the planned partitioning
+        // and only reconciles its partition count at runtime. Coalescing and
+        // skew splitting can change key boundaries without changing that count,
+        // so the saved descriptor would advertise a false hash distribution.
+        return Err("the stage writes a checkpoint with planned partitioning metadata".to_string());
+    }
     if let Some(placeholder) = node.downcast_ref::<StageInputExec<usize>>() {
         if let Some(g) = group {
             groups[g].inputs.insert(*placeholder.input());

@@ -336,6 +336,10 @@ fn filter(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     Arc::new(FilterExec::try_new(predicate, input).unwrap())
 }
 
+fn drop_value_column(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    Arc::new(ProjectionExec::try_new(vec![(key(), "k".to_string())], input).unwrap())
+}
+
 /// A projection that computes a value, so its output may be wider than its input.
 fn computed_projection(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     let value = Arc::new(BinaryExpr::new(
@@ -396,7 +400,7 @@ fn build_side_without_a_bound_is_not_coalesced() {
 }
 
 #[test]
-fn bounded_build_side_through_a_filter_is_coalesced_within_the_cap() {
+fn filtered_build_side_is_not_coalesced_without_a_byte_bound() {
     let plan = hash_join(
         filter(placeholder(0, 4)),
         placeholder(1, 4),
@@ -412,11 +416,9 @@ fn bounded_build_side_through_a_filter_is_coalesced_within_the_cap() {
     );
     view.options.join_max_build_partition_size = 50 * MIB;
     view.options.join_enabled = false;
-    let rewrite = adapt(&view).unwrap().expect("a rewrite");
-    assert_eq!(
-        spec_ranges(rewrite.inputs[0].as_ref().unwrap()),
-        vec![0..2, 2..4]
-    );
+    // FilterExec can repeat dictionaries while rebatching, so its input does
+    // not bound the bytes of a coalesced build partition.
+    assert!(adapt(&view).unwrap().is_none());
 }
 
 #[test]
@@ -454,8 +456,7 @@ fn filtered_build_side_is_not_swapped() {
 }
 
 #[test]
-fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
-    // The probe side is at most its input, so the exact build side is larger.
+fn exact_build_side_is_not_swapped_over_an_unbounded_filtered_probe_side() {
     let plan = hash_join(
         placeholder(0, 4),
         filter(placeholder(1, 4)),
@@ -470,6 +471,29 @@ fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
         ],
     );
     view.options.coalesce_enabled = false;
+    // A filter can repeat dictionary bytes, so even this smaller probe input
+    // does not prove its filtered output is smaller than the build side.
+    assert!(adapt(&view).unwrap().is_none());
+}
+
+#[test]
+fn exact_build_side_is_swapped_over_an_upper_bounded_probe_side() {
+    let plan = hash_join(
+        placeholder(0, 4),
+        drop_value_column(placeholder(1, 4)),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let mut view = view(
+        plan,
+        vec![
+            shuffle_input(statistics(&[8 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    view.options.coalesce_enabled = false;
+    // Dropping a column preserves batch boundaries and gives a sound upper
+    // bound, so the exact build side can still be proved larger than the probe.
     let rewrite = adapt(&view).unwrap().expect("a rewrite");
     assert_eq!(rewrite.rules, vec![joins::RULE_SWAP_JOIN_INPUTS]);
     assert_eq!(build_input(&rewrite.plan), Some(1));
@@ -479,7 +503,7 @@ fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
 #[test]
 fn upper_bounded_build_side_keeps_its_hash_join() {
     let plan = hash_join(
-        filter(placeholder(0, 4)),
+        drop_value_column(placeholder(0, 4)),
         placeholder(1, 4),
         PartitionMode::Partitioned,
         JoinType::Left,
@@ -1448,4 +1472,184 @@ fn coalescing_partition_constants_cannot_satisfy_sort_merge_ordering() {
         reason.contains("input ordering is not satisfied"),
         "{reason}"
     );
+}
+
+#[test]
+fn checkpoint_writer_keeps_hash_buckets_when_skew_and_coalescing_keep_the_count() {
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use object_store::path::Path;
+    use sail_physical_plan::remote_checkpoint::{
+        RemoteCheckpointCommitExec, RemoteCheckpointWriteExec, checkpoint_storage_schema,
+    };
+
+    let side = || {
+        let input = MemorySourceConfig::try_new_exec(&vec![vec![]; 3], schema(), None).unwrap();
+        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![key()], 4)).unwrap())
+            as Arc<dyn ExecutionPlan>
+    };
+    let joined = hash_join(side(), side(), PartitionMode::Partitioned, JoinType::Inner);
+    let logical_schema = joined.schema();
+    let storage_schema = checkpoint_storage_schema(&logical_schema);
+    let object_store = ObjectStoreUrl::parse("memory://").unwrap();
+    let prefix = Path::from("checkpoint/adaptive-layout");
+    let writer: Arc<dyn ExecutionPlan> = Arc::new(
+        RemoteCheckpointWriteExec::try_new(
+            joined,
+            object_store.clone(),
+            prefix.clone(),
+            storage_schema.clone(),
+            None,
+        )
+        .unwrap(),
+    );
+    let plan = Arc::new(RemoteCheckpointCommitExec::new(
+        Arc::new(CoalescePartitionsExec::new(writer)),
+        "adaptive-layout".to_string(),
+        object_store,
+        prefix,
+        logical_schema,
+        storage_schema,
+        Partitioning::Hash(vec![Arc::new(Column::new("_c0", 0))], 4),
+        None,
+    ));
+    let graph = JobGraph::try_new(
+        plan,
+        JobGraphOptions {
+            shuffle_backend: remote_shuffle_service(),
+        },
+    )
+    .unwrap();
+    let writer_stage = graph
+        .stages()
+        .iter()
+        .position(|stage| stage.plan.is::<RemoteCheckpointWriteExec>())
+        .expect("checkpoint writer stage");
+    let commit_stage = graph
+        .stages()
+        .iter()
+        .position(|stage| stage.plan.is::<RemoteCheckpointCommitExec>())
+        .expect("checkpoint commit stage");
+    let mut job = job(graph);
+    // Three large mapper slices of bucket 0 and one coalesced range of buckets
+    // 1..4 still give four tasks. Count-only checkpoint metadata validation
+    // cannot distinguish that layout from the original four hash buckets.
+    succeed(&mut job, 0, |_| ChannelCounts {
+        rows: vec![100; 4],
+        physical_bytes: Some(vec![80 * MIB, MIB, MIB, MIB]),
+        logical_bytes: vec![160 * MIB, 2 * MIB, 2 * MIB, 2 * MIB],
+    });
+    succeed(&mut job, 1, |_| ChannelCounts {
+        rows: vec![100; 4],
+        physical_bytes: Some(vec![MIB; 4]),
+        logical_bytes: vec![2 * MIB; 4],
+    });
+    commit(&mut job, 0);
+    commit(&mut job, 1);
+    assert_eq!(count(&job.graph.stages()[writer_stage].plan), 4);
+    let before = job.graph.to_string();
+    let adapted = adapt_job(&mut job, &skew_options());
+    assert_eq!(count(&job.graph.stages()[writer_stage].plan), 4);
+    let checkpoint = job.graph.stages()[commit_stage]
+        .plan
+        .downcast_ref::<RemoteCheckpointCommitExec>()
+        .unwrap();
+    assert!(matches!(
+        checkpoint.checkpoint_partitioning(),
+        Partitioning::Hash(_, 4)
+    ));
+    if adapted {
+        let spec = job.graph.stages()[writer_stage].inputs[0]
+            .adaptive
+            .as_ref()
+            .unwrap();
+        assert_eq!(spec.partitions(), 4);
+        // The same key in bucket 0 can now appear in three saved partitions,
+        // contradicting the static Hash(..., 4) checkpoint descriptor.
+        assert_eq!(
+            spec.spec
+                .iter()
+                .filter(|slices| slices[0].buckets == (0..1))
+                .count(),
+            3
+        );
+        assert_eq!(spec.spec[3][0].buckets, 1..4);
+        assert_eq!(spec.property, AdaptiveProperty::Unknown);
+    }
+    assert!(
+        !adapted,
+        "checkpoint writer changed hash bucket boundaries while the commit retained Hash(..., 4)"
+    );
+    assert_eq!(job.graph.to_string(), before);
+    assert_eq!(job.stages[writer_stage].adaptive, AdaptiveDecision::Static);
+}
+
+#[tokio::test]
+async fn checkpoint_hash_metadata_cannot_describe_skew_slices_with_the_same_count() {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use sail_physical_plan::remote_checkpoint::CheckpointDataSource;
+
+    let row = |value| {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    };
+    let saved = MemorySourceConfig::try_new(
+        &[vec![row(10)], vec![row(20)], vec![row(30)], vec![]],
+        schema(),
+        None,
+    )
+    .unwrap();
+    // The real checkpoint scan trusts this saved descriptor instead of the
+    // underlying file layout. The three slices of one key violate that claim.
+    let checkpointed: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+        CheckpointDataSource::new(Arc::new(saved), Partitioning::Hash(vec![key()], 4)),
+    )));
+    let probe = || {
+        let source = MemorySourceConfig::try_new_exec(&[vec![row(99)]], schema(), None).unwrap();
+        Arc::new(RepartitionExec::try_new(source, Partitioning::Hash(vec![key()], 4)).unwrap())
+            as Arc<dyn ExecutionPlan>
+    };
+    let joined = hash_join(
+        checkpointed.clone(),
+        probe(),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let rows = datafusion::physical_plan::collect(joined, Arc::new(TaskContext::default()))
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert!(
+        rows <= 1,
+        "one hash bucket cannot see the other saved slices"
+    );
+
+    // Shuffling the saved rows restores key co-location and all three matches.
+    let restored: Arc<dyn ExecutionPlan> = Arc::new(
+        RepartitionExec::try_new(checkpointed, Partitioning::Hash(vec![key()], 4)).unwrap(),
+    );
+    let joined = hash_join(
+        restored,
+        probe(),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let rows = datafusion::physical_plan::collect(joined, Arc::new(TaskContext::default()))
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(rows, 3);
 }
