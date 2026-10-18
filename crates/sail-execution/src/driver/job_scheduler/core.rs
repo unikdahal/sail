@@ -1191,7 +1191,6 @@ impl<'a> TaskInputBuilder<'a> {
 
     fn build_shuffle_service_locator(&self) -> ExecutionResult<TaskInputLocator> {
         let input_channels = self.producer.distribution.channels();
-        let output_partitions = self.consumer.plan.output_partitioning().partition_count();
         let map_attempts = self.committed_map_attempts()?;
         let reads = if let Some(adaptive) = &self.input.adaptive {
             // Partition `i` of this input's own domain reads the bucket slices of its
@@ -1237,7 +1236,9 @@ impl<'a> TaskInputBuilder<'a> {
                     .collect(),
                 InputMode::Broadcast => {
                     let channels = (0..input_channels).collect::<Vec<_>>();
-                    vec![ShuffleServiceRead::channels(channels); output_partitions]
+                    // Every consumer reads partition zero of the shared input.
+                    // Its domain has one partition regardless of the consumer count.
+                    vec![ShuffleServiceRead::channels(channels)]
                 }
                 mode => {
                     return Err(ExecutionError::InvalidArgument(format!(
@@ -1670,19 +1671,140 @@ mod terminal_statistics_regression_tests {
 mod shuffle_domain_regression_tests {
     use std::sync::Arc;
 
+    use datafusion::common::{JoinType, NullEquality};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_expr::Partitioning;
-    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion::physical_plan::joins::{CrossJoinExec, HashJoinExec, PartitionMode};
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+    use prost::Message;
 
     use super::tests_support::build_input_locator;
     use crate::driver::job_scheduler::test_utils::{
-        NoAssignments, commit, job, remote_shuffle_service, schema,
+        NoAssignments, commit, job, key, remote_shuffle_service, schema,
     };
     use crate::id::{JobId, TaskKey};
     use crate::job_graph::{InputMode, JobGraph, JobGraphOptions};
+    use crate::plan::StageInputExec;
     use crate::task::definition::{ShuffleServiceRead, TaskInputLocator};
+    use crate::task::r#gen;
+
+    #[test]
+    fn broadcast_locator_size_uses_the_input_partition_domain() -> crate::error::ExecutionResult<()>
+    {
+        for cross_join in [false, true] {
+            let mut sizes = vec![];
+            for probe_partitions in [1, 64, 256] {
+                let build = Arc::new(CoalescePartitionsExec::new(
+                    MemorySourceConfig::try_new_exec(&vec![vec![]; 4], schema(), None).unwrap(),
+                ));
+                let probe = MemorySourceConfig::try_new_exec(
+                    &vec![vec![]; probe_partitions],
+                    schema(),
+                    None,
+                )
+                .unwrap();
+                let join: Arc<dyn ExecutionPlan> = if cross_join {
+                    Arc::new(CrossJoinExec::new(build, probe))
+                } else {
+                    Arc::new(
+                        HashJoinExec::try_new(
+                            build,
+                            probe,
+                            vec![(key(), key())],
+                            None,
+                            &JoinType::Inner,
+                            None,
+                            PartitionMode::CollectLeft,
+                            NullEquality::NullEqualsNothing,
+                            false,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let graph = JobGraph::try_new(
+                    join,
+                    JobGraphOptions {
+                        shuffle_backend: remote_shuffle_service(),
+                    },
+                )
+                .unwrap();
+                let mut job = job(graph);
+                let consumer = job.graph.stages().len() - 1;
+                let stage = &job.graph.stages()[consumer];
+                assert_eq!(
+                    stage.plan.output_partitioning().partition_count(),
+                    probe_partitions
+                );
+                let placeholder = stage.plan.children()[0]
+                    .downcast_ref::<StageInputExec<usize>>()
+                    .unwrap();
+                assert_eq!(
+                    placeholder
+                        .properties()
+                        .output_partitioning()
+                        .partition_count(),
+                    1
+                );
+                let input = stage.inputs[*placeholder.input()].clone();
+                assert!(matches!(input.mode, InputMode::Broadcast));
+                let channels = job.graph.stages()[input.stage].distribution.channels();
+                assert_eq!(channels, 1);
+                commit(&mut job, input.stage);
+                let attempts = [0_i32, 1, 0, 2];
+                job.stages[input.stage].commit.as_mut().unwrap().attempts = vec![0, 1, 0, 2];
+
+                // Every probe task receives a separately built and serialized locator,
+                // but its shared build input executes only placeholder partition zero.
+                for partition in [0, probe_partitions - 1] {
+                    let locator = build_input_locator(
+                        &job,
+                        &TaskKey {
+                            job_id: JobId::from(1),
+                            stage: consumer,
+                            partition,
+                            attempt: 0,
+                        },
+                        &input,
+                        &NoAssignments,
+                    );
+                    let TaskInputLocator::ShuffleService {
+                        reads,
+                        map_attempts,
+                    } = locator.as_ref()
+                    else {
+                        return Err(crate::error::ExecutionError::InternalError(
+                            "expected a shuffle service locator".into(),
+                        ));
+                    };
+                    assert_eq!(reads[0], ShuffleServiceRead::channels(vec![0]));
+                    assert_eq!(map_attempts.as_deref(), Some(attempts.as_slice()));
+                    let encoded: r#gen::TaskInputLocator = locator.as_ref().clone().into();
+                    sizes.push((reads.len(), encoded.encoded_len()));
+                    let decoded = TaskInputLocator::try_from(encoded)?;
+                    let TaskInputLocator::ShuffleService {
+                        reads: decoded_reads,
+                        map_attempts: decoded_attempts,
+                    } = decoded
+                    else {
+                        return Err(crate::error::ExecutionError::InternalError(
+                            "expected a shuffle service locator after decoding".into(),
+                        ));
+                    };
+                    assert_eq!(decoded_reads, *reads);
+                    assert_eq!(decoded_attempts.as_deref(), Some(attempts.as_slice()));
+                }
+            }
+            assert_eq!(sizes[0].0, 1);
+            assert!(
+                sizes.iter().all(|size| *size == sizes[0]),
+                "broadcast locator size should not grow with probe partitions: cross_join={cross_join}, (read count, protobuf bytes)={sizes:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn union_shuffle_inputs_use_their_own_partition_domains() -> crate::error::ExecutionResult<()> {
