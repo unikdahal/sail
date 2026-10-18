@@ -101,15 +101,17 @@ and the Rust tests of the changed crates on its own.
   the build side of every partitioned hash join in the group.
 - Join decisions: empty-input pruning, build/probe swap and hash join to sort-merge join.
 - Sizes of operator outputs come from bounds of the committed input sizes: exact
-  through reordering projections, an upper bound through filters, limits and
+  through reordering projections, an upper bound through limits and
   column-dropping projections, and no bound otherwise. A swap needs an exact build size
   larger than the probe's upper bound. A sort-merge conversion needs an exact build size
   above the cap. A group whose hash-join build side has no bound is not coalesced.
-  Sorts do not preserve these sizes because rebatching can repeat dictionary values.
+  Filters and sorts do not preserve these sizes because rebatching can repeat dictionary values.
   Caps bound recorded logical shuffle bytes; rebatching and operator allocations
   can change execution memory. DataFusion receives exact row counts and inexact
   byte totals, and skew-replicated inputs receive no original exact totals.
 - User-chosen partition counts (`repartition(n, ...)`) are kept.
+- Checkpoint writer stages retain their planned partition boundaries because the
+  saved checkpoint descriptor cannot yet represent an adaptive runtime layout.
 - `EXPLAIN` notes that adaptive execution may re-plan the initial job graph, and
   `system.execution.stages` shows which stages were re-planned, by which rules, and their
   initial partition counts.
@@ -415,6 +417,75 @@ results; they were not rerun in this pass. The Docker suite retains its existing
 pytest configuration deprecation warning. GitHub Build remains `disabled_fork`;
 these checks are local. No new performance or peak-memory benchmark was run; the
 broadcast regression measures locator count and encoded size.
+
+### Cleanup draining, checkpoint layouts and validation bounds (2026-10-18)
+
+Fetched PR #10 and the open AQE stack again. PR #10 was still open at
+`21fd2903`, and `aqe/5-ci-and-benchmark` remained `0b236c9f`.
+This pass reproduced and fixed four further defects:
+
+- Unregister could finish while registration, revival or commit callbacks were
+  still in flight. A delayed callback could restore cleared reservations or
+  locations, or recreate resources after master cleanup. Both lifecycle and
+  shuffle-client actors now close the ID to new work, drain tracked callbacks,
+  coalesce duplicate cleanup requests, and then finish cleanup. Lifecycle callers
+  waiting on cancelled work fail promptly. All workers' commits are awaited even
+  if one fails; a failed unregister keeps the ID closed until an explicit retry
+  succeeds. Local-only cleanup remains local, and successful cleanup allows ID
+  reuse. A bounded lookup revision prevents delayed ID lookups from restoring
+  local caches without retaining per-ID tombstones or discarding unrelated
+  lookup results.
+- AQE could split a hot hash bucket into three mapper slices and coalesce the
+  other buckets, retaining four tasks while changing key boundaries. The
+  checkpoint commit stage only reconciles the partition count, so it saved a
+  false `Hash(..., 4)` descriptor. A real JobGraph regression reproduced this
+  count-preserving rewrite; a DataFusion checkpoint readback join produced at
+  most one of three matches when trusting that descriptor. Checkpoint writer
+  stages now retain their planned layout until checkpoint metadata can carry the
+  actual runtime distribution.
+- An unlimited, all-pass FilterExec can rebatch dictionary arrays and repeat
+  dictionary values. The real operator regression preserves all 103 rows while
+  increasing recorded logical bytes by more than three times, invalidating its
+  assumed upper byte bound. Filters now have no such bound, so size-dependent
+  coalescing and join decisions fall back conservatively. Column-dropping
+  projections remain covered by positive upper-bound controls.
+- The benchmark compared only warmup results and discarded the timed results,
+  allowing incorrect measured runs to report parity and exit successfully.
+  Every timed result is now compared to its mode's warmup after stopping the
+  timer. A mismatch persists even if a later repetition is correct. Regressions
+  reproduce false success in either mode and retain an order-insensitive passing
+  control.
+
+The lifecycle registration regression and both original client drain regressions
+failed before the cleanup changes. Eleven new controlled race tests cover
+registration, revival, commits, the observer boundary, read refresh, push revival,
+lookup caching, duplicate cleanup, failure/retry and ID reuse. The corrected
+filter-bound regression failed against the old Upper classification, and the
+checkpoint regression failed against the old accepted rewrite. The benchmark
+regressions failed with false parity before the fix. The changes received
+independent review; a detached read-reply boundary race and failed-cleanup
+reopening were corrected during that review.
+
+Fresh local validation:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 36 + 256 passed; doc tests passed |
+| Eleven new cleanup regressions, 20 consecutive rounds | 220 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 5 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+The earlier 60 and 180 repeated concurrency/lifecycle results remain historical;
+the 220 checks above exercise this pass's new cleanup regressions. GitHub Build
+was freshly checked and remains `disabled_fork`; these results are local.
+Performance and peak-memory benchmarks have not been rerun. The cleanup drain
+covers tracked operations before acknowledgement; actor shutdown and revocation
+of already-delivered lazy read streams are outside this change. Cleanup progress
+still depends on in-flight operations completing, including the documented
+nonblocking commit-observer contract.
 
 ## Remaining work
 
