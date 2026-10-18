@@ -59,7 +59,6 @@ pub enum LifecycleManagerMessage {
     UnregisterShuffleComplete {
         shuffle_id: i32,
         result: CelebornResult<()>,
-        reply: oneshot::Sender<CelebornResult<()>>,
     },
     ReportMetrics {
         metrics: ApplicationMetrics,

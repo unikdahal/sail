@@ -15,6 +15,7 @@ pub enum ShuffleClientMessage {
         result: oneshot::Sender<CelebornResult<i32>>,
     },
     GetShuffleIdComplete {
+        revision: u64,
         job_id: u64,
         stage: u64,
         result: CelebornResult<i32>,
@@ -25,6 +26,7 @@ pub enum ShuffleClientMessage {
         result: oneshot::Sender<CelebornResult<Vec<(u64, i32)>>>,
     },
     GetJobShuffleIdsComplete {
+        revision: u64,
         job_id: u64,
         result: CelebornResult<Vec<(u64, i32)>>,
         reply: oneshot::Sender<CelebornResult<Vec<(u64, i32)>>>,
@@ -63,6 +65,11 @@ pub enum ShuffleClientMessage {
         num_mappers: i32,
         result: oneshot::Sender<CelebornResult<()>>,
     },
+    MapperEndComplete {
+        shuffle_id: i32,
+        result: CelebornResult<()>,
+        reply: oneshot::Sender<CelebornResult<()>>,
+    },
     UnregisterShuffle {
         shuffle_id: i32,
         result: oneshot::Sender<CelebornResult<()>>,
@@ -70,7 +77,6 @@ pub enum ShuffleClientMessage {
     UnregisterShuffleComplete {
         shuffle_id: i32,
         result: CelebornResult<()>,
-        reply: oneshot::Sender<CelebornResult<()>>,
     },
     /// Remove local client state for a shuffle without unregistering it.
     CleanUpShuffle {
@@ -107,6 +113,7 @@ impl SpanAssociation for ShuffleClientMessage {
             Self::PushData { .. } => "PushData",
             Self::PushDataComplete { .. } => "PushDataComplete",
             Self::MapperEnd { .. } => "MapperEnd",
+            Self::MapperEndComplete { .. } => "MapperEndComplete",
             Self::UnregisterShuffle { .. } => "UnregisterShuffle",
             Self::UnregisterShuffleComplete { .. } => "UnregisterShuffleComplete",
             Self::CleanUpShuffle { .. } => "CleanUpShuffle",

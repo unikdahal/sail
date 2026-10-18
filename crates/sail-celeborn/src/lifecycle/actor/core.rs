@@ -25,6 +25,7 @@ impl Actor for LifecycleManagerActor {
             pending_slot_requests: Default::default(),
             pending_revives: Default::default(),
             shuffle_commits: Default::default(),
+            pending_unregisters: Default::default(),
             shuffle_ids: Default::default(),
             shuffle_keys: Default::default(),
             next_shuffle_id: 0,
@@ -85,7 +86,7 @@ impl Actor for LifecycleManagerActor {
                 result,
             ),
             LifecycleManagerMessage::RegisterShuffleComplete { shuffle_id, result } => {
-                self.handle_register_shuffle_complete(shuffle_id, result)
+                self.handle_register_shuffle_complete(ctx, shuffle_id, result)
             }
             LifecycleManagerMessage::Revive { request, result } => {
                 self.handle_revive(ctx, request, result)
@@ -106,16 +107,14 @@ impl Actor for LifecycleManagerActor {
                 self.handle_commit_complete(ctx, shuffle_id, result)
             }
             LifecycleManagerMessage::CommitReported { shuffle_id, result } => {
-                self.handle_commit_reported(shuffle_id, result)
+                self.handle_commit_reported(ctx, shuffle_id, result)
             }
             LifecycleManagerMessage::UnregisterShuffle { shuffle_id, result } => {
                 self.handle_unregister_shuffle(ctx, shuffle_id, result)
             }
-            LifecycleManagerMessage::UnregisterShuffleComplete {
-                shuffle_id,
-                result,
-                reply,
-            } => self.handle_unregister_shuffle_complete(shuffle_id, result, reply),
+            LifecycleManagerMessage::UnregisterShuffleComplete { shuffle_id, result } => {
+                self.handle_unregister_shuffle_complete(shuffle_id, result)
+            }
             LifecycleManagerMessage::ReportMetrics { metrics, result } => {
                 self.handle_report_metrics(metrics, result)
             }

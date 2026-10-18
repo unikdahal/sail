@@ -1,4 +1,4 @@
-use futures::future::try_join_all;
+use futures::future::join_all;
 use log::warn;
 use sail_common::actor::{ActorAction, ActorContext};
 use tokio::sync::oneshot;
@@ -7,7 +7,9 @@ use crate::common::{
     ApplicationMetrics, PartitionLocation, SlotReservation, UserIdentifier, WorkerSlotLocations,
 };
 use crate::error::{CelebornError, CelebornResult};
-use crate::lifecycle::actor::{LifecycleManagerActor, ShuffleCommitState, ShuffleKey};
+use crate::lifecycle::actor::{
+    LifecycleManagerActor, PendingUnregister, ShuffleCommitState, ShuffleKey,
+};
 use crate::lifecycle::{LifecycleManagerMessage, ReviveRequest, ShuffleCommitReport};
 use crate::protocol::StatusCode;
 use crate::worker::WorkerClientOptions;
@@ -107,6 +109,10 @@ impl LifecycleManagerActor {
         max_workers: i32,
         reply: oneshot::Sender<CelebornResult<SlotReservation>>,
     ) -> ActorAction {
+        if self.pending_unregisters.contains_key(&shuffle_id) {
+            let _ = reply.send(Err(unregistering(shuffle_id)));
+            return ActorAction::Continue;
+        }
         // Readers refresh locations through registration, so an old reservation
         // must not let them read files after the global commit has failed.
         if let Some(ShuffleCommitState::Lost { reason }) = self.shuffle_commits.get(&shuffle_id) {
@@ -190,6 +196,7 @@ impl LifecycleManagerActor {
 
     pub(super) fn handle_register_shuffle_complete(
         &mut self,
+        ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
         result: CelebornResult<SlotReservation>,
     ) -> ActorAction {
@@ -197,6 +204,10 @@ impl LifecycleManagerActor {
             .pending_slot_requests
             .remove(&shuffle_id)
             .unwrap_or_default();
+        if self.pending_unregisters.contains_key(&shuffle_id) {
+            self.advance_unregister(ctx, shuffle_id);
+            return ActorAction::Continue;
+        }
         if let Ok(reservation) = &result {
             self.registered_shuffles
                 .insert(shuffle_id, reservation.worker_locations.clone());
@@ -220,6 +231,10 @@ impl LifecycleManagerActor {
         request: ReviveRequest,
         reply: oneshot::Sender<CelebornResult<PartitionLocation>>,
     ) -> ActorAction {
+        if self.pending_unregisters.contains_key(&request.shuffle_id) {
+            let _ = reply.send(Err(unregistering(request.shuffle_id)));
+            return ActorAction::Continue;
+        }
         if let Some(error) = self.application_registration.error() {
             let _ = reply.send(Err(error));
             return ActorAction::Continue;
@@ -344,6 +359,10 @@ impl LifecycleManagerActor {
             .pending_revives
             .remove(&(shuffle_id, partition_id))
             .unwrap_or_default();
+        if self.pending_unregisters.contains_key(&shuffle_id) {
+            self.advance_unregister(ctx, shuffle_id);
+            return ActorAction::Continue;
+        }
         match result {
             Ok(replacement) => {
                 let Some(location) = replacement.primary_locations.get(&partition_id).cloned()
@@ -409,6 +428,10 @@ impl LifecycleManagerActor {
         num_mappers: i32,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        if self.pending_unregisters.contains_key(&shuffle_id) {
+            let _ = reply.send(Err(unregistering(shuffle_id)));
+            return ActorAction::Continue;
+        }
         let num_mappers = match usize::try_from(num_mappers) {
             Ok(num_mappers) if num_mappers > 0 => num_mappers,
             _ => {
@@ -527,26 +550,33 @@ impl LifecycleManagerActor {
                     }
                 })
             });
-            let result = try_join_all(commits).await.and_then(|commits| {
-                let mut metrics = ApplicationMetrics::default();
-                let mut unreadable = vec![];
-                for commit in commits {
-                    metrics.total_written =
-                        metrics.total_written.saturating_add(commit.total_written);
-                    metrics.file_count = metrics.file_count.saturating_add(commit.file_count);
-                    unreadable.extend(commit.unreadable_files);
-                }
-                // A commit is final, so a shuffle with files that cannot be read is lost.
-                // Reading them would return no data instead of failing.
-                match unreadable.first() {
-                    None => Ok(metrics),
-                    Some((id, storage)) => Err(CelebornError::Application(format!(
-                        "{} committed partition files are on distributed storage, which is \
+            // Keep every worker transaction alive until it finishes, including
+            // after another worker fails. Unregister waits for this completion
+            // before asking the master to remove worker resources.
+            let result = join_all(commits)
+                .await
+                .into_iter()
+                .collect::<CelebornResult<Vec<_>>>()
+                .and_then(|commits| {
+                    let mut metrics = ApplicationMetrics::default();
+                    let mut unreadable = vec![];
+                    for commit in commits {
+                        metrics.total_written =
+                            metrics.total_written.saturating_add(commit.total_written);
+                        metrics.file_count = metrics.file_count.saturating_add(commit.file_count);
+                        unreadable.extend(commit.unreadable_files);
+                    }
+                    // A commit is final, so a shuffle with files that cannot be read is lost.
+                    // Reading them would return no data instead of failing.
+                    match unreadable.first() {
+                        None => Ok(metrics),
+                        Some((id, storage)) => Err(CelebornError::Application(format!(
+                            "{} committed partition files are on distributed storage, which is \
                          not supported (for example, location {id} on {storage})",
-                        unreadable.len()
-                    ))),
-                }
-            });
+                            unreadable.len()
+                        ))),
+                    }
+                });
             let _ = handle
                 .send(LifecycleManagerMessage::CommitComplete { shuffle_id, result })
                 .await;
@@ -560,6 +590,11 @@ impl LifecycleManagerActor {
         shuffle_id: i32,
         result: CelebornResult<ApplicationMetrics>,
     ) -> ActorAction {
+        if self.pending_unregisters.contains_key(&shuffle_id) {
+            self.shuffle_commits.remove(&shuffle_id);
+            self.advance_unregister(ctx, shuffle_id);
+            return ActorAction::Continue;
+        }
         // The shuffle may have been unregistered during the commit.
         let Some(state) = self.shuffle_commits.get_mut(&shuffle_id) else {
             return ActorAction::Continue;
@@ -618,9 +653,15 @@ impl LifecycleManagerActor {
 
     pub(super) fn handle_commit_reported(
         &mut self,
+        ctx: &mut ActorContext<Self>,
         shuffle_id: i32,
         result: Result<(), String>,
     ) -> ActorAction {
+        if self.pending_unregisters.contains_key(&shuffle_id) {
+            self.shuffle_commits.remove(&shuffle_id);
+            self.advance_unregister(ctx, shuffle_id);
+            return ActorAction::Continue;
+        }
         let Some(state) = self.shuffle_commits.get_mut(&shuffle_id) else {
             return ActorAction::Continue;
         };
@@ -652,33 +693,93 @@ impl LifecycleManagerActor {
         shuffle_id: i32,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        if let Some(pending) = self.pending_unregisters.get_mut(&shuffle_id) {
+            pending.waiters.push(reply);
+            self.advance_unregister(ctx, shuffle_id);
+            return ActorAction::Continue;
+        }
         if let Some(error) = self.application_registration.error() {
             let _ = reply.send(Err(error));
             return ActorAction::Continue;
         }
+        self.pending_unregisters.insert(
+            shuffle_id,
+            PendingUnregister {
+                waiters: vec![reply],
+                request_sent: false,
+            },
+        );
+        // Close the shuffle immediately, but retain the empty pending entries
+        // until their network operations finish. Final master cleanup must run
+        // after every ReserveSlots/CommitFiles transaction, or a delayed request
+        // could recreate worker resources after cleanup was acknowledged.
+        if let Some(waiters) = self.pending_slot_requests.get_mut(&shuffle_id) {
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(Err(unregistering(shuffle_id)));
+            }
+        }
+        for ((id, _), waiters) in &mut self.pending_revives {
+            if *id == shuffle_id {
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(Err(unregistering(shuffle_id)));
+                }
+            }
+        }
+        if let Some(
+            ShuffleCommitState::Committing { waiters, .. }
+            | ShuffleCommitState::Reporting { waiters },
+        ) = self.shuffle_commits.get_mut(&shuffle_id)
+        {
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(Err(unregistering(shuffle_id)));
+            }
+        }
+        self.advance_unregister(ctx, shuffle_id);
+        ActorAction::Continue
+    }
+
+    fn advance_unregister(&mut self, ctx: &mut ActorContext<Self>, shuffle_id: i32) {
+        if self.pending_slot_requests.contains_key(&shuffle_id)
+            || self.pending_revives.keys().any(|(id, _)| *id == shuffle_id)
+            || matches!(
+                self.shuffle_commits.get(&shuffle_id),
+                Some(ShuffleCommitState::Committing { .. } | ShuffleCommitState::Reporting { .. })
+            )
+        {
+            return;
+        }
+        let Some(pending) = self.pending_unregisters.get_mut(&shuffle_id) else {
+            return;
+        };
+        if pending.request_sent {
+            return;
+        }
+        pending.request_sent = true;
         let client = self.client.clone();
         let application_id = self.options.application_id.clone();
         let handle = ctx.handle().clone();
         ctx.spawn(async move {
             let result = client.unregister_shuffle(application_id, shuffle_id).await;
             let _ = handle
-                .send(LifecycleManagerMessage::UnregisterShuffleComplete {
-                    shuffle_id,
-                    result,
-                    reply,
-                })
+                .send(LifecycleManagerMessage::UnregisterShuffleComplete { shuffle_id, result })
                 .await;
         });
-        ActorAction::Continue
     }
 
     pub(super) fn handle_unregister_shuffle_complete(
         &mut self,
         shuffle_id: i32,
         result: CelebornResult<()>,
-        reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        let Some(pending) = self.pending_unregisters.get_mut(&shuffle_id) else {
+            return ActorAction::Continue;
+        };
+        let waiters = std::mem::take(&mut pending.waiters);
+        // A failed response cannot prove that cleanup did not happen. Keep the
+        // shuffle closed, but permit another explicit unregister to retry it.
+        pending.request_sent = false;
         if result.is_ok() {
+            self.pending_unregisters.remove(&shuffle_id);
             if let Some(key) = self.shuffle_keys.remove(&shuffle_id) {
                 self.shuffle_ids.remove(&key);
             }
@@ -686,7 +787,13 @@ impl LifecycleManagerActor {
             self.reservations.remove(&shuffle_id);
             self.shuffle_commits.remove(&shuffle_id);
         }
-        let _ = reply.send(result);
+        let error = result.err().map(|error| error.to_string());
+        for waiter in waiters {
+            let _ = waiter.send(match &error {
+                None => Ok(()),
+                Some(error) => Err(CelebornError::Application(error.clone())),
+            });
+        }
         ActorAction::Continue
     }
 
@@ -810,6 +917,10 @@ fn append_locations(target: &mut Vec<PartitionLocation>, source: Vec<PartitionLo
     }
 }
 
+fn unregistering(shuffle_id: i32) -> CelebornError {
+    CelebornError::Application(format!("shuffle {shuffle_id} is being unregistered"))
+}
+
 fn shuffle_lost(shuffle_id: i32, reason: &str) -> CelebornError {
     CelebornError::Application(format!(
         "shuffle {shuffle_id} is lost: commit failed: {reason}"
@@ -820,10 +931,13 @@ fn shuffle_lost(shuffle_id: i32, reason: &str) -> CelebornError {
 #[expect(clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use prost::Message;
     use sail_common::actor::ActorSystem;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{Notify, oneshot};
 
     use crate::common::{PartitionLocation, SlotReservation, WorkerSlotLocations};
@@ -832,6 +946,507 @@ mod tests {
         ShuffleCommitObserver, ShuffleCommitReport,
     };
     use crate::master::MasterClientOptions;
+    use crate::protocol::proto::{
+        MessageType, PbCommitFilesResponse, PbHeartbeatFromApplicationResponse,
+        PbRequestSlotsResponse, PbReserveSlotsResponse, PbUnregisterShuffleResponse,
+        PbWorkerResource,
+    };
+    use crate::protocol::transport::TransportMessage;
+
+    async fn read_control_request(socket: &mut TcpStream) -> (i64, TransportMessage) {
+        let header_length = socket.read_i32().await.unwrap() as usize;
+        assert_eq!(socket.read_u8().await.unwrap(), 3); // RpcRequest
+        let body_length = socket.read_i32().await.unwrap() as usize;
+        let mut header = vec![0; header_length];
+        let mut body = vec![0; body_length];
+        socket.read_exact(&mut header).await.unwrap();
+        socket.read_exact(&mut body).await.unwrap();
+        let request_id = i64::from_be_bytes(header[..8].try_into().unwrap());
+        // The control message follows the two addresses and endpoint name.
+        let mut offset = 1;
+        for address in 0..2 {
+            let length = u16::from_be_bytes(body[offset..offset + 2].try_into().unwrap());
+            offset += 2 + usize::from(length) + 4;
+            if address == 0 {
+                assert_eq!(body[offset], 1);
+                offset += 1; // receiver address protocol version
+            }
+        }
+        let length = u16::from_be_bytes(body[offset..offset + 2].try_into().unwrap());
+        offset += 2 + usize::from(length);
+        assert_eq!(body[offset], 0xff);
+        (
+            request_id,
+            TransportMessage::decode(&body[offset + 1..]).unwrap(),
+        )
+    }
+
+    async fn reply_control(
+        socket: &mut TcpStream,
+        request_id: i64,
+        kind: MessageType,
+        payload: Vec<u8>,
+    ) {
+        // Java serialization's stable TransportMessage layout, as used by the
+        // real master and worker control endpoints.
+        fn utf(output: &mut Vec<u8>, value: &[u8]) {
+            output.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            output.extend_from_slice(value);
+        }
+        let mut body = vec![0xac, 0xed, 0, 5, 0x73, 0x72];
+        utf(
+            &mut body,
+            b"org.apache.celeborn.common.network.protocol.TransportMessage",
+        );
+        body.extend_from_slice(&0_i64.to_be_bytes());
+        body.extend_from_slice(&[2, 0, 2, b'I']);
+        utf(&mut body, b"messageTypeValue");
+        body.push(b'[');
+        utf(&mut body, b"payload");
+        body.push(0x74);
+        utf(&mut body, b"[B");
+        body.extend_from_slice(&[0x78, 0x70]);
+        body.extend_from_slice(&(kind as i32).to_be_bytes());
+        body.extend_from_slice(&[0x75, 0x72]);
+        utf(&mut body, b"[B");
+        body.extend_from_slice(&0_i64.to_be_bytes());
+        body.extend_from_slice(&[2, 0, 0, 0x78, 0x70]);
+        body.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        body.extend_from_slice(&payload);
+        socket.write_i32(12).await.unwrap();
+        socket.write_u8(4).await.unwrap(); // RpcResponse
+        socket.write_i32(body.len() as i32).await.unwrap();
+        socket.write_i64(request_id).await.unwrap();
+        socket.write_i32(body.len() as i32).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unregister_cancels_pending_registration_without_resurrecting_reservation() {
+        check_unregister_drains_reservation(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn unregister_drains_pending_revive_before_cleanup_and_id_reuse() {
+        check_unregister_drains_reservation(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_unregister_keeps_shuffle_closed_until_cleanup_is_retried() {
+        check_unregister_drains_reservation(true, true).await;
+    }
+
+    #[expect(clippy::panic)]
+    async fn check_unregister_drains_reservation(reviving: bool, fail_cleanup: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let master_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let worker_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let master_port = master_listener.local_addr().unwrap().port();
+            let worker_port = worker_listener.local_addr().unwrap().port();
+            let location = PartitionLocation {
+                mode: 0,
+                id: 0,
+                epoch: 0,
+                host: "127.0.0.1".into(),
+                rpc_port: worker_port,
+                push_port: worker_port,
+                fetch_port: worker_port,
+                replicate_port: worker_port,
+                peer: None,
+            };
+            let slot_requests = Arc::new(AtomicUsize::new(0));
+            let old_location = location.clone();
+            let master_requests = slot_requests.clone();
+            let unregisters = Arc::new(AtomicUsize::new(0));
+            let master_unregisters = unregisters.clone();
+            let master = tokio::spawn(async move {
+                let (mut socket, _) = master_listener.accept().await.unwrap();
+                loop {
+                    let (request_id, message) = read_control_request(&mut socket).await;
+                    let (kind, payload) = match message.message_type {
+                        MessageType::RegisterApplicationInfo => {
+                            (MessageType::OneWayMessageResponse, vec![])
+                        }
+                        MessageType::HeartbeatFromApplication => (
+                            MessageType::HeartbeatFromApplicationResponse,
+                            PbHeartbeatFromApplicationResponse::default().encode_to_vec(),
+                        ),
+                        MessageType::RequestSlots => {
+                            master_requests.fetch_add(1, Ordering::SeqCst);
+                            (
+                                MessageType::RequestSlotsResponse,
+                                PbRequestSlotsResponse {
+                                    worker_resource: [(
+                                        format!("127.0.0.1:{worker_port}:{worker_port}:{worker_port}:{worker_port}"),
+                                        PbWorkerResource {
+                                            primary_partitions: vec![location.clone().into()],
+                                            ..Default::default()
+                                        },
+                                    )].into(),
+                                    ..Default::default()
+                                }.encode_to_vec(),
+                            )
+                        }
+                        MessageType::UnregisterShuffle => {
+                            let attempt = master_unregisters.fetch_add(1, Ordering::SeqCst);
+                            (MessageType::UnregisterShuffleResponse,
+                                PbUnregisterShuffleResponse {
+                                    status: if fail_cleanup && attempt == 0 {
+                                        crate::protocol::StatusCode::RequestFailed as i32
+                                    } else {
+                                        0
+                                    },
+                                }.encode_to_vec())
+                        },
+                        kind => panic!("unexpected master request: {kind:?}"),
+                    };
+                    reply_control(&mut socket, request_id, kind, payload).await;
+                }
+            });
+            let (reserve_started, started) = oneshot::channel();
+            let (release_reserve, resume) = oneshot::channel();
+            let worker = tokio::spawn(async move {
+                let (mut socket, _) = worker_listener.accept().await.unwrap();
+                if reviving {
+                    let (request_id, request) = read_control_request(&mut socket).await;
+                    assert_eq!(request.message_type, MessageType::ReserveSlots);
+                    reply_control(&mut socket, request_id, MessageType::ReserveSlotsResponse,
+                        PbReserveSlotsResponse::default().encode_to_vec()).await;
+                }
+                let (request_id, request) = read_control_request(&mut socket).await;
+                assert_eq!(request.message_type, MessageType::ReserveSlots);
+                reserve_started.send(()).unwrap();
+                resume.await.unwrap();
+                reply_control(&mut socket, request_id, MessageType::ReserveSlotsResponse,
+                    PbReserveSlotsResponse::default().encode_to_vec()).await;
+                let (request_id, request) = read_control_request(&mut socket).await;
+                assert_eq!(request.message_type, MessageType::ReserveSlots);
+                reply_control(&mut socket, request_id, MessageType::ReserveSlotsResponse,
+                    PbReserveSlotsResponse::default().encode_to_vec()).await;
+            });
+            let mut system = ActorSystem::new();
+            let handle = system.spawn::<LifecycleManagerActor>(LifecycleManagerOptions::new(
+                "test-unregister-pending",
+                MasterClientOptions::new(vec![format!("127.0.0.1:{master_port}")]),
+            ));
+            let manager = crate::lifecycle::LocalLifecycleManager::new(handle.clone());
+            let mut registration = None;
+            let mut revive = None;
+            if reviving {
+                let reservation = manager.register_shuffle(1, vec![0], false, 1).await.unwrap();
+                let (result, pending) = oneshot::channel();
+                assert!(handle.send(LifecycleManagerMessage::Revive {
+                    request: crate::lifecycle::ReviveRequest {
+                        shuffle_id: 1, partition_id: 0, map_id: 0, attempt_id: 0,
+                        old_location: reservation.primary_locations[&0].clone(),
+                        cause: crate::protocol::StatusCode::HardSplit as i32,
+                    }, result,
+                }).await.is_ok());
+                revive = Some(pending);
+            } else {
+                let (result, pending) = oneshot::channel();
+                assert!(handle.send(LifecycleManagerMessage::RegisterShuffle {
+                    shuffle_id: 1, partition_ids: vec![0], should_replicate: false,
+                    max_workers: 1, result,
+                }).await.is_ok());
+                registration = Some(pending);
+            }
+            started.await.unwrap();
+            // Registration is still waiting on the worker. Both unregister
+            // callers must wait until it drains, while new operations fail.
+            let (result, mut first_unregister) = oneshot::channel();
+            assert!(handle.send(LifecycleManagerMessage::UnregisterShuffle {
+                shuffle_id: 1, result,
+            }).await.is_ok());
+            let (result, mut second_unregister) = oneshot::channel();
+            assert!(handle.send(LifecycleManagerMessage::UnregisterShuffle {
+                shuffle_id: 1, result,
+            }).await.is_ok());
+            manager.get_job_shuffle_ids(0).await.unwrap(); // actor barrier
+            if let Some(pending) = registration.as_mut() {
+                assert!(matches!(pending.try_recv(), Ok(Err(_))),
+                    "unregister must fail the pending registration caller");
+            }
+            if let Some(pending) = revive.as_mut() {
+                assert!(matches!(pending.try_recv(), Ok(Err(_))),
+                    "unregister must fail the pending revive caller");
+            }
+            assert!(matches!(first_unregister.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+            assert!(matches!(second_unregister.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+            assert_eq!(unregisters.load(Ordering::SeqCst), 0,
+                "master cleanup ran before the delayed reservation finished");
+            assert!(manager.register_shuffle(1, vec![0], false, 1).await.is_err());
+            assert!(manager.mapper_end(1, 0, 0, 1).await.is_err());
+            assert!(manager.revive(crate::lifecycle::ReviveRequest {
+                shuffle_id: 1, partition_id: 0, map_id: 0, attempt_id: 0,
+                old_location: old_location.clone(),
+                cause: crate::protocol::StatusCode::HardSplit as i32,
+            }).await.is_err());
+            release_reserve.send(()).unwrap();
+            let first_result = first_unregister.await.unwrap();
+            let second_result = second_unregister.await.unwrap();
+            if fail_cleanup {
+                assert!(first_result.is_err());
+                assert!(second_result.is_err());
+                assert!(manager.register_shuffle(1, vec![0], false, 1).await.is_err(),
+                    "a failed cleanup must not reopen a cached reservation");
+                assert!(manager.mapper_end(1, 0, 0, 1).await.is_err());
+                assert!(manager.revive(crate::lifecycle::ReviveRequest {
+                    shuffle_id: 1, partition_id: 0, map_id: 0, attempt_id: 0,
+                    old_location,
+                    cause: crate::protocol::StatusCode::HardSplit as i32,
+                }).await.is_err());
+                manager.unregister_shuffle(1).await.unwrap();
+            } else {
+                first_result.unwrap();
+                second_result.unwrap();
+            }
+            assert_eq!(unregisters.load(Ordering::SeqCst), if fail_cleanup { 2 } else { 1 },
+                "concurrent unregisters must share one master transaction");
+            // Reusing an explicit ID must allocate again; the old delayed
+            // completion must not satisfy this new request or retain its cache.
+            manager.register_shuffle(1, vec![0], false, 1).await.unwrap();
+            assert_eq!(slot_requests.load(Ordering::SeqCst), if reviving { 3 } else { 2 },
+                "late reservation resurrected the unregistered shuffle");
+            worker.await.unwrap();
+            let (result, stopped) = oneshot::channel();
+            assert!(handle.send(LifecycleManagerMessage::StopComplete { result }).await.is_ok());
+            stopped.await.unwrap();
+            system.join().await;
+            master.abort();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unregister_drains_worker_commit_before_master_cleanup() {
+        check_unregister_drains_commit(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn unregister_drains_commit_observer_before_master_cleanup() {
+        check_unregister_drains_commit(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn unregister_drains_other_worker_commits_after_one_worker_fails() {
+        check_unregister_drains_commit(false, true).await;
+    }
+
+    #[expect(clippy::panic)]
+    async fn check_unregister_drains_commit(reporting: bool, failing_worker: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let master_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let worker_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let master_port = master_listener.local_addr().unwrap().port();
+            let worker_port = worker_listener.local_addr().unwrap().port();
+            let failure_listener = if failing_worker {
+                Some(TcpListener::bind(("127.0.0.1", 0)).await.unwrap())
+            } else {
+                None
+            };
+            let failure_port = failure_listener
+                .as_ref()
+                .map(|listener| listener.local_addr().unwrap().port());
+            let failure = failure_listener.map(|listener| {
+                tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (request_id, request) = read_control_request(&mut socket).await;
+                    assert_eq!(request.message_type, MessageType::CommitFiles);
+                    reply_control(
+                        &mut socket,
+                        request_id,
+                        MessageType::CommitFilesResponse,
+                        PbCommitFilesResponse {
+                            status: crate::protocol::StatusCode::RequestFailed as i32,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                    .await;
+                })
+            });
+            let unregisters = Arc::new(AtomicUsize::new(0));
+            let master_unregisters = unregisters.clone();
+            let master = tokio::spawn(async move {
+                let (mut socket, _) = master_listener.accept().await.unwrap();
+                loop {
+                    let (request_id, message) = read_control_request(&mut socket).await;
+                    let (kind, payload) = match message.message_type {
+                        MessageType::RegisterApplicationInfo => {
+                            (MessageType::OneWayMessageResponse, vec![])
+                        }
+                        MessageType::HeartbeatFromApplication => (
+                            MessageType::HeartbeatFromApplicationResponse,
+                            PbHeartbeatFromApplicationResponse::default().encode_to_vec(),
+                        ),
+                        MessageType::UnregisterShuffle => {
+                            master_unregisters.fetch_add(1, Ordering::SeqCst);
+                            (
+                                MessageType::UnregisterShuffleResponse,
+                                PbUnregisterShuffleResponse::default().encode_to_vec(),
+                            )
+                        }
+                        kind => panic!("unexpected master request: {kind:?}"),
+                    };
+                    reply_control(&mut socket, request_id, kind, payload).await;
+                }
+            });
+            let (commit_started, started) = oneshot::channel();
+            let (release_commit, resume) = oneshot::channel();
+            let worker = tokio::spawn(async move {
+                let (mut socket, _) = worker_listener.accept().await.unwrap();
+                let (request_id, request) = read_control_request(&mut socket).await;
+                assert_eq!(request.message_type, MessageType::CommitFiles);
+                commit_started.send(()).unwrap();
+                if !reporting {
+                    resume.await.unwrap();
+                }
+                reply_control(
+                    &mut socket,
+                    request_id,
+                    MessageType::CommitFilesResponse,
+                    PbCommitFilesResponse::default().encode_to_vec(),
+                )
+                .await;
+            });
+            let observer = Arc::new(BlockingCommitObserver::default());
+            let options = LifecycleManagerOptions::new(
+                "test-unregister-commit",
+                MasterClientOptions::new(vec![format!("127.0.0.1:{master_port}")]),
+            )
+            .with_commit_retries(0, Duration::ZERO);
+            let options = if reporting {
+                options.with_commit_observer(observer.clone())
+            } else {
+                options
+            };
+            let mut system = ActorSystem::new();
+            let handle = system.spawn::<LifecycleManagerActor>(options);
+            let manager = crate::lifecycle::LocalLifecycleManager::new(handle.clone());
+            let shuffle_id = manager.get_shuffle_id(9, 0).await.unwrap();
+            let location = PartitionLocation {
+                mode: 0,
+                id: 0,
+                epoch: 0,
+                host: "127.0.0.1".into(),
+                rpc_port: worker_port,
+                push_port: worker_port,
+                fetch_port: worker_port,
+                replicate_port: worker_port,
+                peer: None,
+            };
+            let mut locations = vec![location];
+            if let Some(port) = failure_port {
+                locations.push(PartitionLocation {
+                    id: 1,
+                    rpc_port: port,
+                    push_port: port,
+                    fetch_port: port,
+                    replicate_port: port,
+                    ..locations[0].clone()
+                });
+            }
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::RegisterShuffleComplete {
+                        shuffle_id,
+                        result: Ok(SlotReservation {
+                            worker_ids: locations
+                                .iter()
+                                .map(|location| location.worker_identity())
+                                .collect(),
+                            primary_locations: locations
+                                .iter()
+                                .map(|location| (location.id, location.clone()))
+                                .collect(),
+                            worker_locations: locations
+                                .into_iter()
+                                .map(|location| (
+                                    location.worker_identity(),
+                                    WorkerSlotLocations {
+                                        primary_locations: vec![location],
+                                        replica_locations: vec![],
+                                    }
+                                ))
+                                .collect(),
+                        }),
+                    })
+                    .await
+                    .is_ok()
+            );
+            let (result, mut mapper) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::MapperEnd {
+                        shuffle_id,
+                        map_id: 0,
+                        attempt_id: 0,
+                        num_mappers: 1,
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            started.await.unwrap();
+            if let Some(failure) = failure {
+                failure.await.unwrap();
+            }
+            if reporting {
+                observer.started.notified().await;
+            }
+            let (result, mut cleanup) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::UnregisterShuffle { shuffle_id, result })
+                    .await
+                    .is_ok()
+            );
+            manager.get_job_shuffle_ids(9).await.unwrap(); // actor barrier
+            assert!(matches!(mapper.try_recv(), Ok(Err(_))));
+            if failing_worker {
+                // The failed worker's response has been sent. Give its error
+                // time to propagate while the other transaction remains gated;
+                // try_join_all would cancel it and allow cleanup to finish.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut cleanup)
+                        .await
+                        .is_err(),
+                    "a failed worker cancelled the other worker's active commit"
+                );
+            }
+            assert!(matches!(
+                cleanup.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                unregisters.load(Ordering::SeqCst),
+                0,
+                "master cleanup overtook an active commit/report"
+            );
+            assert!(manager.mapper_end(shuffle_id, 0, 0, 1).await.is_err());
+            if reporting {
+                observer.resume.notify_one();
+            } else {
+                release_commit.send(()).unwrap();
+            }
+            cleanup.await.unwrap().unwrap();
+            assert_eq!(unregisters.load(Ordering::SeqCst), 1);
+            assert!(manager.get_job_shuffle_ids(9).await.unwrap().is_empty());
+            worker.await.unwrap();
+            let (result, stopped) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::StopComplete { result })
+                    .await
+                    .is_ok()
+            );
+            stopped.await.unwrap();
+            system.join().await;
+            master.abort();
+        })
+        .await
+        .unwrap();
+    }
 
     #[derive(Default)]
     struct BlockingCommitObserver {

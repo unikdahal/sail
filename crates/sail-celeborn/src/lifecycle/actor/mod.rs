@@ -73,6 +73,11 @@ struct ShuffleKey {
     stage: u64,
 }
 
+struct PendingUnregister {
+    waiters: Vec<oneshot::Sender<CelebornResult<()>>>,
+    request_sent: bool,
+}
+
 pub struct LifecycleManagerActor {
     options: LifecycleManagerOptions,
     client: MasterClient,
@@ -83,6 +88,7 @@ pub struct LifecycleManagerActor {
     pending_slot_requests: HashMap<i32, Vec<oneshot::Sender<CelebornResult<SlotReservation>>>>,
     pending_revives: HashMap<(i32, i32), Vec<oneshot::Sender<CelebornResult<PartitionLocation>>>>,
     shuffle_commits: HashMap<i32, ShuffleCommitState>,
+    pending_unregisters: HashMap<i32, PendingUnregister>,
     shuffle_ids: HashMap<ShuffleKey, i32>,
     shuffle_keys: HashMap<i32, ShuffleKey>,
     next_shuffle_id: i32,
