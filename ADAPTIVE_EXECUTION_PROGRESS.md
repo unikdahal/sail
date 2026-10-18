@@ -369,6 +369,53 @@ still depends on Celeborn's eventual shuffle cleanup. Normal stream-end also
 leaves Celeborn's own per-shuffle numeric ID tracking until shuffle cleanup;
 this fix releases the registered stream state and original-file pin.
 
+### Broadcast metadata and lost-shuffle reads (2026-10-18)
+
+Fetched the open stack and PR #10 again: its head was `40dad51d` and the top
+of the stack remained `0b236c9f`. This review reproduced two new issues:
+
+- A Celeborn broadcast locator repeated the same read group for every output
+  partition of its consumer, although the broadcast input has one logical
+  partition. Each task builds and serializes its own locator, causing avoidable
+  quadratic metadata growth across a wide probe stage. A real JobGraph regression
+  observed 1, 64 and 256 repeated groups, with per-task protobuf sizes of 19, 335
+  and 1,295 bytes. The locator now contains one all-channel group independent of
+  consumer width. The regression checks CollectLeft hash joins and cross joins,
+  first/last tasks and nonuniform committed-attempt round trips.
+- After a terminal global commit failure, lifecycle registration still returned
+  its cached reservation. Direct Rust/Python readers refresh locations through
+  this API, so they could read a healthy worker's output from a lost shuffle.
+  Registration now rejects the terminal Lost state before consulting its cache.
+  Successful and not-yet-terminal registration behavior is unchanged; the query
+  engine already had its own failed-commit guard.
+
+The broadcast regression failed before the fix because encoded size grew with
+probe partitions. The actor regression caused a real loopback CommitFiles failure,
+waited for mapper_end to report Lost, then reproduced the cached-reservation
+bypass. Against the previously installed native extension, the Docker regression
+also failed: a direct read completed without error after global failure. That
+regression explicitly requests two workers, observes the healthy worker's commit,
+then persistently fails partition 1's worker. Returned worker IDs alone do not
+prove primary placement because Celeborn may include workers with empty slot lists.
+Both fixes and their regressions received independent review.
+
+Fresh local validation:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 25 + 251 passed; doc tests passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 2 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+The earlier 60 and 180 repeated concurrency/lifecycle checks remain historical
+results; they were not rerun in this pass. The Docker suite retains its existing
+pytest configuration deprecation warning. GitHub Build remains `disabled_fork`;
+these checks are local. No new performance or peak-memory benchmark was run; the
+broadcast regression measures locator count and encoded size.
+
 ## Remaining work
 
 - Measure peak hash-join build memory (`build_mem_used`) against the build cap on

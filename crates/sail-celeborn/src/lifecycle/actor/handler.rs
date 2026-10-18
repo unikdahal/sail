@@ -107,6 +107,12 @@ impl LifecycleManagerActor {
         max_workers: i32,
         reply: oneshot::Sender<CelebornResult<SlotReservation>>,
     ) -> ActorAction {
+        // Readers refresh locations through registration, so an old reservation
+        // must not let them read files after the global commit has failed.
+        if let Some(ShuffleCommitState::Lost { reason }) = self.shuffle_commits.get(&shuffle_id) {
+            let _ = reply.send(Err(shuffle_lost(shuffle_id, reason)));
+            return ActorAction::Continue;
+        }
         if let Some(reservation) = self.reservations.get(&shuffle_id) {
             let _ = reply.send(Ok(reservation.clone()));
             return ActorAction::Continue;
@@ -820,9 +826,9 @@ mod tests {
     use sail_common::actor::ActorSystem;
     use tokio::sync::{Notify, oneshot};
 
-    use crate::common::SlotReservation;
+    use crate::common::{PartitionLocation, SlotReservation, WorkerSlotLocations};
     use crate::lifecycle::{
-        LifecycleManagerActor, LifecycleManagerMessage, LifecycleManagerOptions,
+        LifecycleManager, LifecycleManagerActor, LifecycleManagerMessage, LifecycleManagerOptions,
         ShuffleCommitObserver, ShuffleCommitReport,
     };
     use crate::master::MasterClientOptions;
@@ -841,6 +847,96 @@ mod tests {
             self.resume.notified().await;
             self.reported.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn lost_shuffle_cannot_reuse_its_cached_reservation() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            // Closing the worker connection makes the real commit fail without
+            // relying on an unused port or on a transport timeout.
+            let worker = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            });
+            let location = PartitionLocation {
+                mode: 0,
+                id: 0,
+                epoch: 0,
+                host: "127.0.0.1".into(),
+                rpc_port: port,
+                push_port: port,
+                fetch_port: port,
+                replicate_port: port,
+                peer: None,
+            };
+            let identity = location.worker_identity();
+            let reservation = SlotReservation {
+                worker_ids: vec![identity.clone()],
+                primary_locations: [(0, location.clone())].into(),
+                worker_locations: [(
+                    identity,
+                    WorkerSlotLocations {
+                        primary_locations: vec![location],
+                        replica_locations: vec![],
+                    },
+                )]
+                .into(),
+            };
+            let mut system = ActorSystem::new();
+            let handle = system.spawn::<LifecycleManagerActor>(
+                LifecycleManagerOptions::new("test", MasterClientOptions::new(vec![]))
+                    .with_commit_retries(0, Duration::ZERO),
+            );
+            let manager = crate::lifecycle::LocalLifecycleManager::new(handle.clone());
+            let shuffle_id = 1;
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::RegisterShuffleComplete {
+                        shuffle_id,
+                        result: Ok(reservation.clone()),
+                    })
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                manager
+                    .register_shuffle(shuffle_id, vec![0], false, 0)
+                    .await
+                    .unwrap(),
+                reservation
+            );
+            let error = manager.mapper_end(shuffle_id, 0, 0, 1).await.unwrap_err();
+            assert!(error.to_string().contains("is lost"), "{error}");
+            worker.await.unwrap();
+
+            // Reads refresh their locations through this same registration API.
+            // An old reservation must not authorize reading a lost shuffle.
+            let result = manager
+                .register_shuffle(shuffle_id, vec![0], false, 0)
+                .await;
+            assert!(
+                result.is_err(),
+                "a lost shuffle returned its cached reservation: {result:?}"
+            );
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("is lost"), "{error}");
+
+            let (result, stopped) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::StopComplete { result })
+                    .await
+                    .is_ok()
+            );
+            stopped.await.unwrap();
+            system.join().await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
