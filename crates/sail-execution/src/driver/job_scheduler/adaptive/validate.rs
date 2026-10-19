@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{OrderingRequirements, Partitioning};
+use datafusion::physical_expr::{Distribution, OrderingRequirements, Partitioning};
 use datafusion::physical_plan::joins::{
     HashJoinExec, PartitionMode, SortMergeJoinExec, SymmetricHashJoinExec,
 };
@@ -96,7 +96,8 @@ fn validate_inputs(ctx: &ValidationContext, s: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Join partition modes and ordering requirements hold for every operator.
+/// Join partition modes, single-partition inputs and ordering requirements hold
+/// for every operator.
 pub(crate) fn validate_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
     let mut error = None;
     let _ = plan.apply(|node| {
@@ -140,6 +141,20 @@ fn validate_node(node: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
         return Err("symmetric hash join has unequal input partitions".to_string());
     }
     let children = node.children();
+    let distribution = node.input_distribution_requirements();
+    for (i, child) in children.iter().enumerate() {
+        if matches!(
+            distribution.child_distribution(i),
+            Some(Distribution::SinglePartition)
+        ) && count(child) != 1
+        {
+            return Err(format!(
+                "{} input {i} requires a single partition but has {}",
+                node.name(),
+                count(child)
+            ));
+        }
+    }
     for (child, requirement) in children.iter().zip(node.required_input_ordering()) {
         let Some(requirement) = requirement else {
             continue;

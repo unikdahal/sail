@@ -143,9 +143,12 @@ fn split_safe_input(node: &Arc<dyn ExecutionPlan>) -> Option<usize> {
             filter.fetch().is_none() && deterministic(filter.predicate())
         } else {
             node.is::<CooperativeExec>()
-                || node
-                    .downcast_ref::<SortExec>()
-                    .is_some_and(|sort| sort.fetch().is_none())
+                || node.downcast_ref::<SortExec>().is_some_and(|sort| {
+                    // A global sort keeps one output partition and reads
+                    // only input partition 0. Splitting below it would leave
+                    // the remaining producer slices unread.
+                    sort.preserve_partitioning() && sort.fetch().is_none()
+                })
         };
         match node.children().as_slice() {
             [child] if safe => node = child,
