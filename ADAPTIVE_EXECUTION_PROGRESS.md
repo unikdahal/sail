@@ -45,6 +45,8 @@ and the Rust tests of the changed crates on its own.
   idempotently. If it keeps failing, the shuffle is lost: every `mapper_end` and every
   reader of it fails, so the query fails instead of returning partial data (open
   question 3 of the design).
+- Commit freezes mapper selection and drains accepted revivals before snapshotting
+  worker locations, so every published replacement epoch participates in the commit.
 - Workers serve committed files on HDFS, S3 or OSS as streams without chunks, which would
   read as empty. The commit response names the storage of every committed file, so a
   shuffle with files on distributed storage is lost at commit time and the query fails
@@ -91,8 +93,9 @@ and the Rust tests of the changed crates on its own.
 - A stage is re-planned once, just before any of its regions runs, from an immutable
   snapshot of its plan and the committed statistics of its producers. Rules are pure
   functions of the snapshot. A rewrite is validated (alignment groups, exact coverage of
-  every bucket, join modes, ordering requirements, consumer placeholders, the slot cap and
-  a codec round trip) and committed atomically with the rebuilt topology, or not at all.
+  every bucket, join modes, single-partition and ordering requirements, consumer
+  placeholders, the slot cap and a codec round trip) and committed atomically with
+  the rebuilt topology, or not at all.
   The decision is frozen, so retries reuse it.
 - Rewritten inputs declare `UnknownPartitioning` to DataFusion and carry the coalesced
   hash property as Sail metadata, so no operator relies on a partitioning that is false.
@@ -486,6 +489,57 @@ covers tracked operations before acknowledgement; actor shutdown and revocation
 of already-delivered lazy read streams are outside this change. Cleanup progress
 still depends on in-flight operations completing, including the documented
 nonblocking commit-observer contract.
+
+### Global-sort skew safety and in-flight revival (2026-10-19)
+
+Fetched PR #10 and the open stack again: the follow-up was still open at
+`d0e03330`, with `aqe/5-ci-and-benchmark` still at `0b236c9f`.
+Two new defects were reproduced before production changes:
+
+- Skew splitting accepted unlimited global SortExec nodes. A global sort keeps
+  one output partition and reads input partition 0; splitting below it left
+  later slices unread. With a supported one-bucket configuration and
+  `skew_factor=0.5`, the real scheduler accepted this layout. An executable
+  DataFusion join returned one match instead of two. Global sorts now prevent
+  splitting, and rewrite validation enforces every SinglePartition input
+  requirement. Unlimited partition-preserving sorts remain eligible. Controls
+  cover hash and sort-merge joins, either/both sorted sides, actual row counts,
+  and the real JobGraph's static fallback.
+- Final mapper completion could snapshot worker locations while an already
+  accepted revive was still reserving a replacement epoch. The late callback
+  then exposed an epoch omitted from CommitFiles after global success. Mapper
+  selection now freezes while pending revivals drain; the commit snapshots all
+  completed replacements and retains the original selected attempts. New
+  revivals are rejected after selection freezes. Duplicate mapper completions
+  wait for the same outcome, failed revival still advances the commit, and
+  unregister cancels the wait without starting a commit or hanging cleanup.
+
+All six new regressions failed against the fetched head while the existing
+36 Celeborn and 256 execution tests passed. Three lifecycle regressions use a
+scripted master and two loopback worker endpoints, holding the replacement's
+ReserveSlots response so connection serialization cannot mask the race. They
+verify exact committed epoch IDs and attempts, failure handling and cancellation.
+The lifecycle issue is a commit-boundary reliability defect: the wire tests
+establish the missing revival barrier, and code review identified the later
+publication of an uncommitted epoch. Silent loss of selected rows was not
+demonstrated. Both fixes received independent review with no blocking findings.
+
+Fresh local validation:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 39 + 259 passed; doc tests passed |
+| Fourteen cleanup/revive/commit regressions, 20 consecutive rounds | 280 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 5 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+Earlier 60, 180 and 220 repeated-test results remain historical; the 280 checks
+above are fresh and include this pass's three lifecycle regressions. GitHub Build
+was checked again and remains `disabled_fork`; these are local results.
+Performance and peak-memory benchmarks have not been rerun.
 
 ## Remaining work
 
