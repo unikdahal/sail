@@ -373,6 +373,7 @@ impl LifecycleManagerActor {
                     for reply in replies {
                         let _ = reply.send(Err(CelebornError::Application(error.to_string())));
                     }
+                    self.advance_commit(ctx, shuffle_id);
                     return ActorAction::Continue;
                 };
                 let Some(reservation) = self.reservations.get_mut(&shuffle_id) else {
@@ -391,6 +392,7 @@ impl LifecycleManagerActor {
                     for reply in replies {
                         let _ = reply.send(Err(CelebornError::Application(error.to_string())));
                     }
+                    self.advance_commit(ctx, shuffle_id);
                     return ActorAction::Continue;
                 };
                 reservation
@@ -416,6 +418,7 @@ impl LifecycleManagerActor {
                 }
             }
         }
+        self.advance_commit(ctx, shuffle_id);
         ActorAction::Continue
     }
 
@@ -464,7 +467,8 @@ impl LifecycleManagerActor {
                 let _ = reply.send(Err(shuffle_lost(shuffle_id, reason)));
                 return ActorAction::Continue;
             }
-            ShuffleCommitState::Committing { waiters, .. }
+            ShuffleCommitState::WaitingForRevives { waiters, .. }
+            | ShuffleCommitState::Committing { waiters, .. }
             | ShuffleCommitState::Reporting { waiters } => {
                 waiters.push(reply);
                 return ActorAction::Continue;
@@ -490,15 +494,42 @@ impl LifecycleManagerActor {
                 std::mem::take(attempts)
             }
         };
+        *state = ShuffleCommitState::WaitingForRevives {
+            attempts,
+            waiters: vec![reply],
+        };
+        self.advance_commit(ctx, shuffle_id);
+        ActorAction::Continue
+    }
+
+    /// Close mapper selection before waiting for in-flight revives. Otherwise a
+    /// delayed reservation could publish a readable epoch after the commit's
+    /// location snapshot, leaving its worker-side writer uncommitted.
+    fn advance_commit(&mut self, ctx: &mut ActorContext<Self>, shuffle_id: i32) {
+        if self.pending_unregisters.contains_key(&shuffle_id)
+            || self.pending_revives.keys().any(|(id, _)| *id == shuffle_id)
+        {
+            return;
+        }
+        let Some(state) = self.shuffle_commits.get_mut(&shuffle_id) else {
+            return;
+        };
+        let ShuffleCommitState::WaitingForRevives { attempts, waiters } = state else {
+            return;
+        };
+        let attempts = std::mem::take(attempts);
+        let waiters = std::mem::take(waiters);
         let Some(worker_locations) = self.registered_shuffles.get(&shuffle_id).cloned() else {
             let reason = "the shuffle is not registered".to_string();
-            let _ = reply.send(Err(shuffle_lost(shuffle_id, &reason)));
+            for waiter in waiters {
+                let _ = waiter.send(Err(shuffle_lost(shuffle_id, &reason)));
+            }
             *state = ShuffleCommitState::Lost { reason };
-            return ActorAction::Continue;
+            return;
         };
         *state = ShuffleCommitState::Committing {
             attempts: attempts.clone(),
-            waiters: vec![reply],
+            waiters,
         };
         let application_id = self.options.application_id.clone();
         let endpoint_resolver = self.options.endpoint_resolver.clone();
@@ -581,7 +612,6 @@ impl LifecycleManagerActor {
                 .send(LifecycleManagerMessage::CommitComplete { shuffle_id, result })
                 .await;
         });
-        ActorAction::Continue
     }
 
     pub(super) fn handle_commit_complete(
@@ -726,7 +756,8 @@ impl LifecycleManagerActor {
             }
         }
         if let Some(
-            ShuffleCommitState::Committing { waiters, .. }
+            ShuffleCommitState::WaitingForRevives { waiters, .. }
+            | ShuffleCommitState::Committing { waiters, .. }
             | ShuffleCommitState::Reporting { waiters },
         ) = self.shuffle_commits.get_mut(&shuffle_id)
         {
@@ -947,7 +978,7 @@ mod tests {
     };
     use crate::master::MasterClientOptions;
     use crate::protocol::proto::{
-        MessageType, PbCommitFilesResponse, PbHeartbeatFromApplicationResponse,
+        MessageType, PbCommitFiles, PbCommitFilesResponse, PbHeartbeatFromApplicationResponse,
         PbRequestSlotsResponse, PbReserveSlotsResponse, PbUnregisterShuffleResponse,
         PbWorkerResource,
     };
@@ -1019,6 +1050,325 @@ mod tests {
         socket.write_i64(request_id).await.unwrap();
         socket.write_i32(body.len() as i32).await.unwrap();
         socket.write_all(&body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_drains_pending_revive_and_includes_replacement_epoch() {
+        check_commit_drains_revive(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn commit_continues_after_pending_revive_fails() {
+        check_commit_drains_revive(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn unregister_cancels_commit_waiting_for_pending_revive() {
+        check_commit_drains_revive(false, true).await;
+    }
+
+    #[expect(clippy::panic)]
+    async fn check_commit_drains_revive(fail_revive: bool, unregister: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let master_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let old_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let replacement_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let master_port = master_listener.local_addr().unwrap().port();
+            let location = |port| PartitionLocation {
+                mode: 0,
+                id: 0,
+                epoch: 0,
+                host: "127.0.0.1".into(),
+                rpc_port: port,
+                push_port: port,
+                fetch_port: port,
+                replicate_port: port,
+                peer: None,
+            };
+            let old_location = location(old_listener.local_addr().unwrap().port());
+            let replacement_location = location(replacement_listener.local_addr().unwrap().port());
+            let expected_replacement = PartitionLocation {
+                epoch: 1,
+                ..replacement_location.clone()
+            };
+            let requests = Arc::new(AtomicUsize::new(0));
+            let master_requests = requests.clone();
+            let unregisters = Arc::new(AtomicUsize::new(0));
+            let master_unregisters = unregisters.clone();
+            let master = tokio::spawn(async move {
+                let (mut socket, _) = master_listener.accept().await.unwrap();
+                loop {
+                    let (request_id, message) = read_control_request(&mut socket).await;
+                    let (kind, payload) = match message.message_type {
+                        MessageType::RegisterApplicationInfo => {
+                            (MessageType::OneWayMessageResponse, vec![])
+                        }
+                        MessageType::HeartbeatFromApplication => (
+                            MessageType::HeartbeatFromApplicationResponse,
+                            PbHeartbeatFromApplicationResponse::default().encode_to_vec(),
+                        ),
+                        MessageType::RequestSlots => {
+                            let index = master_requests.fetch_add(1, Ordering::SeqCst);
+                            assert!(
+                                index < 2,
+                                "a new revive started after mapper selection froze"
+                            );
+                            let location = if index == 0 {
+                                &old_location
+                            } else {
+                                &replacement_location
+                            };
+                            let port = location.rpc_port;
+                            (
+                                MessageType::RequestSlotsResponse,
+                                PbRequestSlotsResponse {
+                                    worker_resource: [(
+                                        format!("127.0.0.1:{port}:{port}:{port}:{port}"),
+                                        PbWorkerResource {
+                                            primary_partitions: vec![location.clone().into()],
+                                            ..Default::default()
+                                        },
+                                    )]
+                                    .into(),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            )
+                        }
+                        MessageType::UnregisterShuffle => {
+                            master_unregisters.fetch_add(1, Ordering::SeqCst);
+                            (
+                                MessageType::UnregisterShuffleResponse,
+                                PbUnregisterShuffleResponse::default().encode_to_vec(),
+                            )
+                        }
+                        kind => panic!("unexpected master request: {kind:?}"),
+                    };
+                    reply_control(&mut socket, request_id, kind, payload).await;
+                }
+            });
+            let (old_commit, mut old_committed) = oneshot::channel();
+            let mut old_worker = tokio::spawn(async move {
+                let (mut socket, _) = old_listener.accept().await.unwrap();
+                let (request_id, message) = read_control_request(&mut socket).await;
+                assert_eq!(message.message_type, MessageType::ReserveSlots);
+                reply_control(
+                    &mut socket,
+                    request_id,
+                    MessageType::ReserveSlotsResponse,
+                    PbReserveSlotsResponse::default().encode_to_vec(),
+                )
+                .await;
+                let (request_id, message) = read_control_request(&mut socket).await;
+                assert_eq!(message.message_type, MessageType::CommitFiles);
+                let request = PbCommitFiles::decode(message.payload.as_slice()).unwrap();
+                old_commit.send(request).unwrap();
+                reply_control(
+                    &mut socket,
+                    request_id,
+                    MessageType::CommitFilesResponse,
+                    PbCommitFilesResponse::default().encode_to_vec(),
+                )
+                .await;
+            });
+            let (reserve_started, started) = oneshot::channel();
+            let (release_reserve, resume) = oneshot::channel();
+            let (replacement_commit, mut replacement_committed) = oneshot::channel();
+            let replacement_worker = tokio::spawn(async move {
+                let (mut socket, _) = replacement_listener.accept().await.unwrap();
+                let (request_id, message) = read_control_request(&mut socket).await;
+                assert_eq!(message.message_type, MessageType::ReserveSlots);
+                reserve_started.send(()).unwrap();
+                resume.await.unwrap();
+                reply_control(
+                    &mut socket,
+                    request_id,
+                    MessageType::ReserveSlotsResponse,
+                    PbReserveSlotsResponse {
+                        status: if fail_revive {
+                            crate::protocol::StatusCode::RequestFailed as i32
+                        } else {
+                            0
+                        },
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .await;
+                if fail_revive || unregister {
+                    return;
+                }
+                let (request_id, message) = read_control_request(&mut socket).await;
+                assert_eq!(message.message_type, MessageType::CommitFiles);
+                let request = PbCommitFiles::decode(message.payload.as_slice()).unwrap();
+                replacement_commit.send(request).unwrap();
+                reply_control(
+                    &mut socket,
+                    request_id,
+                    MessageType::CommitFilesResponse,
+                    PbCommitFilesResponse::default().encode_to_vec(),
+                )
+                .await;
+            });
+            let mut system = ActorSystem::new();
+            let handle = system.spawn::<LifecycleManagerActor>(
+                LifecycleManagerOptions::new(
+                    "test-commit-pending-revive",
+                    MasterClientOptions::new(vec![format!("127.0.0.1:{master_port}")]),
+                )
+                .with_commit_retries(0, Duration::ZERO),
+            );
+            let manager = crate::lifecycle::LocalLifecycleManager::new(handle.clone());
+            let shuffle_id = manager.get_shuffle_id(9, 0).await.unwrap();
+            let reservation = manager
+                .register_shuffle(shuffle_id, vec![0], false, 1)
+                .await
+                .unwrap();
+            let revive_request = crate::lifecycle::ReviveRequest {
+                shuffle_id,
+                partition_id: 0,
+                map_id: 0,
+                attempt_id: 1,
+                old_location: reservation.primary_locations[&0].clone(),
+                cause: crate::protocol::StatusCode::HardSplit as i32,
+            };
+            let (result, mut revive) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::Revive {
+                        request: revive_request.clone(),
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            started.await.unwrap();
+            let (result, mut mapper) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::MapperEnd {
+                        shuffle_id,
+                        map_id: 0,
+                        attempt_id: 0,
+                        num_mappers: 1,
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            let (result, mut duplicate_mapper) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::MapperEnd {
+                        shuffle_id,
+                        map_id: 0,
+                        attempt_id: 1,
+                        num_mappers: 1,
+                        result,
+                    })
+                    .await
+                    .is_ok()
+            );
+            manager.get_job_shuffle_ids(9).await.unwrap(); // actor barrier
+            // A different worker avoids connection serialization masking the race.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut old_committed)
+                    .await
+                    .is_err(),
+                "global commit overtook the pending replacement reservation"
+            );
+            assert!(matches!(
+                mapper.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                duplicate_mapper.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(
+                manager.revive(revive_request).await.is_err(),
+                "mapper selection must close the shuffle to new revives"
+            );
+            let mut cleanup = None;
+            if unregister {
+                let (result, pending) = oneshot::channel();
+                assert!(
+                    handle
+                        .send(LifecycleManagerMessage::UnregisterShuffle { shuffle_id, result })
+                        .await
+                        .is_ok()
+                );
+                cleanup = Some(pending);
+                manager.get_job_shuffle_ids(9).await.unwrap();
+                assert!(matches!(mapper.try_recv(), Ok(Err(_))));
+                assert!(matches!(duplicate_mapper.try_recv(), Ok(Err(_))));
+                assert!(matches!(revive.try_recv(), Ok(Err(_))));
+                assert_eq!(unregisters.load(Ordering::SeqCst), 0);
+            }
+            release_reserve.send(()).unwrap();
+            if let Some(cleanup) = cleanup {
+                cleanup.await.unwrap().unwrap();
+                assert_eq!(unregisters.load(Ordering::SeqCst), 1);
+                assert!(matches!(
+                    old_committed.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    replacement_committed.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            } else {
+                let revived = revive.await.unwrap();
+                if fail_revive {
+                    assert!(revived.is_err());
+                } else {
+                    assert_eq!(revived.unwrap(), expected_replacement);
+                }
+                mapper.await.unwrap().unwrap();
+                duplicate_mapper.await.unwrap().unwrap();
+                let old = old_committed.await.unwrap();
+                assert_eq!(old.map_attempts, vec![0]);
+                assert_eq!(old.primary_ids, vec!["0-0"]);
+                let refreshed = manager
+                    .register_shuffle(shuffle_id, vec![0], false, 0)
+                    .await
+                    .unwrap();
+                if fail_revive {
+                    assert_eq!(refreshed.primary_locations[&0].epoch, 0);
+                    assert_eq!(refreshed.worker_locations.len(), 1);
+                    assert!(matches!(
+                        replacement_committed.try_recv(),
+                        Err(oneshot::error::TryRecvError::Closed)
+                    ));
+                } else {
+                    let replacement = replacement_committed.await.unwrap();
+                    assert_eq!(replacement.map_attempts, vec![0]);
+                    assert_eq!(replacement.primary_ids, vec!["0-1"]);
+                    assert_eq!(refreshed.primary_locations[&0].epoch, 1);
+                    assert_eq!(refreshed.worker_locations.len(), 2);
+                }
+                (&mut old_worker).await.unwrap();
+            }
+            replacement_worker.await.unwrap();
+            // No Stop RPC is needed: final cleanup was checked above or is outside
+            // this controlled commit transaction.
+            let (result, stopped) = oneshot::channel();
+            assert!(
+                handle
+                    .send(LifecycleManagerMessage::StopComplete { result })
+                    .await
+                    .is_ok()
+            );
+            stopped.await.unwrap();
+            system.join().await;
+            master.abort();
+            if unregister {
+                old_worker.abort();
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

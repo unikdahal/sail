@@ -49,6 +49,12 @@ enum ShuffleCommitState {
     Collecting {
         attempts: Vec<i32>,
     },
+    /// Mapper selection is frozen, but an earlier revive is still reserving a
+    /// replacement epoch. Include that epoch in the snapshot before committing.
+    WaitingForRevives {
+        attempts: Vec<i32>,
+        waiters: Vec<oneshot::Sender<CelebornResult<()>>>,
+    },
     /// Every mapper has ended and the workers are committing the selected attempts.
     /// `mapper_end` calls made meanwhile wait for the outcome.
     Committing {
