@@ -47,6 +47,11 @@ and the Rust tests of the changed crates on its own.
   question 3 of the design).
 - Commit freezes mapper selection and drains accepted revivals before snapshotting
   worker locations, so every published replacement epoch participates in the commit.
+- Actor shutdown drains accepted requests before acknowledging Stop. Lifecycle
+  shutdown also attempts cleanup for failed allocations with explicit shuffle IDs;
+  remote cleanup remains best effort. Stopping one client preserves its shared
+  lifecycle manager. Pools evict idle workers after the last shuffle cleanup,
+  while already-held clients and readers retain their transport references.
 - Workers serve committed files on HDFS, S3 or OSS as streams without chunks, which would
   read as empty. The commit response names the storage of every committed file, so a
   shuffle with files on distributed storage is lost at commit time and the query fails
@@ -93,9 +98,9 @@ and the Rust tests of the changed crates on its own.
 - A stage is re-planned once, just before any of its regions runs, from an immutable
   snapshot of its plan and the committed statistics of its producers. Rules are pure
   functions of the snapshot. A rewrite is validated (alignment groups, exact coverage of
-  every bucket, join modes, single-partition and ordering requirements, consumer
-  placeholders, the slot cap and a codec round trip) and committed atomically with
-  the rebuilt topology, or not at all.
+  every bucket, join modes, single-partition and ordering requirements, whole-probe
+  join boundaries, consumer placeholders, the slot cap and a codec round trip) and
+  committed atomically with the rebuilt topology, or not at all.
   The decision is frozen, so retries reuse it.
 - Rewritten inputs declare `UnknownPartitioning` to DataFusion and carry the coalesced
   hash property as Sail metadata, so no operator relies on a partitioning that is false.
@@ -540,6 +545,70 @@ Earlier 60, 180 and 220 repeated-test results remain historical; the 280 checks
 above are fresh and include this pass's three lifecycle regressions. GitHub Build
 was checked again and remains `disabled_fork`; these are local results.
 Performance and peak-memory benchmarks have not been rerun.
+
+### Shutdown, worker connections and whole-probe joins (2026-10-21–22)
+
+Fetched the open stack and PR #10 again before review and after resuming.
+The follow-up remained open at `c6de67f4`, and the stack top remained
+`0b236c9f`. This review reproduced three further defects:
+
+- Actor Stop bypassed the per-shuffle drain barriers. It could acknowledge
+  shutdown while registration, revival, commit or observer work still ran, then
+  abort callbacks or allow worker allocation to overtake cleanup. Both actors
+  now reject new work, coalesce accepted Stop callers and drain tracked work
+  before acknowledging. Lifecycle Stop attempts cleanup for every accepted
+  allocation ID, including an explicit ID whose registration already failed
+  after reserving resources. Client Stop remains local to its shared lifecycle
+  manager. Controls cover lookups, commit/observer ordering, duplicate Stop,
+  cleanup failures and rejected work after shutdown begins.
+- Worker pools retained strong clients and their RPC/push/fetch sockets for every
+  historical worker until actor destruction. Shuffle cleanup now evicts clients
+  for workers absent from remaining live location histories/reservations;
+  partial reservation errors also release unused cache entries. An actual TCP
+  regression keeps one worker connection shared by two shuffles, proves the
+  first cleanup preserves reuse, and observes EOF after the last cleanup.
+  Existing clients/readers retain their own transport references. Independent
+  later jobs may reconnect; no performance or peak-memory benchmark was run.
+- Skew splitting beneath joins that need the whole probe side could expand an
+  initially valid single-task stage. Build-match bitmaps and probe completion
+  counters are local to each deserialized plan, so independently executed task
+  partitions cannot coordinate final build-side output. The real JobGraph
+  accepted a one-to-four rewrite, and executable isolated tasks lost an unmatched
+  build row (one static row became zero). The regression covers nested-loop
+  left anti and null-aware CollectLeft hash joins. Skew traversal now preserves
+  whole-probe boundaries, and validation checks the same requirement. Controls
+  cover other build-output join types, independent inner/right probe joins and
+  PiecewiseMergeJoin's left/full validation requirements.
+
+The first six shutdown regressions and the idle-worker TCP regression all failed
+before the fixes while all 39 existing Celeborn tests passed. Three new AQE
+regressions failed against the old rules/validator while all 259 existing
+execution tests passed. Additional controls cover failed explicit allocation,
+remote cleanup failure, lookup completion, existing-client ownership and
+piecewise merge joins. Loopback fixtures were strengthened to observe socket EOF
+and accept a fresh RPC connection when an ID is reused after cleanup. The fixes
+received independent review with no blocking findings.
+
+Validation for the final source (Rust/native/Python checks on October 21,
+Docker integration on October 22):
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 51 + 263 passed; doc tests passed |
+| Twenty-five cleanup/shutdown/commit regressions, 20 consecutive rounds | 500 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 5 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+Earlier repeated-test totals remain historical; the 500 checks above exercise
+the current cleanup and shutdown code. GitHub Build was checked again and remains
+`disabled_fork`; these are local results. The previous shutdown exclusion is now
+closed for tracked actor operations. Already-delivered lazy read streams remain
+externally owned and are not revoked. Lifecycle Stop retains its best-effort
+`()` API: remote unregister failures are logged, and eventual server cleanup may
+still be needed. Performance and peak-memory benchmarks have not been rerun.
 
 ## Remaining work
 
