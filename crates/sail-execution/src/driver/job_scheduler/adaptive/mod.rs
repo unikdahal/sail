@@ -43,7 +43,7 @@ use crate::driver::job_scheduler::adaptive::coalesce::{
 };
 use crate::driver::job_scheduler::adaptive::domain::{AlignmentGroup, alignment_groups};
 use crate::driver::job_scheduler::adaptive::joins::{
-    apply_join_rules, apply_sort_merge_joins, exact_statistics,
+    apply_join_rules, apply_sort_merge_joins, committed_input_statistics,
 };
 use crate::driver::job_scheduler::adaptive::skew::{
     RULE_SKEW_SPLIT, skew_joins, split_skewed_buckets,
@@ -556,6 +556,9 @@ fn group_sizes(view: &StageView, group: &AlignmentGroup) -> Result<Option<GroupS
     if group.fixed {
         return Err("the group reads a source that is not a stage input".to_string());
     }
+    if group.partition_fetch {
+        return Err("the group contains an operator with a finite fetch limit".to_string());
+    }
     let options = &view.options;
     let mut buckets = None;
     let mut sizes: Vec<u64> = vec![];
@@ -656,8 +659,10 @@ fn coalesce_ranges(
 
 /// Rewrites the stage input placeholders: an adapted input declares
 /// `UnknownPartitioning` with its new partition count, and every input with
-/// committed statistics exposes them. Ancestors are rebuilt, so their properties
-/// follow from their inputs.
+/// committed statistics exposes them when its spec preserves total reads. Skew
+/// splits may replicate an input, so their original totals are no longer exact.
+/// Bucket reads can interleave, so orderings and partition-local constants are
+/// discarded. Ancestors are rebuilt, so their properties follow from their inputs.
 fn rewrite_placeholders(
     plan: Arc<dyn ExecutionPlan>,
     view: &StageView,
@@ -671,15 +676,36 @@ fn rewrite_placeholders(
             let i = *placeholder.input();
             let mut properties = placeholder.properties().clone();
             if let Some(Some(adaptive)) = inputs.get(i) {
-                properties =
-                    Arc::new(properties.as_ref().clone().with_partitioning(
-                        Partitioning::UnknownPartitioning(adaptive.partitions()),
-                    ));
+                // Each original bucket may be sorted even for a non-order-
+                // preserving shuffle with a single producer. Combining buckets
+                // does not merge their ordering or preserve constants that can
+                // differ between buckets.
+                let mut equivalence = node.equivalence_properties().clone();
+                equivalence.clear_orderings();
+                equivalence.clear_per_partition_constants();
+                properties = Arc::new(
+                    properties
+                        .as_ref()
+                        .clone()
+                        .with_eq_properties(equivalence)
+                        .with_partitioning(Partitioning::UnknownPartitioning(
+                            adaptive.partitions(),
+                        )),
+                );
             }
             let mut rewritten = StageInputExec::new(i, properties);
-            if let Some(statistics) = view.statistics(i) {
-                rewritten = rewritten
-                    .with_statistics(Arc::new(exact_statistics(statistics, &node.schema())));
+            let preserves_totals = !matches!(
+                inputs.get(i).and_then(|input| input.as_deref()),
+                Some(AdaptiveInput {
+                    property: AdaptiveProperty::Unknown,
+                    ..
+                })
+            );
+            if preserves_totals && let Some(statistics) = view.statistics(i) {
+                rewritten = rewritten.with_statistics(Arc::new(committed_input_statistics(
+                    statistics,
+                    &node.schema(),
+                )));
             }
             Ok(Transformed::yes(
                 Arc::new(rewritten) as Arc<dyn ExecutionPlan>

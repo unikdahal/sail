@@ -39,6 +39,7 @@ class Measurement:
     """What one workload did in one mode."""
 
     wall_seconds: list[float] = field(default_factory=list)
+    results_match_warmup: bool = True
     jobs: int = 0
     stages: int = 0
     tasks: int = 0
@@ -97,16 +98,6 @@ WORKLOADS: dict[str, Callable[[SparkSession, int], DataFrame]] = {
 }
 
 
-def _max_job_id(spark: SparkSession) -> int:
-    row = (
-        spark.sql("SELECT session_id, CAST(job_id AS BIGINT) AS job_id FROM system.execution.jobs")
-        .where(F.col("session_id") == spark.session_id)
-        .agg(F.max("job_id").alias("m"))
-        .collect()[0]
-    )
-    return -1 if row.m is None else row.m
-
-
 def _settled(df: DataFrame, timeout: float = 15.0) -> list[Any]:
     """System events are recorded asynchronously, so wait until the rows stop changing."""
     deadline = time.monotonic() + timeout
@@ -119,15 +110,13 @@ def _settled(df: DataFrame, timeout: float = 15.0) -> list[Any]:
         time.sleep(0.5)
 
 
-def _record(spark: SparkSession, measurement: Measurement, first: int, last: int) -> None:
+def _record(observer: SparkSession, session_id: str, measurement: Measurement) -> None:
     def scoped(df: DataFrame) -> DataFrame:
-        return df.where(
-            (F.col("session_id") == spark.session_id) & (F.col("job_id") > first) & (F.col("job_id") <= last)
-        )
+        return df.where(F.col("session_id") == session_id)
 
     stages = _settled(
         scoped(
-            spark.sql(
+            observer.sql(
                 "SELECT session_id, CAST(job_id AS BIGINT) AS job_id, CAST(stage AS BIGINT) AS stage, "
                 "CAST(partitions AS BIGINT) AS partitions, "
                 "CAST(initial_partitions AS BIGINT) AS initial_partitions, replanned, adaptive_rules "
@@ -137,7 +126,7 @@ def _record(spark: SparkSession, measurement: Measurement, first: int, last: int
     )
     tasks = _settled(
         scoped(
-            spark.sql(
+            observer.sql(
                 "SELECT session_id, CAST(job_id AS BIGINT) AS job_id, CAST(stage AS BIGINT) AS stage, "
                 "CAST(partition AS BIGINT) AS partition, CAST(attempt AS BIGINT) AS attempt, "
                 "CAST(unix_micros(stopped_at) - unix_micros(created_at) AS DOUBLE) / 1e6 AS seconds "
@@ -176,19 +165,25 @@ def _run_mode(args: argparse.Namespace, *, adaptive: bool) -> dict[str, tuple[li
         spark_connect_server(envs=_envs(args, adaptive=adaptive)) as server,
         spark_session_factory(server.remote) as sessions,
     ):
-        spark = sessions.create()
+        # Reading system tables also schedules jobs. Observe from a separate session
+        # so those jobs cannot inflate the workload's task and partition counts.
+        observer = sessions.create()
         for name, workload in WORKLOADS.items():
             print(f"[adaptive={'on' if adaptive else 'off'}] {name}", flush=True)  # noqa: T201
-            measurement = Measurement()
-            # The first run is measured from the system tables and also warms up.
-            first = _max_job_id(spark)
-            rows = sorted(tuple(row) for row in workload(spark, args.scale).collect())
-            _record(spark, measurement, first, _max_job_id(spark))
-            for _ in range(args.repeat):
-                start = time.perf_counter()
-                workload(spark, args.scale).collect()
-                measurement.wall_seconds.append(time.perf_counter() - start)
-            results[name] = (rows, measurement)
+            with spark_session_factory(server.remote) as workload_sessions:
+                measurement = Measurement()
+                spark = workload_sessions.create()
+                # The first run is measured from the system tables and also warms up.
+                rows = sorted(tuple(row) for row in workload(spark, args.scale).collect())
+                _record(observer, spark.session_id, measurement)
+                for _ in range(args.repeat):
+                    start = time.perf_counter()
+                    timed_rows = workload(spark, args.scale).collect()
+                    measurement.wall_seconds.append(time.perf_counter() - start)
+                    # Compare after stopping the timer, and retain any mismatch
+                    # even if a later repetition returns the expected rows.
+                    measurement.results_match_warmup &= sorted(tuple(row) for row in timed_rows) == rows
+                results[name] = (rows, measurement)
     return results
 
 
@@ -232,9 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     on = _run_mode(args, adaptive=True)
     report = {}
     for name in WORKLOADS:
-        parity = off[name][0] == on[name][0]
+        parity = off[name][0] == on[name][0] and all(mode[name][1].results_match_warmup for mode in (off, on))
         if not parity:
-            print(f"error: results of {name} differ with adaptive execution", file=sys.stderr)  # noqa: T201
+            print(f"error: results of {name} differ between modes or timed repetitions", file=sys.stderr)  # noqa: T201
         report[name] = {
             "parity": parity,
             "off": {**asdict(off[name][1]), "median_wall_seconds": off[name][1].median_wall_seconds},

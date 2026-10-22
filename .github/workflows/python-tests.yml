@@ -69,6 +69,9 @@ jobs:
       - name: Run Tests
         run: hatch run pytest -n 2 --dist=loadfile --pyargs pysail
 
+      - name: Run Adaptive Benchmark Unit Tests
+        run: hatch run pytest scripts/adaptive/test_benchmark.py
+
       # Generate coverage report after Python tests
       - name: Generate coverage report
         run: |

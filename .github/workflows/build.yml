@@ -6,7 +6,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
     types:
       - labeled
       - opened
@@ -42,7 +41,10 @@ jobs:
               - "pyproject.toml"
               - "rustfmt.toml"
             celeborn:
+              - ".github/workflows/celeborn-tests.yml"
               - "crates/sail-celeborn/**"
+              - "crates/sail-common/src/config/application.rs"
+              - "crates/sail-common/src/config/application.yaml"
               - "crates/sail-execution/**"
               - "python/pysail/testing/containers/celeborn.py"
               - "python/pysail/tests/celeborn/**"

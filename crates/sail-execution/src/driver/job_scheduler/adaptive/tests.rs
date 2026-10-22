@@ -16,7 +16,9 @@ use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoi
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, PlanProperties};
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, PlanProperties, StatisticsArgs, StatisticsContext,
+};
 
 use super::*;
 use crate::driver::job_scheduler::JobSchedulerOptions;
@@ -334,6 +336,10 @@ fn filter(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     Arc::new(FilterExec::try_new(predicate, input).unwrap())
 }
 
+fn drop_value_column(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    Arc::new(ProjectionExec::try_new(vec![(key(), "k".to_string())], input).unwrap())
+}
+
 /// A projection that computes a value, so its output may be wider than its input.
 fn computed_projection(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     let value = Arc::new(BinaryExpr::new(
@@ -394,7 +400,7 @@ fn build_side_without_a_bound_is_not_coalesced() {
 }
 
 #[test]
-fn bounded_build_side_through_a_filter_is_coalesced_within_the_cap() {
+fn filtered_build_side_is_not_coalesced_without_a_byte_bound() {
     let plan = hash_join(
         filter(placeholder(0, 4)),
         placeholder(1, 4),
@@ -410,11 +416,9 @@ fn bounded_build_side_through_a_filter_is_coalesced_within_the_cap() {
     );
     view.options.join_max_build_partition_size = 50 * MIB;
     view.options.join_enabled = false;
-    let rewrite = adapt(&view).unwrap().expect("a rewrite");
-    assert_eq!(
-        spec_ranges(rewrite.inputs[0].as_ref().unwrap()),
-        vec![0..2, 2..4]
-    );
+    // FilterExec can repeat dictionaries while rebatching, so its input does
+    // not bound the bytes of a coalesced build partition.
+    assert!(adapt(&view).unwrap().is_none());
 }
 
 #[test]
@@ -452,8 +456,7 @@ fn filtered_build_side_is_not_swapped() {
 }
 
 #[test]
-fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
-    // The probe side is at most its input, so the exact build side is larger.
+fn exact_build_side_is_not_swapped_over_an_unbounded_filtered_probe_side() {
     let plan = hash_join(
         placeholder(0, 4),
         filter(placeholder(1, 4)),
@@ -468,6 +471,29 @@ fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
         ],
     );
     view.options.coalesce_enabled = false;
+    // A filter can repeat dictionary bytes, so even this smaller probe input
+    // does not prove its filtered output is smaller than the build side.
+    assert!(adapt(&view).unwrap().is_none());
+}
+
+#[test]
+fn exact_build_side_is_swapped_over_an_upper_bounded_probe_side() {
+    let plan = hash_join(
+        placeholder(0, 4),
+        drop_value_column(placeholder(1, 4)),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let mut view = view(
+        plan,
+        vec![
+            shuffle_input(statistics(&[8 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    view.options.coalesce_enabled = false;
+    // Dropping a column preserves batch boundaries and gives a sound upper
+    // bound, so the exact build side can still be proved larger than the probe.
     let rewrite = adapt(&view).unwrap().expect("a rewrite");
     assert_eq!(rewrite.rules, vec![joins::RULE_SWAP_JOIN_INPUTS]);
     assert_eq!(build_input(&rewrite.plan), Some(1));
@@ -477,7 +503,7 @@ fn exact_build_side_is_swapped_over_a_filtered_probe_side() {
 #[test]
 fn upper_bounded_build_side_keeps_its_hash_join() {
     let plan = hash_join(
-        filter(placeholder(0, 4)),
+        drop_value_column(placeholder(0, 4)),
         placeholder(1, 4),
         PartitionMode::Partitioned,
         JoinType::Left,
@@ -949,6 +975,28 @@ fn inner_join_splits_both_skewed_sides_into_pairs() {
         .filter(|(l, r)| l[0].part.is_some() && r[0].part.is_some())
         .count();
     assert!(pairs >= 4, "{pairs} pairs");
+
+    // Both sides repeat producer ranges across the cross product. The original
+    // shuffle totals must not be advertised as exact statistics of these reads.
+    let _ = rewrite
+        .plan
+        .apply(|node| {
+            if node.is::<StageInputExec<usize>>() {
+                let statistics = StatisticsContext::new()
+                    .compute(node.as_ref(), &StatisticsArgs::default())
+                    .unwrap();
+                assert_eq!(
+                    statistics.num_rows,
+                    datafusion::common::stats::Precision::Absent
+                );
+                assert_eq!(
+                    statistics.total_byte_size,
+                    datafusion::common::stats::Precision::Absent
+                );
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
 }
 
 #[test]
@@ -1236,4 +1284,829 @@ fn retried_tasks_reuse_the_adapted_plan() {
     assert!(!adapt_job(&mut job, &options));
     assert_eq!(job.graph.to_string(), adapted);
     assert_eq!(job.stages[1].adaptive, AdaptiveDecision::Replanned);
+}
+
+#[test]
+fn coalescing_remains_available_after_join_dynamic_filter_pushdown() {
+    use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+    let filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![key()], lit(true)));
+    let join = HashJoinExec::try_new(
+        placeholder(0, 4),
+        placeholder(1, 4),
+        vec![(key(), key())],
+        None,
+        &JoinType::Inner,
+        None,
+        PartitionMode::Partitioned,
+        NullEquality::NullEqualsNothing,
+        false,
+    )
+    .unwrap()
+    .with_dynamic_filter_expr(filter)
+    .unwrap();
+    let view = view(
+        Arc::new(join),
+        vec![
+            shuffle_input(statistics(&[8 * MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a coalescing rewrite");
+    assert_eq!(rewrite.rules, vec![RULE_COALESCE]);
+    assert_eq!(count(&rewrite.plan), 1);
+    assert_eq!(build_input(&rewrite.plan), Some(0));
+    assert_eq!(
+        rewrite
+            .plan
+            .downcast_ref::<HashJoinExec>()
+            .unwrap()
+            .dynamic_expressions_produced()
+            .len(),
+        1
+    );
+    validate::validate_plan(&rewrite.plan).unwrap();
+}
+
+#[test]
+fn coalesced_inputs_keep_exact_rows_and_estimated_bytes() {
+    use datafusion::common::stats::Precision;
+
+    let statistics = statistics(&[MIB; 4]);
+    let view = view(placeholder(0, 4), vec![shuffle_input(statistics.clone())]);
+    let rewrite = adapt(&view).unwrap().expect("a coalescing rewrite");
+    let actual = StatisticsContext::new()
+        .compute(rewrite.plan.as_ref(), &StatisticsArgs::default())
+        .unwrap();
+    assert_eq!(
+        actual.num_rows,
+        Precision::Exact(statistics.total_rows as usize)
+    );
+    assert_eq!(
+        actual.total_byte_size,
+        Precision::Inexact(statistics.total_logical_bytes as usize)
+    );
+}
+
+#[test]
+fn coalescing_sorted_shuffle_buckets_keeps_the_static_sort_merge_join() {
+    use datafusion::arrow::compute::SortOptions;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap();
+    let side = || {
+        let source = MemorySourceConfig::try_new_exec(&[vec![]], schema(), None).unwrap();
+        let sorted = Arc::new(SortExec::new(ordering.clone(), source));
+        let shuffled =
+            Arc::new(RepartitionExec::try_new(sorted, Partitioning::Hash(vec![key()], 4)).unwrap());
+        // With one producer, each original hash bucket is still sorted even
+        // without RepartitionExec's explicit preserve-order option.
+        assert!(!shuffled.preserve_order());
+        let shuffled: Arc<dyn ExecutionPlan> = shuffled;
+        assert!(shuffled.output_ordering().is_some());
+        shuffled
+    };
+    let join = Arc::new(
+        SortMergeJoinExec::try_new(
+            side(),
+            side(),
+            vec![(key(), key())],
+            None,
+            JoinType::Inner,
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap(),
+    );
+    let graph = JobGraph::try_new(
+        join,
+        JobGraphOptions {
+            shuffle_backend: remote_shuffle_service(),
+        },
+    )
+    .unwrap();
+    assert_eq!(graph.stages().len(), 3);
+    let mut job = job(graph);
+    let options = adaptive_options();
+    for producer in 0..2 {
+        succeed(&mut job, producer, |_| ChannelCounts {
+            rows: vec![10; 4],
+            physical_bytes: Some(vec![100; 4]),
+            logical_bytes: vec![200; 4],
+        });
+        commit(&mut job, producer);
+    }
+    let before = job.graph.stages()[2].plan.clone();
+    validate::validate_plan(&before).unwrap();
+    let view = JobScheduler::stage_view(&mut job, 2, &options.adaptive, None).unwrap();
+    let rewrite = adapt(&view).unwrap().expect("a coalescing proposal");
+    assert_eq!(count(&rewrite.plan), 1);
+    // The remote reader interleaves buckets without merging their sort order.
+    // A consumer that needs sorted rows must reject this proposal.
+    let reason = validate::validate_plan(&rewrite.plan).unwrap_err();
+    assert!(
+        reason.contains("input ordering is not satisfied"),
+        "{reason}"
+    );
+    assert!(!adapt_job(&mut job, &options));
+    assert!(Arc::ptr_eq(&before, &job.graph.stages()[2].plan));
+    assert_eq!(job.stages[2].tasks.len(), 4);
+    assert_eq!(job.stages[2].adaptive, AdaptiveDecision::Static);
+    assert!(
+        job.graph.stages()[2]
+            .inputs
+            .iter()
+            .all(|input| input.adaptive.is_none())
+    );
+}
+
+#[test]
+fn coalescing_partition_constants_cannot_satisfy_sort_merge_ordering() {
+    use datafusion::arrow::compute::SortOptions;
+    use datafusion::physical_expr::equivalence::{AcrossPartitions, ConstExpr};
+
+    let side = |input: usize| {
+        let mut equivalence = EquivalenceProperties::new(schema());
+        equivalence
+            .add_constants([ConstExpr::new(key(), AcrossPartitions::Heterogeneous)])
+            .unwrap();
+        Arc::new(StageInputExec::new(
+            input,
+            Arc::new(PlanProperties::new(
+                equivalence,
+                Partitioning::Hash(vec![key()], 4),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        )) as Arc<dyn ExecutionPlan>
+    };
+    let join: Arc<dyn ExecutionPlan> = Arc::new(
+        SortMergeJoinExec::try_new(
+            side(0),
+            side(1),
+            vec![(key(), key())],
+            None,
+            JoinType::Inner,
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap(),
+    );
+    // A key that is constant within each original bucket trivially satisfies
+    // that bucket's ordering requirement, even without an explicit ordering.
+    validate::validate_plan(&join).unwrap();
+    let view = view(
+        join,
+        vec![
+            shuffle_input(statistics(&[MIB; 4])),
+            shuffle_input(statistics(&[MIB; 4])),
+        ],
+    );
+    let rewrite = adapt(&view).unwrap().expect("a coalescing proposal");
+    assert_eq!(count(&rewrite.plan), 1);
+    // Different buckets may have different constant values. Merging them must
+    // not let those old constants prove that the merged stream is sorted.
+    let reason = validate::validate_plan(&rewrite.plan).unwrap_err();
+    assert!(
+        reason.contains("input ordering is not satisfied"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn checkpoint_writer_keeps_hash_buckets_when_skew_and_coalescing_keep_the_count() {
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use object_store::path::Path;
+    use sail_physical_plan::remote_checkpoint::{
+        RemoteCheckpointCommitExec, RemoteCheckpointWriteExec, checkpoint_storage_schema,
+    };
+
+    let side = || {
+        let input = MemorySourceConfig::try_new_exec(&vec![vec![]; 3], schema(), None).unwrap();
+        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![key()], 4)).unwrap())
+            as Arc<dyn ExecutionPlan>
+    };
+    let joined = hash_join(side(), side(), PartitionMode::Partitioned, JoinType::Inner);
+    let logical_schema = joined.schema();
+    let storage_schema = checkpoint_storage_schema(&logical_schema);
+    let object_store = ObjectStoreUrl::parse("memory://").unwrap();
+    let prefix = Path::from("checkpoint/adaptive-layout");
+    let writer: Arc<dyn ExecutionPlan> = Arc::new(
+        RemoteCheckpointWriteExec::try_new(
+            joined,
+            object_store.clone(),
+            prefix.clone(),
+            storage_schema.clone(),
+            None,
+        )
+        .unwrap(),
+    );
+    let plan = Arc::new(RemoteCheckpointCommitExec::new(
+        Arc::new(CoalescePartitionsExec::new(writer)),
+        "adaptive-layout".to_string(),
+        object_store,
+        prefix,
+        logical_schema,
+        storage_schema,
+        Partitioning::Hash(vec![Arc::new(Column::new("_c0", 0))], 4),
+        None,
+    ));
+    let graph = JobGraph::try_new(
+        plan,
+        JobGraphOptions {
+            shuffle_backend: remote_shuffle_service(),
+        },
+    )
+    .unwrap();
+    let writer_stage = graph
+        .stages()
+        .iter()
+        .position(|stage| stage.plan.is::<RemoteCheckpointWriteExec>())
+        .expect("checkpoint writer stage");
+    let commit_stage = graph
+        .stages()
+        .iter()
+        .position(|stage| stage.plan.is::<RemoteCheckpointCommitExec>())
+        .expect("checkpoint commit stage");
+    let mut job = job(graph);
+    // Three large mapper slices of bucket 0 and one coalesced range of buckets
+    // 1..4 still give four tasks. Count-only checkpoint metadata validation
+    // cannot distinguish that layout from the original four hash buckets.
+    succeed(&mut job, 0, |_| ChannelCounts {
+        rows: vec![100; 4],
+        physical_bytes: Some(vec![80 * MIB, MIB, MIB, MIB]),
+        logical_bytes: vec![160 * MIB, 2 * MIB, 2 * MIB, 2 * MIB],
+    });
+    succeed(&mut job, 1, |_| ChannelCounts {
+        rows: vec![100; 4],
+        physical_bytes: Some(vec![MIB; 4]),
+        logical_bytes: vec![2 * MIB; 4],
+    });
+    commit(&mut job, 0);
+    commit(&mut job, 1);
+    assert_eq!(count(&job.graph.stages()[writer_stage].plan), 4);
+    let before = job.graph.to_string();
+    let adapted = adapt_job(&mut job, &skew_options());
+    assert_eq!(count(&job.graph.stages()[writer_stage].plan), 4);
+    let checkpoint = job.graph.stages()[commit_stage]
+        .plan
+        .downcast_ref::<RemoteCheckpointCommitExec>()
+        .unwrap();
+    assert!(matches!(
+        checkpoint.checkpoint_partitioning(),
+        Partitioning::Hash(_, 4)
+    ));
+    if adapted {
+        let spec = job.graph.stages()[writer_stage].inputs[0]
+            .adaptive
+            .as_ref()
+            .unwrap();
+        assert_eq!(spec.partitions(), 4);
+        // The same key in bucket 0 can now appear in three saved partitions,
+        // contradicting the static Hash(..., 4) checkpoint descriptor.
+        assert_eq!(
+            spec.spec
+                .iter()
+                .filter(|slices| slices[0].buckets == (0..1))
+                .count(),
+            3
+        );
+        assert_eq!(spec.spec[3][0].buckets, 1..4);
+        assert_eq!(spec.property, AdaptiveProperty::Unknown);
+    }
+    assert!(
+        !adapted,
+        "checkpoint writer changed hash bucket boundaries while the commit retained Hash(..., 4)"
+    );
+    assert_eq!(job.graph.to_string(), before);
+    assert_eq!(job.stages[writer_stage].adaptive, AdaptiveDecision::Static);
+}
+
+#[tokio::test]
+async fn checkpoint_hash_metadata_cannot_describe_skew_slices_with_the_same_count() {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use sail_physical_plan::remote_checkpoint::CheckpointDataSource;
+
+    let row = |value| {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    };
+    let saved = MemorySourceConfig::try_new(
+        &[vec![row(10)], vec![row(20)], vec![row(30)], vec![]],
+        schema(),
+        None,
+    )
+    .unwrap();
+    // The real checkpoint scan trusts this saved descriptor instead of the
+    // underlying file layout. The three slices of one key violate that claim.
+    let checkpointed: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+        CheckpointDataSource::new(Arc::new(saved), Partitioning::Hash(vec![key()], 4)),
+    )));
+    let probe = || {
+        let source = MemorySourceConfig::try_new_exec(&[vec![row(99)]], schema(), None).unwrap();
+        Arc::new(RepartitionExec::try_new(source, Partitioning::Hash(vec![key()], 4)).unwrap())
+            as Arc<dyn ExecutionPlan>
+    };
+    let joined = hash_join(
+        checkpointed.clone(),
+        probe(),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let rows = datafusion::physical_plan::collect(joined, Arc::new(TaskContext::default()))
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert!(
+        rows <= 1,
+        "one hash bucket cannot see the other saved slices"
+    );
+
+    // Shuffling the saved rows restores key co-location and all three matches.
+    let restored: Arc<dyn ExecutionPlan> = Arc::new(
+        RepartitionExec::try_new(checkpointed, Partitioning::Hash(vec![key()], 4)).unwrap(),
+    );
+    let joined = hash_join(
+        restored,
+        probe(),
+        PartitionMode::Partitioned,
+        JoinType::Inner,
+    );
+    let rows = datafusion::physical_plan::collect(joined, Arc::new(TaskContext::default()))
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(rows, 3);
+}
+
+#[test]
+fn global_sorts_keep_single_partition_skew_domains() {
+    use datafusion::arrow::compute::SortOptions;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap();
+    for sort_merge in [false, true] {
+        // Each sort is initially valid: one hash bucket contains both producers.
+        for global_side in [None, Some(0), Some(1), Some(2)] {
+            let sorted = |i| {
+                Arc::new(
+                    SortExec::new(ordering.clone(), placeholder(i, 1)).with_preserve_partitioning(
+                        global_side != Some(i) && global_side != Some(2),
+                    ),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            let plan = if sort_merge {
+                Arc::new(
+                    SortMergeJoinExec::try_new(
+                        sorted(0),
+                        sorted(1),
+                        vec![(key(), key())],
+                        None,
+                        JoinType::Inner,
+                        vec![SortOptions::default()],
+                        NullEquality::NullEqualsNothing,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            } else {
+                hash_join(
+                    sorted(0),
+                    sorted(1),
+                    PartitionMode::Partitioned,
+                    JoinType::Inner,
+                )
+            };
+            validate::validate_plan(&plan).unwrap();
+            let mut view = skew_view(plan, vec![producer_input(&[vec![100], vec![100]]); 2]);
+            view.options.coalesce_enabled = false;
+            view.options.skew_factor = 0.5;
+            view.options.skew_threshold = 1;
+            view.options.coalesce_target_size = 1;
+            let rewrite = adapt(&view).unwrap();
+            if global_side.is_some() {
+                assert!(
+                    rewrite.is_none(),
+                    "global sort on side {global_side:?} was split (sort-merge={sort_merge})"
+                );
+            } else {
+                let rewrite = rewrite.expect("partition-preserving sorts remain splittable");
+                assert!(rewrite.rules.contains(&skew::RULE_SKEW_SPLIT));
+                assert_eq!(count(&rewrite.plan), 4);
+                check_specs(&rewrite, &view, &[0, 1]);
+                validate::validate_plan(&rewrite.plan).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn global_sorts_keep_the_static_job_graph_when_the_input_bucket_is_skewed() {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap();
+    let side = || {
+        let source = MemorySourceConfig::try_new_exec(&[vec![], vec![]], schema(), None).unwrap();
+        let shuffled =
+            Arc::new(RepartitionExec::try_new(source, Partitioning::Hash(vec![key()], 1)).unwrap());
+        Arc::new(SortExec::new(ordering.clone(), shuffled)) as Arc<dyn ExecutionPlan>
+    };
+    let graph = JobGraph::try_new(
+        hash_join(side(), side(), PartitionMode::Partitioned, JoinType::Inner),
+        JobGraphOptions {
+            shuffle_backend: remote_shuffle_service(),
+        },
+    )
+    .unwrap();
+    let mut job = job(graph);
+    assert_eq!(job.graph.stages().len(), 3);
+    for producer in 0..2 {
+        succeed(&mut job, producer, |_| ChannelCounts {
+            rows: vec![1],
+            physical_bytes: Some(vec![100]),
+            logical_bytes: vec![100],
+        });
+        commit(&mut job, producer);
+    }
+    let mut adaptive = options();
+    adaptive.join_enabled = false;
+    adaptive.coalesce_enabled = false;
+    adaptive.skew_factor = 0.5;
+    adaptive.skew_threshold = 1;
+    adaptive.coalesce_target_size = 1;
+    let options = JobSchedulerOptions::new_for_test(remote_shuffle_service(), adaptive, None);
+    let before = job.graph.to_string();
+    assert!(
+        !adapt_job(&mut job, &options),
+        "global sorts hid multiple input slices behind one output partition"
+    );
+    assert_eq!(job.graph.to_string(), before);
+    assert_eq!(job.stages[2].tasks.len(), 1);
+    assert!(
+        job.graph.stages()[2]
+            .inputs
+            .iter()
+            .all(|input| input.adaptive.is_none())
+    );
+    assert_eq!(job.stages[2].adaptive, AdaptiveDecision::Static);
+}
+
+#[tokio::test]
+async fn single_partition_sort_validation_prevents_skew_slices_from_losing_join_rows() {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    let row = |k| {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![k])),
+                Arc::new(Int64Array::from(vec![k * 10])),
+            ],
+        )
+        .unwrap()
+    };
+    let joined =
+        |left: Vec<Vec<RecordBatch>>, right: Vec<Vec<RecordBatch>>, preserve_partitioning| {
+            let ordering = LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap();
+            let sorted = |partitions: Vec<Vec<RecordBatch>>| {
+                let source = MemorySourceConfig::try_new_exec(&partitions, schema(), None).unwrap();
+                Arc::new(
+                    SortExec::new(ordering.clone(), source)
+                        .with_preserve_partitioning(preserve_partitioning),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            hash_join(
+                sorted(left),
+                sorted(right),
+                PartitionMode::Partitioned,
+                JoinType::Inner,
+            )
+        };
+    async fn rows(plan: Arc<dyn ExecutionPlan>) -> usize {
+        datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    let static_plan = joined(
+        vec![vec![row(1), row(2)]],
+        vec![vec![row(1), row(2)]],
+        false,
+    );
+    validate::validate_plan(&static_plan).unwrap();
+    assert_eq!(rows(static_plan).await, 2);
+
+    // The exact-coverage contract permits these four slice pairs. A global sort
+    // above either input still advertises one partition and reads only pair 0.
+    let sliced_left = vec![vec![row(1)], vec![row(1)], vec![row(2)], vec![row(2)]];
+    let sliced_right = vec![vec![row(1)], vec![row(2)], vec![row(1)], vec![row(2)]];
+    let unsafe_plan = joined(sliced_left.clone(), sliced_right.clone(), false);
+    assert_eq!(count(&unsafe_plan), 1);
+    assert_eq!(rows(unsafe_plan.clone()).await, 1);
+    let preserving_plan = joined(sliced_left, sliced_right, true);
+    validate::validate_plan(&preserving_plan).unwrap();
+    assert_eq!(rows(preserving_plan).await, 2);
+
+    let error = validate::validate_plan(&unsafe_plan)
+        .expect_err("a global sort must reject multiple input partitions");
+    assert!(error.contains("SortExec"), "{error}");
+    assert!(error.contains("single partition"), "{error}");
+}
+
+#[test]
+fn piecewise_build_output_requires_single_probe_partition() {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::joins::PiecewiseMergeJoinExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    for join_type in [
+        JoinType::Inner,
+        JoinType::Right,
+        JoinType::Left,
+        JoinType::Full,
+    ] {
+        let left = Arc::new(
+            SortExec::new(
+                LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap(),
+                placeholder(0, 1),
+            )
+            .with_preserve_partitioning(true),
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            PiecewiseMergeJoinExec::try_new(
+                left,
+                placeholder(1, 2),
+                (key(), key()),
+                Operator::Gt,
+                join_type,
+                2,
+            )
+            .unwrap(),
+        );
+        let result = validate::validate_plan(&plan);
+        if matches!(join_type, JoinType::Left | JoinType::Full) {
+            assert!(result.unwrap_err().contains("probe"));
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+fn whole_probe_join(
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    join_type: JoinType,
+    null_aware: bool,
+) -> Arc<dyn ExecutionPlan> {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::JoinSide;
+    use datafusion::physical_plan::joins::NestedLoopJoinExec;
+    use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+
+    if null_aware {
+        return Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                vec![(key(), key())],
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true,
+            )
+            .unwrap(),
+        );
+    }
+    // A real non-equi predicate, rather than a constant false expression that a
+    // logical optimizer could eliminate before building this physical plan.
+    let filter = JoinFilter::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("build", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("probe", 1)),
+        )),
+        vec![
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+        ],
+        Arc::new(Schema::new(vec![
+            Field::new("build", DataType::Int64, true),
+            Field::new("probe", DataType::Int64, true),
+        ])),
+    );
+    Arc::new(NestedLoopJoinExec::try_new(left, right, Some(filter), &join_type, None).unwrap())
+}
+
+#[test]
+fn nested_whole_probe_joins_keep_single_partition_skew_domains() {
+    for null_aware in [false, true] {
+        let types = if null_aware {
+            vec![JoinType::LeftAnti]
+        } else {
+            vec![
+                JoinType::Left,
+                JoinType::LeftSemi,
+                JoinType::LeftAnti,
+                JoinType::LeftMark,
+                JoinType::Full,
+                JoinType::Inner,
+                JoinType::Right,
+                JoinType::RightSemi,
+                JoinType::RightAnti,
+            ]
+        };
+        for join_type in types {
+            let nested = hash_join(
+                placeholder(0, 1),
+                placeholder(1, 1),
+                PartitionMode::Partitioned,
+                JoinType::Inner,
+            );
+            let plan = whole_probe_join(broadcast_placeholder(2), nested, join_type, null_aware);
+            validate::validate_plan(&plan).unwrap();
+            let mut view = skew_view(
+                plan,
+                vec![
+                    producer_input(&[vec![100], vec![100]]),
+                    producer_input(&[vec![100], vec![100]]),
+                    broadcast_input(statistics(&[100])),
+                ],
+            );
+            view.options.coalesce_enabled = false;
+            view.options.skew_factor = 0.5;
+            view.options.skew_threshold = 1;
+            view.options.coalesce_target_size = 1;
+            let rewritten = adapt(&view).unwrap();
+            let whole_probe = null_aware
+                || matches!(
+                    join_type,
+                    JoinType::Left
+                        | JoinType::LeftSemi
+                        | JoinType::LeftAnti
+                        | JoinType::LeftMark
+                        | JoinType::Full
+                );
+            if whole_probe {
+                assert!(
+                    rewritten.is_none(),
+                    "{join_type:?}, null-aware={null_aware}"
+                );
+            } else {
+                let rewritten = rewritten.expect("independent probe partitions remain splittable");
+                assert_eq!(count(&rewritten.plan), 4);
+                check_specs(&rewritten, &view, &[0, 1]);
+                validate::validate_plan(&rewritten.plan).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_whole_probe_joins_keep_the_static_job_graph() {
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+    for null_aware in [false, true] {
+        let side = || {
+            let source =
+                MemorySourceConfig::try_new_exec(&[vec![], vec![]], schema(), None).unwrap();
+            Arc::new(RepartitionExec::try_new(source, Partitioning::Hash(vec![key()], 1)).unwrap())
+                as Arc<dyn ExecutionPlan>
+        };
+        let build = MemorySourceConfig::try_new_exec(&[vec![]], schema(), None).unwrap();
+        let build = Arc::new(CoalescePartitionsExec::new(build));
+        let nested = hash_join(side(), side(), PartitionMode::Partitioned, JoinType::Inner);
+        let graph = JobGraph::try_new(
+            whole_probe_join(build, nested, JoinType::LeftAnti, null_aware),
+            JobGraphOptions {
+                shuffle_backend: remote_shuffle_service(),
+            },
+        )
+        .unwrap();
+        let mut job = job(graph);
+        assert_eq!(job.graph.stages().len(), 4);
+        assert_eq!(count(&job.graph.stages()[3].plan), 1);
+        for producer in 0..3 {
+            succeed(&mut job, producer, |_| ChannelCounts {
+                rows: vec![1],
+                physical_bytes: Some(vec![100]),
+                logical_bytes: vec![100],
+            });
+            commit(&mut job, producer);
+        }
+        let mut adaptive = options();
+        adaptive.join_enabled = false;
+        adaptive.coalesce_enabled = false;
+        adaptive.skew_factor = 0.5;
+        adaptive.skew_threshold = 1;
+        adaptive.coalesce_target_size = 1;
+        let options = JobSchedulerOptions::new_for_test(remote_shuffle_service(), adaptive, None);
+        let before = job.graph.to_string();
+        assert!(
+            !adapt_job(&mut job, &options),
+            "whole-probe stage expanded, null-aware={null_aware}"
+        );
+        assert_eq!(job.graph.to_string(), before);
+        assert_eq!(job.stages[3].tasks.len(), 1);
+        assert_eq!(job.stages[3].adaptive, AdaptiveDecision::Static);
+        assert!(
+            job.graph.stages()[3]
+                .inputs
+                .iter()
+                .all(|input| input.adaptive.is_none())
+        );
+    }
+}
+
+#[tokio::test]
+async fn isolated_whole_probe_join_tasks_lose_unmatched_build_rows() {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::execution::TaskContext;
+    use futures::StreamExt;
+
+    let row = |k| {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![k])),
+                Arc::new(Int64Array::from(vec![k * 10])),
+            ],
+        )
+        .unwrap()
+    };
+    let join = |left: Vec<Vec<RecordBatch>>, right: Vec<Vec<RecordBatch>>, null_aware| {
+        let left = MemorySourceConfig::try_new_exec(&left, schema(), None).unwrap();
+        let right = MemorySourceConfig::try_new_exec(&right, schema(), None).unwrap();
+        let probe = hash_join(left, right, PartitionMode::Partitioned, JoinType::Inner);
+        let build = MemorySourceConfig::try_new_exec(&[vec![row(0)]], schema(), None).unwrap();
+        whole_probe_join(build, probe, JoinType::LeftAnti, null_aware)
+    };
+    let sliced_left = vec![vec![row(1)], vec![row(1)], vec![row(2)], vec![row(2)]];
+    let sliced_right = vec![vec![row(1)], vec![row(2)], vec![row(1)], vec![row(2)]];
+    for null_aware in [false, true] {
+        let static_plan = join(
+            vec![vec![row(1), row(2)]],
+            vec![vec![row(1), row(2)]],
+            null_aware,
+        );
+        validate::validate_plan(&static_plan).unwrap();
+        let batches =
+            datafusion::physical_plan::collect(static_plan, Arc::new(TaskContext::default()))
+                .await
+                .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        // Distributed tasks deserialize independent plans and execute only their
+        // own partition. They cannot share the build bitmap/probe completion
+        // counter that makes a multi-partition join correct on one process.
+        let mut rows = 0;
+        for partition in 0..4 {
+            let plan = join(sliced_left.clone(), sliced_right.clone(), null_aware);
+            let mut stream = plan
+                .execute(partition, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
+        }
+        assert_eq!(
+            rows, 0,
+            "unmatched build row disappeared, null-aware={null_aware}"
+        );
+        let unsafe_plan = join(sliced_left.clone(), sliced_right.clone(), null_aware);
+        let error = validate::validate_plan(&unsafe_plan)
+            .expect_err("distributed build-side output requires the whole probe in one task");
+        assert!(error.contains("probe"), "{error}");
+    }
 }

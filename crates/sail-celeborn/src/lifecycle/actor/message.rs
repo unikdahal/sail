@@ -48,6 +48,10 @@ pub enum LifecycleManagerMessage {
         shuffle_id: i32,
         result: CelebornResult<ApplicationMetrics>,
     },
+    CommitReported {
+        shuffle_id: i32,
+        result: Result<(), String>,
+    },
     UnregisterShuffle {
         shuffle_id: i32,
         result: oneshot::Sender<CelebornResult<()>>,
@@ -55,7 +59,6 @@ pub enum LifecycleManagerMessage {
     UnregisterShuffleComplete {
         shuffle_id: i32,
         result: CelebornResult<()>,
-        reply: oneshot::Sender<CelebornResult<()>>,
     },
     ReportMetrics {
         metrics: ApplicationMetrics,
@@ -84,6 +87,7 @@ impl SpanAssociation for LifecycleManagerMessage {
             Self::ReviveComplete { .. } => "ReviveComplete",
             Self::MapperEnd { .. } => "MapperEnd",
             Self::CommitComplete { .. } => "CommitComplete",
+            Self::CommitReported { .. } => "CommitReported",
             Self::UnregisterShuffle { .. } => "UnregisterShuffle",
             Self::UnregisterShuffleComplete { .. } => "UnregisterShuffleComplete",
             Self::ReportMetrics { .. } => "ReportMetrics",

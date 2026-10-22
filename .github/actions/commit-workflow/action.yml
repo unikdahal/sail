@@ -4,15 +4,12 @@ inputs:
   sha:
     description: The Git SHA of the commit
     required: true
-    type: string
   workflow_name:
     description: The name of the workflow to match
     required: true
-    type: string
   artifact_name:
     description: The name of the artifact to match
     required: true
-    type: string
 outputs:
   workflow_run_id:
     description: The ID of the workflow run for the commit, or empty if the workflow run does not exist

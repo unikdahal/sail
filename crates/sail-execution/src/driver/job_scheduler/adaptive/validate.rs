@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{OrderingRequirements, Partitioning};
+use datafusion::physical_expr::{Distribution, OrderingRequirements, Partitioning};
 use datafusion::physical_plan::joins::{
     HashJoinExec, PartitionMode, SortMergeJoinExec, SymmetricHashJoinExec,
 };
@@ -18,6 +18,7 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use prost::Message;
 
+use crate::driver::job_scheduler::adaptive::skew::requires_single_probe;
 use crate::driver::job_scheduler::adaptive::spec::{SpecInput, check_group};
 use crate::driver::job_scheduler::topology::JobTopology;
 use crate::job_graph::{BucketLayout, InputMode, JobGraph, TaskPlacement};
@@ -76,8 +77,11 @@ fn validate_inputs(ctx: &ValidationContext, s: usize) -> Result<(), String> {
             ));
         }
         // An input whose placeholder was pruned from the plan is never read.
-        if let Some(&partitions) = declared.get(&i) {
-            if partitions != adaptive.partitions() {
+        if let Some(partitions) = declared.get(&i) {
+            if let Some(partitions) = partitions
+                .iter()
+                .find(|&&partitions| partitions != adaptive.partitions())
+            {
                 return Err(format!(
                     "stage {s} input {i} declares {partitions} partitions but its spec has {}",
                     adaptive.partitions()
@@ -93,7 +97,8 @@ fn validate_inputs(ctx: &ValidationContext, s: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Join partition modes and ordering requirements hold for every operator.
+/// Join partition modes, single-partition inputs and ordering requirements hold
+/// for every operator.
 pub(crate) fn validate_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
     let mut error = None;
     let _ = plan.apply(|node| {
@@ -137,6 +142,26 @@ fn validate_node(node: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
         return Err("symmetric hash join has unequal input partitions".to_string());
     }
     let children = node.children();
+    if requires_single_probe(node) && children.get(1).is_none_or(|probe| count(probe) != 1) {
+        return Err(format!(
+            "{} requires the whole probe in one partition for distributed execution",
+            node.name()
+        ));
+    }
+    let distribution = node.input_distribution_requirements();
+    for (i, child) in children.iter().enumerate() {
+        if matches!(
+            distribution.child_distribution(i),
+            Some(Distribution::SinglePartition)
+        ) && count(child) != 1
+        {
+            return Err(format!(
+                "{} input {i} requires a single partition but has {}",
+                node.name(),
+                count(child)
+            ));
+        }
+    }
     for (child, requirement) in children.iter().zip(node.required_input_ordering()) {
         let Some(requirement) = requirement else {
             continue;
@@ -244,7 +269,10 @@ fn validate_consumers(ctx: &ValidationContext) -> Result<(), String> {
                     return Err(format!("stage {c} reads stage {s} by forward input"));
                 }
                 InputMode::Merge => {
-                    if declared.get(&i).is_some_and(|&p| p != partitions) {
+                    if declared
+                        .get(&i)
+                        .is_some_and(|counts| counts.iter().any(|&p| p != partitions))
+                    {
                         return Err(format!("stage {c} merge input {i} is stale for stage {s}"));
                     }
                 }
@@ -300,12 +328,11 @@ pub(crate) fn region_slots(
 }
 
 /// Returns the declared partition count of each stage input placeholder in a plan.
-fn placeholder_partitions(plan: &Arc<dyn ExecutionPlan>) -> HashMap<usize, usize> {
-    let mut result = HashMap::new();
+fn placeholder_partitions(plan: &Arc<dyn ExecutionPlan>) -> HashMap<usize, Vec<usize>> {
+    let mut result: HashMap<usize, Vec<usize>> = HashMap::new();
     let _ = plan.apply(|node| {
         if let Some(placeholder) = node.downcast_ref::<StageInputExec<usize>>() {
-            result.insert(
-                *placeholder.input(),
+            result.entry(*placeholder.input()).or_default().push(
                 placeholder
                     .properties()
                     .output_partitioning()
@@ -335,4 +362,65 @@ fn declares_unknown_partitioning(plan: &Arc<dyn ExecutionPlan>, input: usize) ->
         Ok(TreeNodeRecursion::Continue)
     });
     result
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod repeated_placeholder_regression_tests {
+    use std::sync::Arc;
+
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::Partitioning;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::union::UnionExec;
+
+    use super::{ValidationContext, validate_inputs};
+    use crate::driver::job_scheduler::test_utils::{aggregate_graph, job};
+    use crate::job_graph::{AdaptiveInput, AdaptiveProperty, BucketSlice};
+    use crate::plan::StageInputExec;
+    use crate::proto::RemoteExecutionCodec;
+
+    #[test]
+    fn every_occurrence_must_match_the_adaptive_input_domain() {
+        let job = job(aggregate_graph());
+        let mut stages = job.graph.stages().to_vec();
+        let properties = stages[1].plan.properties().clone();
+        let placeholder = |partitions| {
+            Arc::new(StageInputExec::new(
+                0usize,
+                Arc::new(
+                    properties
+                        .as_ref()
+                        .clone()
+                        .with_partitioning(Partitioning::UnknownPartitioning(partitions)),
+                ),
+            )) as Arc<dyn ExecutionPlan>
+        };
+        stages[1].plan = UnionExec::try_new(vec![placeholder(3), placeholder(2)]).unwrap();
+        stages[1].inputs[0].adaptive = Some(Arc::new(AdaptiveInput {
+            spec: vec![
+                vec![BucketSlice::whole(0..4)],
+                vec![BucketSlice::whole(4..8)],
+            ],
+            property: AdaptiveProperty::Unknown,
+        }));
+        let graph = job.graph.with_stages(stages);
+        let codec = RemoteExecutionCodec;
+        let context = TaskContext::default();
+        let result = validate_inputs(
+            &ValidationContext {
+                old: &job.graph,
+                new: &graph,
+                topology: &job.topology,
+                changed: &[1],
+                stage: 1,
+                groups: &[vec![0]],
+                slot_cap: None,
+                codec: &codec,
+                context: &context,
+            },
+            1,
+        );
+        assert!(result.is_err());
+    }
 }

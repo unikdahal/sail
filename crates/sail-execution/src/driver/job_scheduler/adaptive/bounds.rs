@@ -9,8 +9,13 @@
 //!   - an exact size proves that a size is large (a build side is larger than its
 //!     probe side, or a build partition exceeds the build cap).
 //!
+//! These bounds describe the recorded input data. Read rebatching can repeat or
+//! retain Arrow buffers, and hash table overhead is unmeasured, so byte caps do
+//! not guarantee a bound on a task's actual memory usage.
+//!
 //! Any other operator (an aggregate, a join, a projection that computes values,
-//! a window, an unnest) has no bound, and decisions that need one are not made.
+//! a rebatching filter or sort, a window, an unnest) has no bound, and decisions
+//! that need one are not made.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -80,20 +85,13 @@ fn operator_bound(node: &Arc<dyn ExecutionPlan>) -> Option<Bound> {
     if node.is::<CooperativeExec>() {
         return Some(Bound::Exact);
     }
-    if let Some(sort) = node.downcast_ref::<SortExec>() {
-        return Some(if sort.fetch().is_some() {
-            Bound::Upper
-        } else {
-            Bound::Exact
-        });
+    if node.is::<FilterExec>() || node.is::<SortExec>() {
+        // Filtering and sorting can rebatch the rows. Every output dictionary
+        // batch carries the dictionary values, so the total logical bytes may
+        // exceed the committed input even though the rows are unchanged.
+        return None;
     }
     if node.is::<LocalLimitExec>() || node.is::<GlobalLimitExec>() {
-        return Some(Bound::Upper);
-    }
-    if let Some(filter) = node.downcast_ref::<FilterExec>() {
-        if let Some(projection) = filter.projection() {
-            distinct_columns(projection.iter().copied())?;
-        }
         return Some(Bound::Upper);
     }
     if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
@@ -166,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_through_reordering_and_sorting() {
+    fn exact_through_column_reordering() {
         let plan = project(input(3), vec![column("b", 1), column("a", 0)]);
         assert_eq!(
             input_bound(&plan),
@@ -178,15 +176,65 @@ mod tests {
     }
 
     #[test]
-    fn upper_through_filters_limits_and_dropped_columns() {
-        let predicate = Arc::new(BinaryExpr::new(column("a", 0), Operator::Gt, lit(1i64)));
-        let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input(0)).unwrap());
-        assert_eq!(input_bound(&filter).unwrap().bound, Bound::Upper);
+    fn upper_through_limits_and_dropped_columns() {
         let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(input(0), 10));
         assert_eq!(input_bound(&limit).unwrap().bound, Bound::Upper);
         let dropped = project(input(0), vec![column("a", 0)]);
         assert_eq!(input_bound(&dropped).unwrap().bound, Bound::Upper);
+    }
+
+    #[test]
+    fn no_bound_through_filter_rebatching() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let properties = PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(4),
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        );
+        let child: Arc<dyn ExecutionPlan> =
+            Arc::new(StageInputExec::new(0usize, Arc::new(properties)));
+        assert_eq!(
+            input_bound(&child),
+            Some(InputBound {
+                input: 0,
+                bound: Bound::Exact,
+            })
+        );
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(lit(true), child)
+                .unwrap()
+                .with_batch_size(10)
+                .unwrap(),
+        );
+        // Even an unlimited, all-pass filter coalesces batches. A dictionary
+        // batch crossing an output boundary repeats its values, as the actual
+        // FilterExec regression in statistics.rs demonstrates.
+        assert_eq!(input_bound(&filter), None);
+    }
+
+    #[test]
+    fn no_bound_through_sort_rebatching() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            column("a", 0),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        for fetch in [None, Some(1)] {
+            let sort: Arc<dyn ExecutionPlan> = Arc::new(
+                SortExec::new(ordering.clone(), input(0))
+                    .with_preserve_partitioning(true)
+                    .with_fetch(fetch),
+            );
+            assert_eq!(input_bound(&sort), None);
+        }
     }
 
     #[test]

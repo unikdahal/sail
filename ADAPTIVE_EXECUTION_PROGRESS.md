@@ -45,6 +45,13 @@ and the Rust tests of the changed crates on its own.
   idempotently. If it keeps failing, the shuffle is lost: every `mapper_end` and every
   reader of it fails, so the query fails instead of returning partial data (open
   question 3 of the design).
+- Commit freezes mapper selection and drains accepted revivals before snapshotting
+  worker locations, so every published replacement epoch participates in the commit.
+- Actor shutdown drains accepted requests before acknowledging Stop. Lifecycle
+  shutdown also attempts cleanup for failed allocations with explicit shuffle IDs;
+  remote cleanup remains best effort. Stopping one client preserves its shared
+  lifecycle manager. Pools evict idle workers after the last shuffle cleanup,
+  while already-held clients and readers retain their transport references.
 - Workers serve committed files on HDFS, S3 or OSS as streams without chunks, which would
   read as empty. The commit response names the storage of every committed file, so a
   shuffle with files on distributed storage is lost at commit time and the query fails
@@ -73,10 +80,12 @@ and the Rust tests of the changed crates on its own.
   output is committed, and only when the task definition asks for them: the driver sets
   `collect_statistics` only when adaptive execution is enabled on a remote shuffle service, so execution
   without it is unchanged (design invariant 10).
-- Tasks report exact totals and per-channel sizes as `ChannelSizes`: a 16-bit code
-  `1 + ceil(log_1.01(size))` per channel (within 1%, every `u64` representable), or above
-  2,000 channels a sparse form (nonempty bitmap, accurate codes for channels above twice
-  the average, one average for the rest) when it is smaller. Empty stays exactly zero.
+- Tasks report exact totals and per-channel sizes as `ChannelSizes`. Logical bytes use
+  a dense 16-bit code per channel, rounded upward within 1%, so averages cannot
+  understate a coalescing cap. Physical bytes may use a sparse form above 2,000
+  channels (nonempty bitmap, accurate codes for large channels, an average for the
+  rest) when it is smaller. Legacy sparse logical reports conservatively bound each
+  nonempty channel by the task's total. Empty stays exactly zero.
 - The driver keeps the reported form, binds statistics to the attempt the shuffle service committed,
   folds them per bucket once per producer stage and caches the fold, and releases them
   once every consumer has made its decision. Received and peak retained bytes are logged
@@ -89,8 +98,9 @@ and the Rust tests of the changed crates on its own.
 - A stage is re-planned once, just before any of its regions runs, from an immutable
   snapshot of its plan and the committed statistics of its producers. Rules are pure
   functions of the snapshot. A rewrite is validated (alignment groups, exact coverage of
-  every bucket, join modes, ordering requirements, consumer placeholders, the slot cap and
-  a codec round trip) and committed atomically with the rebuilt topology, or not at all.
+  every bucket, join modes, single-partition and ordering requirements, whole-probe
+  join boundaries, consumer placeholders, the slot cap and a codec round trip) and
+  committed atomically with the rebuilt topology, or not at all.
   The decision is frozen, so retries reuse it.
 - Rewritten inputs declare `UnknownPartitioning` to DataFusion and carry the coalesced
   hash property as Sail metadata, so no operator relies on a partitioning that is false.
@@ -98,12 +108,18 @@ and the Rust tests of the changed crates on its own.
   coalesced range: uncompressed bytes (`cluster.adaptive.coalesce.max_logical_size`) and
   the build side of every partitioned hash join in the group.
 - Join decisions: empty-input pruning, build/probe swap and hash join to sort-merge join.
-- Sizes of operator outputs come from sound bounds of the committed input sizes: exact
-  through reordering projections and sorts, an upper bound through filters, limits and
+- Sizes of operator outputs come from bounds of the committed input sizes: exact
+  through reordering projections, an upper bound through limits and
   column-dropping projections, and no bound otherwise. A swap needs an exact build size
   larger than the probe's upper bound. A sort-merge conversion needs an exact build size
   above the cap. A group whose hash-join build side has no bound is not coalesced.
+  Filters and sorts do not preserve these sizes because rebatching can repeat dictionary values.
+  Caps bound recorded logical shuffle bytes; rebatching and operator allocations
+  can change execution memory. DataFusion receives exact row counts and inexact
+  byte totals, and skew-replicated inputs receive no original exact totals.
 - User-chosen partition counts (`repartition(n, ...)`) are kept.
+- Checkpoint writer stages retain their planned partition boundaries because the
+  saved checkpoint descriptor cannot yet represent an adaptive runtime layout.
 - `EXPLAIN` notes that adaptive execution may re-plan the initial job graph, and
   `system.execution.stages` shows which stages were re-planned, by which rules, and their
   initial partition counts.
@@ -131,7 +147,8 @@ and the Rust tests of the changed crates on its own.
 
 ## Validation
 
-All results are from the final tree unless noted.
+The following results record the original stack. Follow-up validation is recorded
+separately below.
 
 | Check | Result |
 |---|---|
@@ -160,6 +177,11 @@ Celeborn did not commit are never used.
 
 ### Benchmark
 
+The table below records the original run. Its task and partition counts include
+telemetry-query jobs from the old measurement code, so the task-reduction percentages
+are not reliable. The benchmark now observes each workload from a separate session;
+a new run is required before using these counts for performance conclusions.
+
 `scripts/adaptive/benchmark.py`, release build, native Celeborn 0.6.3 with two workers,
 local-cluster mode on a 4-core machine, parallelism 200, coalesce target and skew threshold
 4 MiB, median of three runs. Results are identical with AQE off and on for every workload.
@@ -175,7 +197,6 @@ local-cluster mode on a 4-core machine, parallelism 200, coalesce target and ske
 | join with an empty side | off | 3.51 | 805 | 805 | - | 511.5 |
 | join with an empty side | on | 3.61 | 805 | 805 | empty_input | 542.8 |
 
-Where coalescing applies, AQE removes 32-38% of the tasks and 12-40% of the task time.
 Wall time changes little on one 4-core machine, where the longest task dominates. No swap fires in the third
 workload: the computed join keys come from a projection in the producer stage, and the
 static plan already builds from the smaller side.
@@ -192,7 +213,9 @@ static plan already builds from the smaller side.
 - **Statistics encoding.** The design keeps per-channel rows and one-byte log sizes with
   about 10% error. Per-channel rows were unused and doubled the volume, and one byte
   saturates above about 36 GB, so tasks report exact totals and two-byte sizes within 1%,
-  with a sparse form for many channels. The driver keeps that form instead of re-encoding.
+  with a sparse form for physical bytes on many channels. Logical bytes stay dense
+  to provide per-channel upper bounds. The driver keeps the reported form instead
+  of re-encoding.
 - **Statistics only with AQE.** The design collects statistics for observability before
   any rule ships. They are collected only when AQE is enabled on a remote shuffle service, so execution
   without AQE is unchanged.
@@ -231,6 +254,361 @@ static plan already builds from the smaller side.
   they run in CI on their pull requests.
 - **Benchmarks** ran on one 4-core machine. The manual workflow can repeat them with larger
   scales on GitHub-hosted runners.
+
+## Correctness follow-up (2026-10-17)
+
+[PR #10](https://github.com/unikdahal/sail/pull/10) follows the top of the stack
+at `0b236c9f` and fixes several issues found in repeated reviews:
+
+- A canceled Celeborn request discards its socket, so a later request cannot read
+  its partial or delayed response. Duplicate mapper completions wait for the
+  driver's commit observer before returning success.
+- Logical channel sizes are conservative upper bounds. Sparse averaging,
+  floating-point rounding and overflowing sums cannot bypass coalescing caps.
+  Stored physical bytes include the persisted batch header.
+- Skew splitting rejects volatile projections and filters, and checks its Cartesian
+  partition count before allocation. Sort rebatching no longer supplies a byte
+  bound, and joins with pushed-down dynamic filters keep their other adaptive rules.
+- Terminal jobs release attempt statistics and cached folds, including on failure;
+  late task reports cannot retain them again. Validation checks every placeholder
+  occurrence, and shuffle locators use each input's own partition domain.
+- Benchmark and test telemetry use separate observer sessions. Build covers stacked
+  PRs, configuration edits trigger Celeborn coverage, and Python CI runs the new
+  benchmark regressions.
+
+Local validation used Rust 1.99.1, Python 3.12.14 and Celeborn 0.6.3:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked -p sail-celeborn -p sail-execution --no-fail-fast` | 15 + 242 passed; doc tests passed |
+| New cancellation and commit-observer tests, 20 consecutive rounds | 60 passed |
+| `cargo clippy --locked -p sail-celeborn -p sail-execution --all-targets -- -D warnings` | passed |
+| Native extension build (`maturin develop --locked`) | passed |
+| Docker client, static shuffle and AQE integration suites | 31 passed; existing pytest configuration deprecation warning |
+| `scripts/adaptive/test_benchmark.py` | 2 passed |
+| Nightly Rust formatting, Python lint/format, actionlint, diff checks | passed |
+
+Rust checks used `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_INCREMENTAL=0` and `CARGO_BUILD_JOBS=2`. This environment's Python sysconfig
+names `/install/lib`; the linker and loader used the actual runtime library
+directory through `LIBRARY_PATH` and `LD_LIBRARY_PATH`. The mounted Celeborn config
+needed mode `0644` so the container user could read it. These were environment
+corrections, without repository configuration changes.
+
+GitHub reports the fork's Build workflow as `disabled_fork`; these results are
+local checks, not GitHub Actions results. The corrected benchmark has not been
+rerun for performance measurements.
+
+### Ordering follow-up (2026-10-17)
+
+A further review of `84b25f68` found that adapted inputs retained ordering and
+partition-local constant metadata after combining shuffle buckets. A hash shuffle
+with one sorted producer can legitimately advertise individually sorted buckets
+without its explicit preserve-order option. Coalesced remote reads interleave
+those buckets, so the old metadata could let a sort-merge join accept unsorted rows.
+
+Adapted placeholders now clear orderings and partition-local constants and refresh
+the cached output ordering. Valid column equivalences and global constants remain.
+The existing validator rejects a proposal that loses required ordering, preserving
+the original plan, task count and input specs and freezing the static decision.
+
+The real JobGraph regression failed on the original code because the unsafe
+four-to-one proposal passed validation. It now passes, along with a separate
+regression for ordering inferred from partition-local constants. Two independent
+reviews found no issues in the fix.
+
+Local checks on this follow-up: 15 Celeborn and 244 execution Rust tests passed;
+all 31 Docker integration tests passed; native build, clippy with warnings denied,
+nightly formatting and diff checks passed. After strengthening the ordering error
+assertions, all three focused coalescing tests and clippy passed again. The Docker
+suite retains the existing pytest configuration deprecation warning. GitHub Build
+is still `disabled_fork`; these are local results.
+
+### Worker cleanup and fetch-limit follow-up (2026-10-17)
+
+Fetched PR #10 and the AQE stack again before continuing from `e0c7ec67`;
+the base remained `0b236c9f`. Two further defects were reproduced and fixed:
+
+- Successful OpenStream registrations were never ended after reading. Celeborn
+  0.6.3 retains their stream state, and an active stream can pin the original
+  shuffle file while a map-range read creates a sorted replacement. The reader
+  now sends the one-way `PbBufferStreamEnd(ChunkStream)` RPC on EOF, read errors
+  and early drop. The socket is discarded if that write is interrupted. A guard
+  captures the runtime for drops outside Tokio, and cancellation during cleanup
+  leaves the stream ID armed for a best-effort retry. Cleanup does not replace
+  the original read error.
+- Finite embedded fetch limits were treated as partition-independent. Skew
+  splitting could restart a filter's limit for each slice; coalescing could apply
+  it once across several original buckets. Actual DataFusion joins demonstrate
+  one match becoming two after splitting and four matches becoming one after
+  coalescing. Alignment domains containing finite fetch limits now keep their
+  boundaries through both rules. The restriction propagates through unions;
+  independent union siblings and broadcast probe domains remain eligible.
+
+The EOF wire regression timed out on the original reader because no stream-end
+message arrived. Both filter eligibility regressions failed before their fixes;
+the unsafe coalescing proposal also passed plan validation. Nine loopback
+regressions cover normal/empty EOF, fetch and batch errors, invalid chunk counts,
+unpolled/partial drops outside Tokio and cancellation during a pending fetch.
+Planner controls cover filters on either join side and above joins, local limits,
+fetched sorts/joins, a single-bucket skew domain, unions and broadcast isolation.
+The production changes and expanded regression coverage were independently
+reviewed with no blocking findings.
+
+Latest local checks on the final code:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 24 + 250 passed; doc tests passed |
+| Nine new worker lifecycle regressions, 20 consecutive rounds | 180 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 31 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 2 passed |
+| Nightly Rust formatting and diff checks | passed |
+
+The earlier 60 repeated cancellation/commit-observer checks, Python lint/format
+and workflow lint results above remain historical validation, not fresh runs.
+The current formatting check also reformatted two assertions from the ordering
+follow-up. The fork's GitHub Build workflow is still `disabled_fork`; these are
+local checks. Performance benchmarks have not been rerun.
+
+Stream cleanup is best effort and requires a known server-generated stream ID.
+If the initial OpenStream response is lost before its ID is decoded, cleanup
+still depends on Celeborn's eventual shuffle cleanup. Normal stream-end also
+leaves Celeborn's own per-shuffle numeric ID tracking until shuffle cleanup;
+this fix releases the registered stream state and original-file pin.
+
+### Broadcast metadata and lost-shuffle reads (2026-10-18)
+
+Fetched the open stack and PR #10 again: its head was `40dad51d` and the top
+of the stack remained `0b236c9f`. This review reproduced two new issues:
+
+- A Celeborn broadcast locator repeated the same read group for every output
+  partition of its consumer, although the broadcast input has one logical
+  partition. Each task builds and serializes its own locator, causing avoidable
+  quadratic metadata growth across a wide probe stage. A real JobGraph regression
+  observed 1, 64 and 256 repeated groups, with per-task protobuf sizes of 19, 335
+  and 1,295 bytes. The locator now contains one all-channel group independent of
+  consumer width. The regression checks CollectLeft hash joins and cross joins,
+  first/last tasks and nonuniform committed-attempt round trips.
+- After a terminal global commit failure, lifecycle registration still returned
+  its cached reservation. Direct Rust/Python readers refresh locations through
+  this API, so they could read a healthy worker's output from a lost shuffle.
+  Registration now rejects the terminal Lost state before consulting its cache.
+  Successful and not-yet-terminal registration behavior is unchanged; the query
+  engine already had its own failed-commit guard.
+
+The broadcast regression failed before the fix because encoded size grew with
+probe partitions. The actor regression caused a real loopback CommitFiles failure,
+waited for mapper_end to report Lost, then reproduced the cached-reservation
+bypass. Against the previously installed native extension, the Docker regression
+also failed: a direct read completed without error after global failure. That
+regression explicitly requests two workers, observes the healthy worker's commit,
+then persistently fails partition 1's worker. Returned worker IDs alone do not
+prove primary placement because Celeborn may include workers with empty slot lists.
+Both fixes and their regressions received independent review.
+
+Fresh local validation:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 25 + 251 passed; doc tests passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 2 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+The earlier 60 and 180 repeated concurrency/lifecycle checks remain historical
+results; they were not rerun in this pass. The Docker suite retains its existing
+pytest configuration deprecation warning. GitHub Build remains `disabled_fork`;
+these checks are local. No new performance or peak-memory benchmark was run; the
+broadcast regression measures locator count and encoded size.
+
+### Cleanup draining, checkpoint layouts and validation bounds (2026-10-18)
+
+Fetched PR #10 and the open AQE stack again. PR #10 was still open at
+`21fd2903`, and `aqe/5-ci-and-benchmark` remained `0b236c9f`.
+This pass reproduced and fixed four further defects:
+
+- Unregister could finish while registration, revival or commit callbacks were
+  still in flight. A delayed callback could restore cleared reservations or
+  locations, or recreate resources after master cleanup. Both lifecycle and
+  shuffle-client actors now close the ID to new work, drain tracked callbacks,
+  coalesce duplicate cleanup requests, and then finish cleanup. Lifecycle callers
+  waiting on cancelled work fail promptly. All workers' commits are awaited even
+  if one fails; a failed unregister keeps the ID closed until an explicit retry
+  succeeds. Local-only cleanup remains local, and successful cleanup allows ID
+  reuse. A bounded lookup revision prevents delayed ID lookups from restoring
+  local caches without retaining per-ID tombstones or discarding unrelated
+  lookup results.
+- AQE could split a hot hash bucket into three mapper slices and coalesce the
+  other buckets, retaining four tasks while changing key boundaries. The
+  checkpoint commit stage only reconciles the partition count, so it saved a
+  false `Hash(..., 4)` descriptor. A real JobGraph regression reproduced this
+  count-preserving rewrite; a DataFusion checkpoint readback join produced at
+  most one of three matches when trusting that descriptor. Checkpoint writer
+  stages now retain their planned layout until checkpoint metadata can carry the
+  actual runtime distribution.
+- An unlimited, all-pass FilterExec can rebatch dictionary arrays and repeat
+  dictionary values. The real operator regression preserves all 103 rows while
+  increasing recorded logical bytes by more than three times, invalidating its
+  assumed upper byte bound. Filters now have no such bound, so size-dependent
+  coalescing and join decisions fall back conservatively. Column-dropping
+  projections remain covered by positive upper-bound controls.
+- The benchmark compared only warmup results and discarded the timed results,
+  allowing incorrect measured runs to report parity and exit successfully.
+  Every timed result is now compared to its mode's warmup after stopping the
+  timer. A mismatch persists even if a later repetition is correct. Regressions
+  reproduce false success in either mode and retain an order-insensitive passing
+  control.
+
+The lifecycle registration regression and both original client drain regressions
+failed before the cleanup changes. Eleven new controlled race tests cover
+registration, revival, commits, the observer boundary, read refresh, push revival,
+lookup caching, duplicate cleanup, failure/retry and ID reuse. The corrected
+filter-bound regression failed against the old Upper classification, and the
+checkpoint regression failed against the old accepted rewrite. The benchmark
+regressions failed with false parity before the fix. The changes received
+independent review; a detached read-reply boundary race and failed-cleanup
+reopening were corrected during that review.
+
+Fresh local validation:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 36 + 256 passed; doc tests passed |
+| Eleven new cleanup regressions, 20 consecutive rounds | 220 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 5 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+The earlier 60 and 180 repeated concurrency/lifecycle results remain historical;
+the 220 checks above exercise this pass's new cleanup regressions. GitHub Build
+was freshly checked and remains `disabled_fork`; these results are local.
+Performance and peak-memory benchmarks have not been rerun. The cleanup drain
+covers tracked operations before acknowledgement; actor shutdown and revocation
+of already-delivered lazy read streams are outside this change. Cleanup progress
+still depends on in-flight operations completing, including the documented
+nonblocking commit-observer contract.
+
+### Global-sort skew safety and in-flight revival (2026-10-19)
+
+Fetched PR #10 and the open stack again: the follow-up was still open at
+`d0e03330`, with `aqe/5-ci-and-benchmark` still at `0b236c9f`.
+Two new defects were reproduced before production changes:
+
+- Skew splitting accepted unlimited global SortExec nodes. A global sort keeps
+  one output partition and reads input partition 0; splitting below it left
+  later slices unread. With a supported one-bucket configuration and
+  `skew_factor=0.5`, the real scheduler accepted this layout. An executable
+  DataFusion join returned one match instead of two. Global sorts now prevent
+  splitting, and rewrite validation enforces every SinglePartition input
+  requirement. Unlimited partition-preserving sorts remain eligible. Controls
+  cover hash and sort-merge joins, either/both sorted sides, actual row counts,
+  and the real JobGraph's static fallback.
+- Final mapper completion could snapshot worker locations while an already
+  accepted revive was still reserving a replacement epoch. The late callback
+  then exposed an epoch omitted from CommitFiles after global success. Mapper
+  selection now freezes while pending revivals drain; the commit snapshots all
+  completed replacements and retains the original selected attempts. New
+  revivals are rejected after selection freezes. Duplicate mapper completions
+  wait for the same outcome, failed revival still advances the commit, and
+  unregister cancels the wait without starting a commit or hanging cleanup.
+
+All six new regressions failed against the fetched head while the existing
+36 Celeborn and 256 execution tests passed. Three lifecycle regressions use a
+scripted master and two loopback worker endpoints, holding the replacement's
+ReserveSlots response so connection serialization cannot mask the race. They
+verify exact committed epoch IDs and attempts, failure handling and cancellation.
+The lifecycle issue is a commit-boundary reliability defect: the wire tests
+establish the missing revival barrier, and code review identified the later
+publication of an uncommitted epoch. Silent loss of selected rows was not
+demonstrated. Both fixes received independent review with no blocking findings.
+
+Fresh local validation:
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 39 + 259 passed; doc tests passed |
+| Fourteen cleanup/revive/commit regressions, 20 consecutive rounds | 280 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 5 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+Earlier 60, 180 and 220 repeated-test results remain historical; the 280 checks
+above are fresh and include this pass's three lifecycle regressions. GitHub Build
+was checked again and remains `disabled_fork`; these are local results.
+Performance and peak-memory benchmarks have not been rerun.
+
+### Shutdown, worker connections and whole-probe joins (2026-10-21–22)
+
+Fetched the open stack and PR #10 again before review and after resuming.
+The follow-up remained open at `c6de67f4`, and the stack top remained
+`0b236c9f`. This review reproduced three further defects:
+
+- Actor Stop bypassed the per-shuffle drain barriers. It could acknowledge
+  shutdown while registration, revival, commit or observer work still ran, then
+  abort callbacks or allow worker allocation to overtake cleanup. Both actors
+  now reject new work, coalesce accepted Stop callers and drain tracked work
+  before acknowledging. Lifecycle Stop attempts cleanup for every accepted
+  allocation ID, including an explicit ID whose registration already failed
+  after reserving resources. Client Stop remains local to its shared lifecycle
+  manager. Controls cover lookups, commit/observer ordering, duplicate Stop,
+  cleanup failures and rejected work after shutdown begins.
+- Worker pools retained strong clients and their RPC/push/fetch sockets for every
+  historical worker until actor destruction. Shuffle cleanup now evicts clients
+  for workers absent from remaining live location histories/reservations;
+  partial reservation errors also release unused cache entries. An actual TCP
+  regression keeps one worker connection shared by two shuffles, proves the
+  first cleanup preserves reuse, and observes EOF after the last cleanup.
+  Existing clients/readers retain their own transport references. Independent
+  later jobs may reconnect; no performance or peak-memory benchmark was run.
+- Skew splitting beneath joins that need the whole probe side could expand an
+  initially valid single-task stage. Build-match bitmaps and probe completion
+  counters are local to each deserialized plan, so independently executed task
+  partitions cannot coordinate final build-side output. The real JobGraph
+  accepted a one-to-four rewrite, and executable isolated tasks lost an unmatched
+  build row (one static row became zero). The regression covers nested-loop
+  left anti and null-aware CollectLeft hash joins. Skew traversal now preserves
+  whole-probe boundaries, and validation checks the same requirement. Controls
+  cover other build-output join types, independent inner/right probe joins and
+  PiecewiseMergeJoin's left/full validation requirements.
+
+The first six shutdown regressions and the idle-worker TCP regression all failed
+before the fixes while all 39 existing Celeborn tests passed. Three new AQE
+regressions failed against the old rules/validator while all 259 existing
+execution tests passed. Additional controls cover failed explicit allocation,
+remote cleanup failure, lookup completion, existing-client ownership and
+piecewise merge joins. Loopback fixtures were strengthened to observe socket EOF
+and accept a fresh RPC connection when an ID is reused after cleanup. The fixes
+received independent review with no blocking findings.
+
+Validation for the final source (Rust/native/Python checks on October 21,
+Docker integration on October 22):
+
+| Check | Result |
+|---|---|
+| Rust Celeborn and execution suites | 51 + 263 passed; doc tests passed |
+| Twenty-five cleanup/shutdown/commit regressions, 20 consecutive rounds | 500 passed |
+| Clippy, all targets, warnings denied | passed |
+| Native extension build | passed |
+| Docker client, static shuffle and AQE integration suites | 32 passed; existing pytest configuration deprecation warning |
+| Benchmark unit tests | 5 passed |
+| Full Python lint/format, nightly Rust formatting and diff checks | passed |
+
+Earlier repeated-test totals remain historical; the 500 checks above exercise
+the current cleanup and shutdown code. GitHub Build was checked again and remains
+`disabled_fork`; these are local results. The previous shutdown exclusion is now
+closed for tracked actor operations. Already-delivered lazy read streams remain
+externally owned and are not revoked. Lifecycle Stop retains its best-effort
+`()` API: remote unregister failures are logged, and eventual server cleanup may
+still be needed. Performance and peak-memory benchmarks have not been rerun.
 
 ## Remaining work
 
