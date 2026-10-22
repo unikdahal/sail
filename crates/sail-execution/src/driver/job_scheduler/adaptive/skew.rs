@@ -27,7 +27,9 @@ use datafusion::physical_expr::{Distribution, PhysicalExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion::physical_plan::joins::{
+    HashJoinExec, NestedLoopJoinExec, PartitionMode, PiecewiseMergeJoinExec, SortMergeJoinExec,
+};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 
@@ -69,6 +71,34 @@ pub(crate) fn skew_joins(plan: &Arc<dyn ExecutionPlan>) -> Vec<SkewJoin> {
     result
 }
 
+/// These joins share build-match or NULL/empty-probe state between probe
+/// partitions in one process. Independently deserialized tasks cannot share it.
+pub(super) fn requires_single_probe(node: &Arc<dyn ExecutionPlan>) -> bool {
+    let join_type = if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+        if join.mode != PartitionMode::CollectLeft {
+            return false;
+        }
+        if join.null_aware {
+            return true;
+        }
+        join.join_type
+    } else if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>() {
+        *join.join_type()
+    } else if let Some(join) = node.downcast_ref::<PiecewiseMergeJoinExec>() {
+        join.join_type()
+    } else {
+        return false;
+    };
+    matches!(
+        join_type,
+        JoinType::Left
+            | JoinType::LeftSemi
+            | JoinType::LeftAnti
+            | JoinType::LeftMark
+            | JoinType::Full
+    )
+}
+
 fn walk(node: &Arc<dyn ExecutionPlan>, safe: bool, result: &mut Vec<SkewJoin>) {
     if safe && let Some(join) = candidate(node) {
         result.push(join);
@@ -81,7 +111,10 @@ fn walk(node: &Arc<dyn ExecutionPlan>, safe: bool, result: &mut Vec<SkewJoin>) {
             requirements.child_distribution(i),
             None | Some(Distribution::UnspecifiedDistribution)
         );
-        walk(child, safe && unspecified, result);
+        // DataFusion permits multiple probe partitions because its local tasks
+        // share state. Sail must preserve the planner's whole-probe task here.
+        let whole_probe = i == 1 && requires_single_probe(node);
+        walk(child, safe && unspecified && !whole_probe, result);
     }
 }
 

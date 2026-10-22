@@ -1835,3 +1835,278 @@ async fn single_partition_sort_validation_prevents_skew_slices_from_losing_join_
     assert!(error.contains("SortExec"), "{error}");
     assert!(error.contains("single partition"), "{error}");
 }
+
+#[test]
+fn piecewise_build_output_requires_single_probe_partition() {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::joins::PiecewiseMergeJoinExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    for join_type in [
+        JoinType::Inner,
+        JoinType::Right,
+        JoinType::Left,
+        JoinType::Full,
+    ] {
+        let left = Arc::new(
+            SortExec::new(
+                LexOrdering::new([PhysicalSortExpr::new_default(key())]).unwrap(),
+                placeholder(0, 1),
+            )
+            .with_preserve_partitioning(true),
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            PiecewiseMergeJoinExec::try_new(
+                left,
+                placeholder(1, 2),
+                (key(), key()),
+                Operator::Gt,
+                join_type,
+                2,
+            )
+            .unwrap(),
+        );
+        let result = validate::validate_plan(&plan);
+        if matches!(join_type, JoinType::Left | JoinType::Full) {
+            assert!(result.unwrap_err().contains("probe"));
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+fn whole_probe_join(
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    join_type: JoinType,
+    null_aware: bool,
+) -> Arc<dyn ExecutionPlan> {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::JoinSide;
+    use datafusion::physical_plan::joins::NestedLoopJoinExec;
+    use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+
+    if null_aware {
+        return Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                vec![(key(), key())],
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true,
+            )
+            .unwrap(),
+        );
+    }
+    // A real non-equi predicate, rather than a constant false expression that a
+    // logical optimizer could eliminate before building this physical plan.
+    let filter = JoinFilter::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("build", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("probe", 1)),
+        )),
+        vec![
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+        ],
+        Arc::new(Schema::new(vec![
+            Field::new("build", DataType::Int64, true),
+            Field::new("probe", DataType::Int64, true),
+        ])),
+    );
+    Arc::new(NestedLoopJoinExec::try_new(left, right, Some(filter), &join_type, None).unwrap())
+}
+
+#[test]
+fn nested_whole_probe_joins_keep_single_partition_skew_domains() {
+    for null_aware in [false, true] {
+        let types = if null_aware {
+            vec![JoinType::LeftAnti]
+        } else {
+            vec![
+                JoinType::Left,
+                JoinType::LeftSemi,
+                JoinType::LeftAnti,
+                JoinType::LeftMark,
+                JoinType::Full,
+                JoinType::Inner,
+                JoinType::Right,
+                JoinType::RightSemi,
+                JoinType::RightAnti,
+            ]
+        };
+        for join_type in types {
+            let nested = hash_join(
+                placeholder(0, 1),
+                placeholder(1, 1),
+                PartitionMode::Partitioned,
+                JoinType::Inner,
+            );
+            let plan = whole_probe_join(broadcast_placeholder(2), nested, join_type, null_aware);
+            validate::validate_plan(&plan).unwrap();
+            let mut view = skew_view(
+                plan,
+                vec![
+                    producer_input(&[vec![100], vec![100]]),
+                    producer_input(&[vec![100], vec![100]]),
+                    broadcast_input(statistics(&[100])),
+                ],
+            );
+            view.options.coalesce_enabled = false;
+            view.options.skew_factor = 0.5;
+            view.options.skew_threshold = 1;
+            view.options.coalesce_target_size = 1;
+            let rewritten = adapt(&view).unwrap();
+            let whole_probe = null_aware
+                || matches!(
+                    join_type,
+                    JoinType::Left
+                        | JoinType::LeftSemi
+                        | JoinType::LeftAnti
+                        | JoinType::LeftMark
+                        | JoinType::Full
+                );
+            if whole_probe {
+                assert!(
+                    rewritten.is_none(),
+                    "{join_type:?}, null-aware={null_aware}"
+                );
+            } else {
+                let rewritten = rewritten.expect("independent probe partitions remain splittable");
+                assert_eq!(count(&rewritten.plan), 4);
+                check_specs(&rewritten, &view, &[0, 1]);
+                validate::validate_plan(&rewritten.plan).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_whole_probe_joins_keep_the_static_job_graph() {
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+    for null_aware in [false, true] {
+        let side = || {
+            let source =
+                MemorySourceConfig::try_new_exec(&[vec![], vec![]], schema(), None).unwrap();
+            Arc::new(RepartitionExec::try_new(source, Partitioning::Hash(vec![key()], 1)).unwrap())
+                as Arc<dyn ExecutionPlan>
+        };
+        let build = MemorySourceConfig::try_new_exec(&[vec![]], schema(), None).unwrap();
+        let build = Arc::new(CoalescePartitionsExec::new(build));
+        let nested = hash_join(side(), side(), PartitionMode::Partitioned, JoinType::Inner);
+        let graph = JobGraph::try_new(
+            whole_probe_join(build, nested, JoinType::LeftAnti, null_aware),
+            JobGraphOptions {
+                shuffle_backend: remote_shuffle_service(),
+            },
+        )
+        .unwrap();
+        let mut job = job(graph);
+        assert_eq!(job.graph.stages().len(), 4);
+        assert_eq!(count(&job.graph.stages()[3].plan), 1);
+        for producer in 0..3 {
+            succeed(&mut job, producer, |_| ChannelCounts {
+                rows: vec![1],
+                physical_bytes: Some(vec![100]),
+                logical_bytes: vec![100],
+            });
+            commit(&mut job, producer);
+        }
+        let mut adaptive = options();
+        adaptive.join_enabled = false;
+        adaptive.coalesce_enabled = false;
+        adaptive.skew_factor = 0.5;
+        adaptive.skew_threshold = 1;
+        adaptive.coalesce_target_size = 1;
+        let options = JobSchedulerOptions::new_for_test(remote_shuffle_service(), adaptive, None);
+        let before = job.graph.to_string();
+        assert!(
+            !adapt_job(&mut job, &options),
+            "whole-probe stage expanded, null-aware={null_aware}"
+        );
+        assert_eq!(job.graph.to_string(), before);
+        assert_eq!(job.stages[3].tasks.len(), 1);
+        assert_eq!(job.stages[3].adaptive, AdaptiveDecision::Static);
+        assert!(
+            job.graph.stages()[3]
+                .inputs
+                .iter()
+                .all(|input| input.adaptive.is_none())
+        );
+    }
+}
+
+#[tokio::test]
+async fn isolated_whole_probe_join_tasks_lose_unmatched_build_rows() {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::execution::TaskContext;
+    use futures::StreamExt;
+
+    let row = |k| {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![k])),
+                Arc::new(Int64Array::from(vec![k * 10])),
+            ],
+        )
+        .unwrap()
+    };
+    let join = |left: Vec<Vec<RecordBatch>>, right: Vec<Vec<RecordBatch>>, null_aware| {
+        let left = MemorySourceConfig::try_new_exec(&left, schema(), None).unwrap();
+        let right = MemorySourceConfig::try_new_exec(&right, schema(), None).unwrap();
+        let probe = hash_join(left, right, PartitionMode::Partitioned, JoinType::Inner);
+        let build = MemorySourceConfig::try_new_exec(&[vec![row(0)]], schema(), None).unwrap();
+        whole_probe_join(build, probe, JoinType::LeftAnti, null_aware)
+    };
+    let sliced_left = vec![vec![row(1)], vec![row(1)], vec![row(2)], vec![row(2)]];
+    let sliced_right = vec![vec![row(1)], vec![row(2)], vec![row(1)], vec![row(2)]];
+    for null_aware in [false, true] {
+        let static_plan = join(
+            vec![vec![row(1), row(2)]],
+            vec![vec![row(1), row(2)]],
+            null_aware,
+        );
+        validate::validate_plan(&static_plan).unwrap();
+        let batches =
+            datafusion::physical_plan::collect(static_plan, Arc::new(TaskContext::default()))
+                .await
+                .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        // Distributed tasks deserialize independent plans and execute only their
+        // own partition. They cannot share the build bitmap/probe completion
+        // counter that makes a multi-partition join correct on one process.
+        let mut rows = 0;
+        for partition in 0..4 {
+            let plan = join(sliced_left.clone(), sliced_right.clone(), null_aware);
+            let mut stream = plan
+                .execute(partition, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
+        }
+        assert_eq!(
+            rows, 0,
+            "unmatched build row disappeared, null-aware={null_aware}"
+        );
+        let unsafe_plan = join(sliced_left.clone(), sliced_right.clone(), null_aware);
+        let error = validate::validate_plan(&unsafe_plan)
+            .expect_err("distributed build-side output requires the whole probe in one task");
+        assert!(error.contains("probe"), "{error}");
+    }
+}

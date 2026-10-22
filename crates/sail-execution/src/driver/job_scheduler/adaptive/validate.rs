@@ -18,6 +18,7 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use prost::Message;
 
+use crate::driver::job_scheduler::adaptive::skew::requires_single_probe;
 use crate::driver::job_scheduler::adaptive::spec::{SpecInput, check_group};
 use crate::driver::job_scheduler::topology::JobTopology;
 use crate::job_graph::{BucketLayout, InputMode, JobGraph, TaskPlacement};
@@ -141,6 +142,12 @@ fn validate_node(node: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
         return Err("symmetric hash join has unequal input partitions".to_string());
     }
     let children = node.children();
+    if requires_single_probe(node) && children.get(1).is_none_or(|probe| count(probe) != 1) {
+        return Err(format!(
+            "{} requires the whole probe in one partition for distributed execution",
+            node.name()
+        ));
+    }
     let distribution = node.input_distribution_requirements();
     for (i, child) in children.iter().enumerate() {
         if matches!(
