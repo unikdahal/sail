@@ -26,6 +26,9 @@ impl LifecycleManagerActor {
     }
 
     pub(super) fn handle_heartbeat(&mut self, ctx: &mut ActorContext<Self>) -> ActorAction {
+        if self.stopping {
+            return ActorAction::Continue;
+        }
         ctx.send_with_delay(
             LifecycleManagerMessage::Heartbeat,
             self.options.heartbeat_interval,
@@ -65,6 +68,10 @@ impl LifecycleManagerActor {
         stage: u64,
         reply: oneshot::Sender<CelebornResult<i32>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         let key = ShuffleKey { job_id, stage };
         let id = match self.shuffle_ids.get(&key) {
             Some(id) => Ok(*id),
@@ -109,6 +116,10 @@ impl LifecycleManagerActor {
         max_workers: i32,
         reply: oneshot::Sender<CelebornResult<SlotReservation>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         if self.pending_unregisters.contains_key(&shuffle_id) {
             let _ = reply.send(Err(unregistering(shuffle_id)));
             return ActorAction::Continue;
@@ -136,6 +147,7 @@ impl LifecycleManagerActor {
             }
             return ActorAction::Continue;
         }
+        self.requested_shuffles.insert(shuffle_id);
         let client = self.client.clone();
         let application_id = self.options.application_id.clone();
         let hostname = self.options.hostname.clone();
@@ -221,6 +233,7 @@ impl LifecycleManagerActor {
             for reply in replies {
                 let _ = reply.send(Err(CelebornError::Application(error.to_string())));
             }
+            self.retain_worker_clients();
         }
         ActorAction::Continue
     }
@@ -231,6 +244,10 @@ impl LifecycleManagerActor {
         request: ReviveRequest,
         reply: oneshot::Sender<CelebornResult<PartitionLocation>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         if self.pending_unregisters.contains_key(&request.shuffle_id) {
             let _ = reply.send(Err(unregistering(request.shuffle_id)));
             return ActorAction::Continue;
@@ -373,6 +390,7 @@ impl LifecycleManagerActor {
                     for reply in replies {
                         let _ = reply.send(Err(CelebornError::Application(error.to_string())));
                     }
+                    self.retain_worker_clients();
                     self.advance_commit(ctx, shuffle_id);
                     return ActorAction::Continue;
                 };
@@ -392,6 +410,7 @@ impl LifecycleManagerActor {
                     for reply in replies {
                         let _ = reply.send(Err(CelebornError::Application(error.to_string())));
                     }
+                    self.retain_worker_clients();
                     self.advance_commit(ctx, shuffle_id);
                     return ActorAction::Continue;
                 };
@@ -416,6 +435,7 @@ impl LifecycleManagerActor {
                 for reply in replies {
                     let _ = reply.send(Err(CelebornError::Application(error.to_string())));
                 }
+                self.retain_worker_clients();
             }
         }
         self.advance_commit(ctx, shuffle_id);
@@ -431,6 +451,10 @@ impl LifecycleManagerActor {
         num_mappers: i32,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         if self.pending_unregisters.contains_key(&shuffle_id) {
             let _ = reply.send(Err(unregistering(shuffle_id)));
             return ActorAction::Continue;
@@ -723,6 +747,19 @@ impl LifecycleManagerActor {
         shuffle_id: i32,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
+        self.begin_unregister_shuffle(ctx, shuffle_id, reply)
+    }
+
+    fn begin_unregister_shuffle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        shuffle_id: i32,
+        reply: oneshot::Sender<CelebornResult<()>>,
+    ) -> ActorAction {
         if let Some(pending) = self.pending_unregisters.get_mut(&shuffle_id) {
             pending.waiters.push(reply);
             self.advance_unregister(ctx, shuffle_id);
@@ -814,9 +851,18 @@ impl LifecycleManagerActor {
             if let Some(key) = self.shuffle_keys.remove(&shuffle_id) {
                 self.shuffle_ids.remove(&key);
             }
+            self.requested_shuffles.remove(&shuffle_id);
             self.registered_shuffles.remove(&shuffle_id);
             self.reservations.remove(&shuffle_id);
             self.shuffle_commits.remove(&shuffle_id);
+            self.retain_worker_clients();
+        }
+        if self.stop_pending_shuffles.remove(&shuffle_id)
+            && let Err(error) = &result
+        {
+            // Stop has a best-effort () API. Drain the request even on failure,
+            // log it, and let actor destruction release the remaining local state.
+            warn!("failed to unregister Celeborn shuffle {shuffle_id} while stopping: {error}");
         }
         let error = result.err().map(|error| error.to_string());
         for waiter in waiters {
@@ -833,26 +879,75 @@ impl LifecycleManagerActor {
         ctx: &mut ActorContext<Self>,
         result: oneshot::Sender<()>,
     ) -> ActorAction {
-        let client = self.client.clone();
-        let application_id = self.options.application_id.clone();
-        let shuffle_ids = self.registered_shuffles.keys().copied().collect::<Vec<_>>();
-        let handle = ctx.handle().clone();
-        ctx.spawn(async move {
-            for shuffle_id in shuffle_ids {
-                if let Err(error) = client
-                    .unregister_shuffle(application_id.clone(), shuffle_id)
-                    .await
-                {
-                    warn!(
-                        "failed to unregister Celeborn shuffle {shuffle_id} while stopping: {error}"
-                    );
-                }
-            }
-            let _ = handle
-                .send(LifecycleManagerMessage::StopComplete { result })
-                .await;
-        });
+        self.stop_waiters.push(result);
+        if self.stopping {
+            return ActorAction::Continue;
+        }
+        self.stopping = true;
+        // start() completes before messages are received. If application
+        // registration failed, no resource-creating requests could be accepted.
+        if self.application_registration.error().is_some() {
+            return ActorAction::Continue;
+        }
+        // Initial registration may still be awaiting ReserveSlots, and explicit
+        // IDs need not occur in shuffle_ids. Include every source of live state.
+        self.stop_pending_shuffles
+            .extend(self.requested_shuffles.iter().copied());
+        self.stop_pending_shuffles
+            .extend(self.registered_shuffles.keys().copied());
+        self.stop_pending_shuffles
+            .extend(self.reservations.keys().copied());
+        self.stop_pending_shuffles
+            .extend(self.pending_slot_requests.keys().copied());
+        self.stop_pending_shuffles
+            .extend(self.pending_revives.keys().map(|(id, _)| *id));
+        self.stop_pending_shuffles
+            .extend(self.shuffle_commits.keys().copied());
+        self.stop_pending_shuffles
+            .extend(self.pending_unregisters.keys().copied());
+        self.stop_pending_shuffles
+            .extend(self.shuffle_ids.values().copied());
+        for shuffle_id in self.stop_pending_shuffles.clone() {
+            let (reply, receiver) = oneshot::channel();
+            drop(receiver);
+            // Reuse the same close/drain barrier as explicit unregister, and
+            // coalesce with a request already in progress. Completion is tracked
+            // by stop_pending_shuffles rather than the discarded caller reply.
+            self.begin_unregister_shuffle(ctx, shuffle_id, reply);
+        }
         ActorAction::Continue
+    }
+
+    pub(super) fn maybe_finish_stop(&mut self) -> ActorAction {
+        if !self.stopping
+            || !self.stop_pending_shuffles.is_empty()
+            || self.heartbeat_metrics.is_some()
+        {
+            return ActorAction::Continue;
+        }
+        for waiter in self.stop_waiters.drain(..) {
+            let _ = waiter.send(());
+        }
+        ActorAction::Stop
+    }
+
+    fn retain_worker_clients(&self) {
+        let workers = self.registered_shuffles.values().chain(
+            self.reservations
+                .values()
+                .map(|reservation| &reservation.worker_locations),
+        );
+        self.worker_clients.retain_workers(
+            workers
+                .flat_map(|workers| workers.values())
+                .flat_map(|locations| {
+                    locations
+                        .primary_locations
+                        .iter()
+                        .chain(&locations.replica_locations)
+                })
+                .map(PartitionLocation::worker_identity),
+        );
     }
 
     pub(super) fn user_identifier(&self) -> UserIdentifier {
@@ -1373,21 +1468,46 @@ mod tests {
 
     #[tokio::test]
     async fn unregister_cancels_pending_registration_without_resurrecting_reservation() {
-        check_unregister_drains_reservation(false, false).await;
+        check_unregister_drains_reservation(false, false, false, false).await;
     }
 
     #[tokio::test]
     async fn unregister_drains_pending_revive_before_cleanup_and_id_reuse() {
-        check_unregister_drains_reservation(true, false).await;
+        check_unregister_drains_reservation(true, false, false, false).await;
     }
 
     #[tokio::test]
     async fn failed_unregister_keeps_shuffle_closed_until_cleanup_is_retried() {
-        check_unregister_drains_reservation(true, true).await;
+        check_unregister_drains_reservation(true, true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_drains_pending_registration_before_master_cleanup() {
+        check_unregister_drains_reservation(false, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_drains_pending_revive_before_master_cleanup() {
+        check_unregister_drains_reservation(true, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_finishes_after_remote_cleanup_failure() {
+        check_unregister_drains_reservation(true, true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_cleans_failed_explicit_registration_allocations() {
+        check_unregister_drains_reservation(false, false, true, true).await;
     }
 
     #[expect(clippy::panic)]
-    async fn check_unregister_drains_reservation(reviving: bool, fail_cleanup: bool) {
+    async fn check_unregister_drains_reservation(
+        reviving: bool,
+        fail_cleanup: bool,
+        stopping: bool,
+        fail_registration: bool,
+    ) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let master_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let worker_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1468,7 +1588,17 @@ mod tests {
                 reserve_started.send(()).unwrap();
                 resume.await.unwrap();
                 reply_control(&mut socket, request_id, MessageType::ReserveSlotsResponse,
-                    PbReserveSlotsResponse::default().encode_to_vec()).await;
+                    PbReserveSlotsResponse {
+                        status: if fail_registration { crate::protocol::StatusCode::RequestFailed as i32 } else { 0 },
+                        ..Default::default()
+                    }.encode_to_vec()).await;
+                if stopping {
+                    return;
+                }
+                // Successful cleanup releases the lifecycle pool's last worker
+                // lease. Reusing the explicit ID must reserve on a new socket.
+                assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
+                let (mut socket, _) = worker_listener.accept().await.unwrap();
                 let (request_id, request) = read_control_request(&mut socket).await;
                 assert_eq!(request.message_type, MessageType::ReserveSlots);
                 reply_control(&mut socket, request_id, MessageType::ReserveSlotsResponse,
@@ -1502,6 +1632,52 @@ mod tests {
                 registration = Some(pending);
             }
             started.await.unwrap();
+            if fail_registration {
+                release_reserve.send(()).unwrap();
+                assert!(registration.take().unwrap().await.unwrap().is_err());
+                // This explicit ID had no get_shuffle_id mapping and the failed
+                // callback has already left pending_slot_requests.
+                manager.stop().await.unwrap();
+                system.join().await;
+                worker.await.unwrap();
+                assert_eq!(unregisters.load(Ordering::SeqCst), 1,
+                    "stop lost a failed explicit registration's allocated slots");
+                master.abort();
+                return;
+            }
+            if stopping {
+                let (result, mut first_stop) = oneshot::channel();
+                assert!(handle.send(LifecycleManagerMessage::Stop { result }).await.is_ok());
+                let (result, mut second_stop) = oneshot::channel();
+                assert!(handle.send(LifecycleManagerMessage::Stop { result }).await.is_ok());
+                assert!(tokio::time::timeout(Duration::from_millis(100), &mut first_stop).await.is_err(),
+                    "stop acknowledged before the delayed reservation finished");
+                assert!(matches!(second_stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+                assert_eq!(unregisters.load(Ordering::SeqCst), 0,
+                    "stop cleanup overtook a delayed reservation");
+                if let Some(pending) = registration.as_mut() {
+                    assert!(matches!(pending.try_recv(), Ok(Err(_))),
+                        "stop must fail pending registration callers");
+                }
+                if let Some(pending) = revive.as_mut() {
+                    assert!(matches!(pending.try_recv(), Ok(Err(_))),
+                        "stop must fail pending revive callers");
+                }
+                assert!(manager.register_shuffle(2, vec![0], false, 1).await.is_err(),
+                    "stop must reject a new shuffle ID");
+                assert!(manager.mapper_end(1, 0, 0, 1).await.is_err());
+                assert!(manager.unregister_shuffle(2).await.is_err(),
+                    "stop must reject new external cleanup requests");
+                release_reserve.send(()).unwrap();
+                first_stop.await.unwrap();
+                second_stop.await.unwrap();
+                system.join().await;
+                worker.await.unwrap();
+                assert_eq!(unregisters.load(Ordering::SeqCst), 1,
+                    "stop must clean even a pending initial registration exactly once");
+                master.abort();
+                return;
+            }
             // Registration is still waiting on the worker. Both unregister
             // callers must wait until it drains, while new operations fail.
             let (result, mut first_unregister) = oneshot::channel();
@@ -1569,21 +1745,31 @@ mod tests {
 
     #[tokio::test]
     async fn unregister_drains_worker_commit_before_master_cleanup() {
-        check_unregister_drains_commit(false, false).await;
+        check_unregister_drains_commit(false, false, false).await;
     }
 
     #[tokio::test]
     async fn unregister_drains_commit_observer_before_master_cleanup() {
-        check_unregister_drains_commit(true, false).await;
+        check_unregister_drains_commit(true, false, false).await;
     }
 
     #[tokio::test]
     async fn unregister_drains_other_worker_commits_after_one_worker_fails() {
-        check_unregister_drains_commit(false, true).await;
+        check_unregister_drains_commit(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_drains_worker_commit_before_master_cleanup() {
+        check_unregister_drains_commit(false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn stop_drains_commit_observer_before_master_cleanup() {
+        check_unregister_drains_commit(true, false, true).await;
     }
 
     #[expect(clippy::panic)]
-    async fn check_unregister_drains_commit(reporting: bool, failing_worker: bool) {
+    async fn check_unregister_drains_commit(reporting: bool, failing_worker: bool, stopping: bool) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let master_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let worker_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1743,6 +1929,38 @@ mod tests {
             }
             if reporting {
                 observer.started.notified().await;
+            }
+            if stopping {
+                let (result, mut stopped) = oneshot::channel();
+                assert!(
+                    handle
+                        .send(LifecycleManagerMessage::Stop { result })
+                        .await
+                        .is_ok()
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut stopped)
+                        .await
+                        .is_err(),
+                    "stop acknowledged before the active commit/report drained"
+                );
+                assert!(matches!(mapper.try_recv(), Ok(Err(_))));
+                assert_eq!(
+                    unregisters.load(Ordering::SeqCst),
+                    0,
+                    "stop cleanup overtook an active commit/report"
+                );
+                if reporting {
+                    observer.resume.notify_one();
+                } else {
+                    release_commit.send(()).unwrap();
+                }
+                stopped.await.unwrap();
+                system.join().await;
+                assert_eq!(unregisters.load(Ordering::SeqCst), 1);
+                worker.await.unwrap();
+                master.abort();
+                return;
             }
             let (result, mut cleanup) = oneshot::channel();
             assert!(

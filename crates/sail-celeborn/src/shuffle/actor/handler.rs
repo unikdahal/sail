@@ -25,8 +25,12 @@ impl ShuffleClientActor {
         stage: u64,
         reply: oneshot::Sender<CelebornResult<i32>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         if let Some(&shuffle_id) = self.shuffle_ids.get(&(job_id, stage)) {
-            let result = if self.pending_closes.contains_key(&shuffle_id) {
+            let result = if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
                 Err(closing(shuffle_id))
             } else {
                 Ok(shuffle_id)
@@ -34,6 +38,7 @@ impl ShuffleClientActor {
             let _ = reply.send(result);
             return ActorAction::Continue;
         }
+        self.pending_lookups += 1;
         let lifecycle_manager = Arc::clone(&self.options.lifecycle_manager);
         let revision = self.lookup_revision;
         let handle = ctx.handle().clone();
@@ -60,8 +65,13 @@ impl ShuffleClientActor {
         result: CelebornResult<i32>,
         reply: oneshot::Sender<CelebornResult<i32>>,
     ) -> ActorAction {
+        self.pending_lookups -= 1;
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         if let Ok(shuffle_id) = result {
-            if self.pending_closes.contains_key(&shuffle_id) {
+            if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
                 let _ = reply.send(Err(closing(shuffle_id)));
             } else {
                 if revision == self.lookup_revision {
@@ -81,6 +91,11 @@ impl ShuffleClientActor {
         job_id: u64,
         reply: oneshot::Sender<CelebornResult<Vec<(u64, i32)>>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
+        self.pending_lookups += 1;
         let lifecycle_manager = Arc::clone(&self.options.lifecycle_manager);
         let revision = self.lookup_revision;
         let handle = ctx.handle().clone();
@@ -105,6 +120,11 @@ impl ShuffleClientActor {
         result: CelebornResult<Vec<(u64, i32)>>,
         reply: oneshot::Sender<CelebornResult<Vec<(u64, i32)>>>,
     ) -> ActorAction {
+        self.pending_lookups -= 1;
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         if let Ok(shuffle_ids) = result {
             if revision == self.lookup_revision {
                 self.shuffle_ids.extend(
@@ -169,7 +189,7 @@ impl ShuffleClientActor {
         result: CelebornResult<SlotReservation>,
         reply: oneshot::Sender<CelebornResult<SlotReservation>>,
     ) -> ActorAction {
-        if self.pending_closes.contains_key(&shuffle_id) {
+        if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             let _ = reply.send(Err(closing(shuffle_id)));
             self.finish_operation(ctx, shuffle_id);
             return ActorAction::Continue;
@@ -202,7 +222,7 @@ impl ShuffleClientActor {
         data: Bytes,
         reply: oneshot::Sender<CelebornResult<PushDataSize>>,
     ) -> ActorAction {
-        if self.pending_closes.contains_key(&shuffle_id) {
+        if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             let _ = reply.send(Err(closing(shuffle_id)));
             return ActorAction::Continue;
         }
@@ -285,7 +305,7 @@ impl ShuffleClientActor {
         result: CelebornResult<PushDataSize>,
         reply: oneshot::Sender<CelebornResult<PushDataSize>>,
     ) -> ActorAction {
-        if self.pending_closes.contains_key(&shuffle_id) {
+        if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             let _ = reply.send(Err(closing(shuffle_id)));
             self.finish_operation(ctx, shuffle_id);
             return ActorAction::Continue;
@@ -336,7 +356,7 @@ impl ShuffleClientActor {
         result: CelebornResult<()>,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
-        let result = if self.pending_closes.contains_key(&shuffle_id) {
+        let result = if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             Err(closing(shuffle_id))
         } else {
             result
@@ -352,6 +372,10 @@ impl ShuffleClientActor {
         shuffle_id: i32,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         self.begin_close(ctx, shuffle_id, true, reply);
         ActorAction::Continue
     }
@@ -371,6 +395,10 @@ impl ShuffleClientActor {
         shuffle_id: i32,
         reply: oneshot::Sender<CelebornResult<()>>,
     ) -> ActorAction {
+        if self.stopping {
+            let _ = reply.send(Err(CelebornError::ActorStopped));
+            return ActorAction::Continue;
+        }
         self.begin_close(ctx, shuffle_id, false, reply);
         ActorAction::Continue
     }
@@ -461,10 +489,17 @@ impl ShuffleClientActor {
         self.location_history.retain(|(id, _), _| *id != shuffle_id);
         self.batch_ids.retain(|(id, _, _), _| *id != shuffle_id);
         self.shuffle_ids.retain(|_, id| *id != shuffle_id);
+        self.worker_clients.retain_workers(
+            self.location_history
+                .values()
+                .flatten()
+                .chain(self.locations.values())
+                .map(PartitionLocation::worker_identity),
+        );
     }
 
     fn begin_operation(&mut self, shuffle_id: i32) -> CelebornResult<()> {
-        if self.pending_closes.contains_key(&shuffle_id) {
+        if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             return Err(closing(shuffle_id));
         }
         *self.pending_operations.entry(shuffle_id).or_default() += 1;
@@ -489,7 +524,7 @@ impl ShuffleClientActor {
         options: PartitionReadOptions,
         reply: oneshot::Sender<BoxStream<'static, CelebornResult<Bytes>>>,
     ) -> ActorAction {
-        if self.pending_closes.contains_key(&shuffle_id) {
+        if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             let _ = reply.send(Box::pin(stream::once(
                 async move { Err(closing(shuffle_id)) },
             )));
@@ -535,7 +570,7 @@ impl ShuffleClientActor {
         result: CelebornResult<SlotReservation>,
         reply: oneshot::Sender<BoxStream<'static, CelebornResult<Bytes>>>,
     ) -> ActorAction {
-        if self.pending_closes.contains_key(&shuffle_id) {
+        if self.stopping || self.pending_closes.contains_key(&shuffle_id) {
             let _ = reply.send(Box::pin(stream::once(
                 async move { Err(closing(shuffle_id)) },
             )));
@@ -610,7 +645,24 @@ impl ShuffleClientActor {
     }
 
     pub(super) fn handle_stop(&mut self, reply: oneshot::Sender<()>) -> ActorAction {
-        let _ = reply.send(());
+        self.stopping = true;
+        self.stop_waiters.push(reply);
+        ActorAction::Continue
+    }
+
+    pub(super) fn maybe_finish_stop(&mut self) -> ActorAction {
+        if !self.stopping
+            || !self.pending_operations.is_empty()
+            || self.pending_lookups != 0
+            || self.pending_closes.values().any(|close| close.request_sent)
+        {
+            return ActorAction::Continue;
+        }
+        // Stopping a client is local: do not stop its shared lifecycle manager
+        // or retry failed remote cleanup. Actor destruction drops local caches.
+        for waiter in self.stop_waiters.drain(..) {
+            let _ = waiter.send(());
+        }
         ActorAction::Stop
     }
 

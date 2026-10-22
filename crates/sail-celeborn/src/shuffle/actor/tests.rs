@@ -6,6 +6,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use sail_common::actor::ActorSystem;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::common::{ApplicationMetrics, CompressionCodec, PartitionLocation, SlotReservation};
@@ -502,6 +504,356 @@ async fn client_cleanup_drains_delayed_push_revive() {
         assert!(error.to_string().contains("not registered"), "{error}");
         client.stop().await.unwrap();
         system.join().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn client_stop_drains_registration_and_coalesces_waiters() {
+    check_client_stop_drains_operation(false).await;
+}
+
+#[tokio::test]
+async fn client_stop_drains_read_refresh_before_acknowledgement() {
+    check_client_stop_drains_operation(true).await;
+}
+
+async fn check_client_stop_drains_operation(reading: bool) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (registrations, mut registration_calls) = mpsc::unbounded_channel();
+        let (unregisters, mut unregister_calls) = mpsc::unbounded_channel();
+        let mut system = ActorSystem::new();
+        let handle = system.spawn::<ShuffleClientActor>(ShuffleClientOptions::new(
+            "stop-test".into(),
+            Arc::new(ControlledLifecycle {
+                registrations,
+                unregisters,
+                shuffle_ids: None,
+                job_shuffle_ids: None,
+                revives: None,
+            }),
+            None,
+            CompressionCodec::None,
+        ));
+        let client = ShuffleClient::new(handle.clone());
+        if reading {
+            let registering = tokio::spawn({
+                let client = client.clone();
+                async move { client.register_shuffle(7, vec![0], false, 0).await }
+            });
+            registration_calls
+                .recv()
+                .await
+                .unwrap()
+                .send(Ok(reservation()))
+                .unwrap();
+            registering.await.unwrap().unwrap();
+        }
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move {
+                if reading {
+                    let mut stream = client.read_partition_stream(7, 0).await;
+                    match stream.next().await {
+                        Some(Err(error)) => Err(error),
+                        _ => Ok(()),
+                    }
+                } else {
+                    client
+                        .register_shuffle(7, vec![0], false, 0)
+                        .await
+                        .map(|_| ())
+                }
+            }
+        });
+        let registration = registration_calls.recv().await.unwrap();
+        let (reply, mut stopped) = oneshot::channel();
+        assert!(
+            handle
+                .send(ShuffleClientMessage::Stop { result: reply })
+                .await
+                .is_ok()
+        );
+        let (reply, mut duplicate) = oneshot::channel();
+        let duplicate_sent = handle
+            .send(ShuffleClientMessage::Stop { result: reply })
+            .await;
+        // This later request is both an actor-mailbox barrier and a check that
+        // stop rejects work on another ID instead of starting another RPC.
+        assert!(client.register_shuffle(8, vec![0], false, 0).await.is_err());
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(100), client.unregister_shuffle(8))
+                    .await,
+                Ok(Err(_))
+            ),
+            "stop must reject new unregister transactions"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(100), client.clean_up_shuffle(8)).await,
+                Ok(Err(_))
+            ),
+            "stop must reject new local cleanup requests"
+        );
+        assert!(unregister_calls.try_recv().is_err());
+        assert!(
+            matches!(stopped.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "stop acknowledged while a lifecycle callback was still pending"
+        );
+        assert!(duplicate_sent.is_ok());
+        assert!(matches!(
+            duplicate.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(registration_calls.try_recv().is_err());
+
+        registration.send(Ok(reservation())).unwrap();
+        assert!(
+            operation.await.unwrap().is_err(),
+            "a callback completed successfully after client shutdown began"
+        );
+        stopped.await.unwrap();
+        duplicate.await.unwrap();
+        system.join().await;
+        assert!(client.register_shuffle(7, vec![0], false, 0).await.is_err());
+        assert!(
+            unregister_calls.try_recv().is_err(),
+            "stopping one client must not unregister its shared lifecycle manager"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn client_cleanup_releases_idle_worker_but_preserves_shared_connection() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed, connection_closed) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Both shuffles, and the push after the first cleanup, must use
+            // this one accepted connection rather than reconnecting.
+            for _ in 0..3 {
+                let header_length = socket.read_i32().await.unwrap() as usize;
+                assert_eq!(socket.read_u8().await.unwrap(), 11); // PushData
+                let body_length = socket.read_i32().await.unwrap() as usize;
+                let mut header = vec![0; header_length];
+                let mut body = vec![0; body_length];
+                socket.read_exact(&mut header).await.unwrap();
+                socket.read_exact(&mut body).await.unwrap();
+                assert!(header.len() >= 8);
+                // An empty successful RpcResponse carries the push request ID.
+                socket.write_i32(12).await.unwrap();
+                socket.write_u8(4).await.unwrap();
+                socket.write_i32(0).await.unwrap();
+                socket.write_all(&header[..8]).await.unwrap();
+                socket.write_i32(0).await.unwrap();
+            }
+            assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
+            closed.send(()).unwrap();
+        });
+        let (registrations, mut registration_calls) = mpsc::unbounded_channel();
+        let (unregisters, mut unregister_calls) = mpsc::unbounded_channel();
+        let mut system = ActorSystem::new();
+        let handle = system.spawn::<ShuffleClientActor>(ShuffleClientOptions::new(
+            "worker-lifetime-test".into(),
+            Arc::new(ControlledLifecycle {
+                registrations,
+                unregisters,
+                shuffle_ids: None,
+                job_shuffle_ids: None,
+                revives: None,
+            }),
+            None,
+            CompressionCodec::None,
+        ));
+        let client = ShuffleClient::new(handle);
+        for shuffle_id in [7, 8] {
+            let registering = tokio::spawn({
+                let client = client.clone();
+                async move { client.register_shuffle(shuffle_id, vec![0], false, 0).await }
+            });
+            let mut registered = reservation();
+            let location = registered.primary_locations.get_mut(&0).unwrap();
+            location.rpc_port = port;
+            location.push_port = port;
+            location.fetch_port = port;
+            location.replicate_port = port;
+            registration_calls
+                .recv()
+                .await
+                .unwrap()
+                .send(Ok(registered))
+                .unwrap();
+            registering.await.unwrap().unwrap();
+        }
+        for shuffle_id in [7, 8] {
+            client
+                .push_data(shuffle_id, 0, 0, 0, Bytes::from_static(b"first"))
+                .await
+                .unwrap();
+        }
+        client.clean_up_shuffle(7).await.unwrap();
+        client
+            .push_data(8, 0, 0, 0, Bytes::from_static(b"after other cleanup"))
+            .await
+            .unwrap();
+        client.clean_up_shuffle(8).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_millis(200), connection_closed).await;
+        assert!(
+            closed.is_ok(),
+            "last-shuffle cleanup retained the idle worker's TCP connection"
+        );
+        closed.unwrap().unwrap();
+        worker.await.unwrap();
+        assert!(unregister_calls.try_recv().is_err());
+        client.stop().await.unwrap();
+        system.join().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn client_stop_drains_lookup_callbacks_without_publishing_late_results() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for lookup_all in [false, true] {
+            let (registrations, mut registration_calls) = mpsc::unbounded_channel();
+            let (unregisters, mut unregister_calls) = mpsc::unbounded_channel();
+            let (shuffle_ids, mut id_calls) = mpsc::unbounded_channel();
+            let (job_shuffle_ids, mut job_calls) = mpsc::unbounded_channel();
+            let mut system = ActorSystem::new();
+            let handle = system.spawn::<ShuffleClientActor>(ShuffleClientOptions::new(
+                "stop-lookup-test".into(),
+                Arc::new(ControlledLifecycle {
+                    registrations,
+                    unregisters,
+                    shuffle_ids: Some(shuffle_ids),
+                    job_shuffle_ids: Some(job_shuffle_ids),
+                    revives: None,
+                }),
+                None,
+                CompressionCodec::None,
+            ));
+            let client = ShuffleClient::new(handle.clone());
+            let lookup = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    if lookup_all {
+                        client.get_job_shuffle_ids(1).await.map(|_| ())
+                    } else {
+                        client.get_shuffle_id(1, 1).await.map(|_| ())
+                    }
+                }
+            });
+            let id_reply = if lookup_all {
+                None
+            } else {
+                Some(id_calls.recv().await.unwrap())
+            };
+            let job_reply = if lookup_all {
+                Some(job_calls.recv().await.unwrap())
+            } else {
+                None
+            };
+            let (reply, mut stopped) = oneshot::channel();
+            assert!(
+                handle
+                    .send(ShuffleClientMessage::Stop { result: reply })
+                    .await
+                    .is_ok()
+            );
+            assert!(client.register_shuffle(8, vec![0], false, 0).await.is_err());
+            assert!(
+                matches!(stopped.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "stop acknowledged while an ID lookup was still pending"
+            );
+            if let Some(reply) = id_reply {
+                reply.send(Ok(7)).unwrap();
+            }
+            if let Some(reply) = job_reply {
+                reply.send(Ok(vec![(1, 7)])).unwrap();
+            }
+            assert!(
+                lookup.await.unwrap().is_err(),
+                "a late lookup result was published after shutdown began"
+            );
+            stopped.await.unwrap();
+            system.join().await;
+            assert!(registration_calls.try_recv().is_err());
+            assert!(unregister_calls.try_recv().is_err());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn client_stop_drains_active_unregister_and_finishes_after_remote_failure() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (registrations, mut registration_calls) = mpsc::unbounded_channel();
+        let (unregisters, mut unregister_calls) = mpsc::unbounded_channel();
+        let mut system = ActorSystem::new();
+        let handle = system.spawn::<ShuffleClientActor>(ShuffleClientOptions::new(
+            "stop-unregister-test".into(),
+            Arc::new(ControlledLifecycle {
+                registrations,
+                unregisters,
+                shuffle_ids: None,
+                job_shuffle_ids: None,
+                revives: None,
+            }),
+            None,
+            CompressionCodec::None,
+        ));
+        let client = ShuffleClient::new(handle.clone());
+        let registering = tokio::spawn({
+            let client = client.clone();
+            async move { client.register_shuffle(7, vec![0], false, 0).await }
+        });
+        registration_calls
+            .recv()
+            .await
+            .unwrap()
+            .send(Ok(reservation()))
+            .unwrap();
+        registering.await.unwrap().unwrap();
+        let unregistering = tokio::spawn({
+            let client = client.clone();
+            async move { client.unregister_shuffle(7).await }
+        });
+        let remote_unregister = unregister_calls.recv().await.unwrap();
+        let (reply, mut stopped) = oneshot::channel();
+        assert!(
+            handle
+                .send(ShuffleClientMessage::Stop { result: reply })
+                .await
+                .is_ok()
+        );
+        assert!(client.register_shuffle(8, vec![0], false, 0).await.is_err());
+        assert!(
+            matches!(stopped.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "stop acknowledged while remote unregister was still pending"
+        );
+        remote_unregister
+            .send(Err(CelebornError::Application(
+                "partial remote deletion".into(),
+            )))
+            .unwrap();
+        assert!(unregistering.await.unwrap().is_err());
+        // The failed cleanup must retain Closing for ordinary callers, but it
+        // has no active transaction left and must not keep client stop waiting.
+        stopped.await.unwrap();
+        system.join().await;
+        assert!(
+            unregister_calls.try_recv().is_err(),
+            "client stop must not retry shared lifecycle cleanup"
+        );
+        assert!(registration_calls.try_recv().is_err());
     })
     .await
     .unwrap();

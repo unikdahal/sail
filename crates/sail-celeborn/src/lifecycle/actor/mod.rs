@@ -3,7 +3,7 @@ mod handler;
 mod message;
 mod options;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use message::LifecycleManagerMessage;
 pub use options::LifecycleManagerOptions;
@@ -85,12 +85,19 @@ struct PendingUnregister {
 }
 
 pub struct LifecycleManagerActor {
+    stopping: bool,
+    stop_waiters: Vec<oneshot::Sender<()>>,
+    stop_pending_shuffles: HashSet<i32>,
+
     options: LifecycleManagerOptions,
     client: MasterClient,
     worker_clients: WorkerClientPool,
     excluded_workers: HashMap<WorkerIdentity, PartitionLocation>,
     registered_shuffles: HashMap<i32, HashMap<WorkerIdentity, WorkerSlotLocations>>,
     reservations: HashMap<i32, SlotReservation>,
+    // A failed registration may have allocated master slots or some worker files.
+    // Keep explicit IDs reachable for cleanup until unregister succeeds.
+    requested_shuffles: HashSet<i32>,
     pending_slot_requests: HashMap<i32, Vec<oneshot::Sender<CelebornResult<SlotReservation>>>>,
     pending_revives: HashMap<(i32, i32), Vec<oneshot::Sender<CelebornResult<PartitionLocation>>>>,
     shuffle_commits: HashMap<i32, ShuffleCommitState>,

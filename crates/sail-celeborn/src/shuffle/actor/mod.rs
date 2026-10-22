@@ -24,6 +24,10 @@ struct PendingClose {
 
 /// Serializes local shuffle-client operations using an external lifecycle manager.
 pub struct ShuffleClientActor {
+    stopping: bool,
+    stop_waiters: Vec<oneshot::Sender<()>>,
+    pending_lookups: usize,
+
     options: ShuffleClientOptions,
     shuffle_ids: HashMap<(u64, u64), i32>,
     locations: HashMap<(i32, i32), PartitionLocation>,

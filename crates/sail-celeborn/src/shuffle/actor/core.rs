@@ -13,6 +13,9 @@ impl Actor for ShuffleClientActor {
 
     fn new(options: Self::Options) -> Self {
         Self {
+            stopping: false,
+            stop_waiters: Default::default(),
+            pending_lookups: 0,
             options,
             shuffle_ids: Default::default(),
             locations: Default::default(),
@@ -30,7 +33,7 @@ impl Actor for ShuffleClientActor {
         ctx: &mut ActorContext<Self>,
         message: Self::Message,
     ) -> ActorAction {
-        match message {
+        let action = match message {
             ShuffleClientMessage::GetShuffleId {
                 job_id,
                 stage,
@@ -143,6 +146,10 @@ impl Actor for ShuffleClientActor {
                 reply,
             ),
             ShuffleClientMessage::Stop { result } => self.handle_stop(result),
+        };
+        match action {
+            ActorAction::Continue => self.maybe_finish_stop(),
+            ActorAction::Stop => ActorAction::Stop,
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -89,6 +89,17 @@ impl WorkerClientPool {
                 client
             }
         }
+    }
+
+    /// Release cached connections for workers no longer used by active shuffles.
+    /// Clients held by an in-flight request or delivered reader keep their own
+    /// transport references, so eviction does not interrupt those operations.
+    pub(crate) fn retain_workers(&self, workers: impl IntoIterator<Item = WorkerIdentity>) {
+        let workers = workers.into_iter().collect::<HashSet<_>>();
+        self.clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|worker, _| workers.contains(worker));
     }
 }
 
@@ -1075,6 +1086,36 @@ mod tests {
         assert!(first.rpc.shares_stream_with(&second.rpc));
         assert!(first.push.shares_stream_with(&second.push));
         assert!(first.fetch.shares_stream_with(&second.fetch));
+    }
+
+    #[test]
+    fn worker_client_pool_releases_unused_workers_without_invalidating_clients() {
+        let pool = WorkerClientPool::default();
+        let idle_location = location(0);
+        let active_location = PartitionLocation {
+            rpc_port: 13000,
+            push_port: 13001,
+            fetch_port: 13002,
+            replicate_port: 13003,
+            ..location(1)
+        };
+        let idle = pool.client(WorkerClientOptions::new(idle_location.clone()));
+        let held = idle.clone();
+        let active = pool.client(WorkerClientOptions::new(active_location.clone()));
+        pool.retain_workers([active_location.worker_identity()]);
+
+        let active_again = pool.client(WorkerClientOptions::new(active_location));
+        assert!(active.rpc.shares_stream_with(&active_again.rpc));
+        assert!(active.push.shares_stream_with(&active_again.push));
+        assert!(active.fetch.shares_stream_with(&active_again.fetch));
+        let fresh = pool.client(WorkerClientOptions::new(idle_location));
+        assert!(!idle.rpc.shares_stream_with(&fresh.rpc));
+        assert!(!idle.push.shares_stream_with(&fresh.push));
+        assert!(!idle.fetch.shares_stream_with(&fresh.fetch));
+        // Eviction only drops the pool's lease; an existing client remains valid.
+        assert!(idle.rpc.shares_stream_with(&held.rpc));
+        assert!(idle.push.shares_stream_with(&held.push));
+        assert!(idle.fetch.shares_stream_with(&held.fetch));
     }
 
     #[test]
